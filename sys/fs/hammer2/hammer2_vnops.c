@@ -54,6 +54,7 @@
 
 static void hammer2_truncate_file(hammer2_inode_t *, hammer2_key_t);
 static void hammer2_extend_file(hammer2_inode_t *, hammer2_key_t);
+static void hammer2_truncate_buffers(hammer2_inode_t *, hammer2_key_t);
 
 #ifdef DIAGNOSTIC
 extern int prtactive;
@@ -98,8 +99,9 @@ hammer2_inactive(void *v)
 		 * Because vrecycle() calls are not guaranteed, try to
 		 * dispose of the inode as much as possible right here.
 		 */
-		uvm_vnp_setsize(vp, 0);
-		uvm_vnp_uncache(vp);
+		hammer2_inode_unlock(ip);
+		hammer2_truncate_buffers(ip, 0);
+		hammer2_inode_lock(ip, 0);
 
 		/* Delete the file on-media. */
 		if ((ip->flags & HAMMER2_INODE_DELETING) == 0) {
@@ -1072,15 +1074,113 @@ hammer2_write(void *v)
 }
 
 /*
+ * OpenBSD analogue of DragonFly's nvtruncbuf().  The VM object and
+ * logical buffer cache are separate here, so shrinking a file has to
+ * update both sides explicitly.
+ */
+static void
+hammer2_truncate_buffers(hammer2_inode_t *ip, hammer2_key_t nsize)
+{
+	struct vnode *vp = ip->vp;
+	struct buf *bp;
+	daddr_t first_lbn;
+	daddr_t lbn;
+	int boff;
+	int nblksize;
+	int s;
+
+	if (vp == NULL)
+		return;
+
+	/*
+	 * The UVM and logical buffer cache are separate on OpenBSD.
+	 * Shrinking the vnode's VM object is not sufficient on its own; we
+	 * also have to discard logical buffers beyond EOF and zero the tail
+	 * of the retained last block so a later re-extend cannot expose stale
+	 * data.
+	 */
+	s = splbio();
+	(void)vwaitforio(vp, 0, "h2trbio", INFSLP);
+	splx(s);
+
+	uvm_vnp_setsize(vp, nsize);
+	uvm_vnp_uncache(vp);
+
+	nblksize = hammer2_calc_logical(ip, 0, NULL, NULL);
+	boff = (int)(nsize & (nblksize - 1));
+	first_lbn = (daddr_t)(nsize / nblksize);
+	if (boff)
+		++first_lbn;
+
+	/*
+	 * Discard any fully truncated logical buffers, clean or dirty.
+	 * Iterate one buffer at a time because brelse() removes the buffer
+	 * from the vnode's lists when B_INVAL is set.
+	 */
+	for (;;) {
+		bp = NULL;
+		s = splbio();
+
+		LIST_FOREACH(bp, &vp->v_cleanblkhd, b_vnbufs) {
+			if (bp->b_lblkno >= 0 && bp->b_lblkno >= first_lbn)
+				break;
+		}
+		if (bp == NULL) {
+			LIST_FOREACH(bp, &vp->v_dirtyblkhd, b_vnbufs) {
+				if (bp->b_lblkno >= 0 && bp->b_lblkno >= first_lbn)
+					break;
+			}
+		}
+		if (bp == NULL) {
+			splx(s);
+			break;
+		}
+		if (bp->b_flags & B_BUSY) {
+			bp->b_flags |= B_WANTED;
+			(void)tsleep_nsec(bp, PRIBIO + 1, "h2trbuf", INFSLP);
+			splx(s);
+			continue;
+		}
+		bufcache_take(bp);
+		buf_acquire_nomap(bp);
+		bp->b_flags |= B_INVAL;
+		splx(s);
+		brelse(bp);
+	}
+
+	/*
+	 * If EOF lands in the middle of a logical buffer, preserve the bytes
+	 * before EOF and zero the tail.  The zeroed tail must remain dirty so
+	 * a later fsync/sync writes it before the resized inode topology is
+	 * flushed to media.
+	 */
+	if (boff == 0)
+		return;
+
+	lbn = first_lbn - 1;
+	bp = getblk(vp, lbn, nblksize, 0, 0);
+	if ((bp->b_flags & B_CACHE) == 0) {
+		brelse(bp);
+		bp = NULL;
+		if (bread(vp, lbn, nblksize, &bp) != 0) {
+			if (bp)
+				brelse(bp);
+			return;
+		}
+	}
+	if (boff < bp->b_bufsize)
+		memset(bp->b_data + boff, 0, bp->b_bufsize - boff);
+	bdwrite(bp);
+}
+
+/*
  * Truncate the size of a file.  The inode must be locked.
  *
  * We must unconditionally set HAMMER2_INODE_RESIZED to properly
  * ensure that any on-media data beyond the new file EOF has been destroyed.
  *
- * WARNING: nvtruncbuf() can only be safely called without the inode lock
- *	    held due to the way our write thread works.  If the truncation
- *	    occurs in the middle of a buffer, nvtruncbuf() is responsible
- *	    for dirtying that buffer and zeroing out trailing bytes.
+ * WARNING: The OpenBSD truncate helper must be called without the inode lock
+ *	    held due to the way the asynchronous strategy write path operates.
  *
  * WARNING! Assumes that the kernel interlocks size changes at the
  *	    vnode level.
@@ -1094,10 +1194,7 @@ hammer2_truncate_file(hammer2_inode_t *ip, hammer2_key_t nsize)
 	hammer2_mtx_assert_locked(&ip->lock);
 
 	hammer2_mtx_unlock(&ip->lock);
-	if (ip->vp) {
-		uvm_vnp_setsize(ip->vp, nsize);
-		uvm_vnp_uncache(ip->vp);
-	}
+	hammer2_truncate_buffers(ip, nsize);
 	hammer2_mtx_ex(&ip->lock);
 	KKASSERT((ip->flags & HAMMER2_INODE_RESIZED) == 0);
 	ip->osize = ip->meta.size;
