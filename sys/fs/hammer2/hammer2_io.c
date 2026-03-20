@@ -93,6 +93,10 @@ hammer2_io_track_iodone(struct buf *bp)
 
 	while (wref) {
 		next = wref->next;
+		if ((bp->b_flags & B_ERROR) && wref->wsync) {
+			(void)atomic_cas_uint(&wref->wsync->error, 0,
+			    bp->b_error ? (unsigned int)bp->b_error : (unsigned int)EIO);
+		}
 		hammer2_wref_complete(wref);
 		wref = next;
 	}

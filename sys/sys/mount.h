@@ -573,6 +573,7 @@ struct vfsops {
 #define VFS_STATFS(MP, SBP, P)	  (*(MP)->mnt_op->vfs_statfs)(MP, SBP, P)
 #define VFS_SYNC(MP, W, S, C, P)  (*(MP)->mnt_op->vfs_sync)(MP, W, S, C, P)
 #define VFS_MODIFYING_BUFCACHE	0x00000001
+#define VFS_MODIFYING_LOCKHELD	0x00000002
 #define VFS_MODIFYING(MP, VP, F) \
 	(((MP) && (MP)->mnt_op->vfs_modifying) ? \
 	(*(MP)->mnt_op->vfs_modifying)((MP), (VP), (F)) : 0)

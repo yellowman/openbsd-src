@@ -173,6 +173,7 @@ struct hammer2_io {
 struct hammer2_wsync {
 	volatile unsigned int	refs;
 	volatile unsigned int	count;
+	volatile unsigned int	error;
 };
 
 struct hammer2_wref {

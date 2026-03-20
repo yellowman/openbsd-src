@@ -260,6 +260,11 @@ hammer2_fsync(void *v)
 	 * doing scattered reads.
 	 */
 	vflushbuf(vp, ap->a_waitfor == MNT_WAIT);
+	if (ap->a_waitfor != MNT_LAZY) {
+		error2 = hammer2_inode_wsync_wait(ip);
+		if (error2 && error1 == 0)
+			error1 = error2;
+	}
 
 	/* Flush any inode changes. */
 	hammer2_inode_lock(ip, 0);
@@ -283,9 +288,6 @@ hammer2_fsync(void *v)
 	if (mmap_error && error1 == 0)
 		error1 = mmap_error;
 	if (ap->a_waitfor != MNT_LAZY) {
-		error2 = hammer2_inode_wsync_wait(ip);
-		if (error2 && error1 == 0)
-			error1 = error2;
 		error3 = hammer2_pfs_fsync_devices(ip->pmp, ap->a_cred,
 		    ap->a_waitfor, ap->a_p);
 		if (error3 && error1 == 0)
@@ -1031,9 +1033,11 @@ hammer2_write_file(hammer2_inode_t *ip, struct uio *uio, int ioflag,
 		 * to hit the backend promptly so CoW allocations do not wind up
 		 * needlessly scattered by the buffer daemon.
 		 */
-		if (ioflag & IO_SYNC)
-			(void)bwrite(bp);
-		else if ((ioflag & IO_ASYNC) || endofblk)
+		if (ioflag & IO_SYNC) {
+			error = bwrite(bp);
+			if (error)
+				break;
+		} else if ((ioflag & IO_ASYNC) || endofblk)
 			bawrite(bp);
 		else
 			bdwrite(bp);
@@ -1168,8 +1172,13 @@ hammer2_truncate_buffers(hammer2_inode_t *ip, hammer2_key_t nsize)
 	 * data.
 	 */
 	s = splbio();
-	(void)vwaitforio(vp, 0, "h2trbio", INFSLP);
+	error = vwaitforio(vp, 0, "h2trbio", INFSLP);
 	splx(s);
+	if (error)
+		return (error);
+	error = hammer2_inode_wsync_wait(ip);
+	if (error)
+		return (error);
 
 	nblksize = hammer2_calc_logical(ip, 0, NULL, NULL);
 	boff = (int)(nsize & (nblksize - 1));
@@ -1281,8 +1290,13 @@ hammer2_extend_buffers(hammer2_inode_t *ip, hammer2_key_t osize,
 
 	lbn = lbase / lblksize;
 	s = splbio();
-	(void)vwaitforio(vp, 0, "h2exbio", INFSLP);
+	error = vwaitforio(vp, 0, "h2exbio", INFSLP);
 	splx(s);
+	if (error)
+		return (error);
+	error = hammer2_inode_wsync_wait(ip);
+	if (error)
+		return (error);
 
 	bp = getblk(vp, lbn, lblksize, 0, 0);
 	if ((bp->b_flags & B_CACHE) == 0) {

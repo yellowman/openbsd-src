@@ -160,7 +160,7 @@ hammer2_inode_setdepend_locked(hammer2_inode_t *ip, hammer2_depend_t *depend)
 		TAILQ_INSERT_TAIL(&depend->sideq, ip, qentry);
 		ip->depend = depend;
 		++depend->count;
-		++pmp->sideq_count;
+		atomic_inc_long((volatile unsigned long *)&pmp->sideq_count);
 	}
 
 	if (ip->flags & HAMMER2_INODE_SYNCQ_PASS2)
@@ -580,6 +580,7 @@ int
 hammer2_inode_wsync_wait(hammer2_inode_t *ip)
 {
 	hammer2_wsync_t *wsync;
+	unsigned int saved_error;
 	int s, error = 0;
 
 	wsync = ip->wsync;
@@ -592,6 +593,13 @@ hammer2_inode_wsync_wait(hammer2_inode_t *ip)
 		if (error == ERESTART || error == EINTR)
 			break;
 		error = 0;
+	}
+	if (error == 0) {
+		saved_error = wsync->error;
+		if (saved_error) {
+			(void)atomic_cas_uint(&wsync->error, saved_error, 0);
+			error = (int)saved_error;
+		}
 	}
 	splx(s);
 	hammer2_wsync_drop(wsync);

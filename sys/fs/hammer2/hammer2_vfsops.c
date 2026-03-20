@@ -1211,7 +1211,7 @@ hammer2_pfs_memory_wait(hammer2_pfs_t *pmp)
 	for (;;) {
 		hammer2_lk_ex(&pmp->memory_lock);
 		dirty_chains = pmp->inmem_dirty_chains;
-		dirty_inodes = pmp->sideq_count;
+		dirty_inodes = atomic_load_long((volatile unsigned long *)&pmp->sideq_count);
 
 		if (dirty_chains > hammer2_limit_dirty_chains / 2 ||
 		    dirty_inodes > hammer2_limit_dirty_inodes / 2)
@@ -1237,6 +1237,8 @@ static int
 hammer2_vfs_modifying(struct mount *mp, struct vnode *vp, int flags)
 {
 	hammer2_pfs_t *pmp;
+	int dirty_chains;
+	int dirty_inodes;
 
 	(void)vp;
 	if (mp == NULL)
@@ -1246,6 +1248,18 @@ hammer2_vfs_modifying(struct mount *mp, struct vnode *vp, int flags)
 		return (0);
 	if (flags & VFS_MODIFYING_BUFCACHE)
 		return (0);
+	if (mp->mnt_flag & MNT_RDONLY)
+		return (EROFS);
+	if (flags & VFS_MODIFYING_LOCKHELD) {
+		hammer2_lk_ex(&pmp->memory_lock);
+		dirty_chains = pmp->inmem_dirty_chains;
+		dirty_inodes = atomic_load_long((volatile unsigned long *)&pmp->sideq_count);
+		hammer2_lk_unlock(&pmp->memory_lock);
+		if (dirty_chains > hammer2_limit_dirty_chains / 2 ||
+		    dirty_inodes > hammer2_limit_dirty_inodes / 2)
+			hammer2_pfs_schedule_sync(pmp);
+		return (0);
+	}
 	return (hammer2_pfs_memory_wait(pmp));
 }
 
@@ -1304,7 +1318,7 @@ hammer2_pfs_memory_wakeup(hammer2_pfs_t *pmp, int count)
 	if (pmp->inmem_dirty_chains < 0)
 		pmp->inmem_dirty_chains = 0;
 	dirty_chains = pmp->inmem_dirty_chains;
-	dirty_inodes = pmp->sideq_count;
+	dirty_inodes = atomic_load_long((volatile unsigned long *)&pmp->sideq_count);
 
 	if (dirty_chains <= hammer2_limit_dirty_chains * 2 / 3 &&
 	    dirty_inodes <= hammer2_limit_dirty_inodes * 2 / 3)
@@ -1324,7 +1338,7 @@ hammer2_pfs_memory_inc(hammer2_pfs_t *pmp)
 	hammer2_lk_ex(&pmp->memory_lock);
 	++pmp->inmem_dirty_chains;
 	dirty_chains = pmp->inmem_dirty_chains;
-	dirty_inodes = pmp->sideq_count;
+	dirty_inodes = atomic_load_long((volatile unsigned long *)&pmp->sideq_count);
 	if (dirty_chains > hammer2_limit_dirty_chains / 2 ||
 	    dirty_inodes > hammer2_limit_dirty_inodes / 2)
 		dosched = 1;
@@ -1845,7 +1859,7 @@ hammer2_vfs_sync_pmp(hammer2_pfs_t *pmp, int waitfor __unused)
 	hammer2_depend_t *depend, *depend_next;
 	struct vnode *vp;
 	uint32_t pass2;
-	int error, dorestart, wakecount;
+	int error = 0, error2, dorestart, wakecount;
 
 	/*
 	 * Move all inodes on sideq to syncq.  This will clear sideq.
@@ -1934,7 +1948,7 @@ restart:
 		    HAMMER2_INODE_SYNCQ_PASS2) == 0)
 			continue;
 		TAILQ_REMOVE(&pmp->syncq, ip, qentry);
-		--pmp->sideq_count;
+		atomic_dec_long((volatile unsigned long *)&pmp->sideq_count);
 		hammer2_spin_unex(&pmp->list_spin);
 
 		/*
@@ -2028,8 +2042,12 @@ restart:
 		 * not NULL that will also be exclusively locked.  Do the
 		 * meat of the flush.
 		 */
-		if (vp)
+		if (vp) {
 			vflushbuf(vp, 1);
+			error2 = hammer2_inode_wsync_wait(ip);
+			if (error2 && error == 0)
+				error = error2;
+		}
 
 		/*
 		 * If the inode has not yet been inserted into the tree
@@ -2063,13 +2081,17 @@ restart:
 		 */
 		debug_hprintf("inum %016llx pinum %016llx chain-sync\n",
 		    (long long)ip->meta.inum, (long long)ip->meta.iparent);
-		hammer2_inode_chain_sync(ip);
+		error2 = hammer2_inode_chain_sync(ip);
+		if (error2 && error == 0)
+			error = error2;
 
 		if (ip == pmp->iroot)
-			hammer2_inode_chain_flush(ip, HAMMER2_XOP_INODE_STOP);
+			error2 = hammer2_inode_chain_flush(ip, HAMMER2_XOP_INODE_STOP);
 		else
-			hammer2_inode_chain_flush(ip,
+			error2 = hammer2_inode_chain_flush(ip,
 			    HAMMER2_XOP_INODE_STOP | HAMMER2_XOP_FSSYNC);
+		if (error2 && error == 0)
+			error = error2;
 		if (vp) {
 			if ((ip->flags & (HAMMER2_INODE_MODIFIED |
 			    HAMMER2_INODE_RESIZED |
@@ -2122,6 +2144,8 @@ restart:
 	}
 	debug_hprintf("FILESYSTEM SYNC STAGE 2 BEGIN\n");
 
+	hammer2_bioq_sync(pmp);
+
 	/*
 	 * We have to flush the PFS root last, even if it does not appear to
 	 * be dirty, because all the inodes in the PFS are indexed under it.
@@ -2134,17 +2158,20 @@ restart:
 	if ((ip = pmp->iroot) != NULL) {
 		hammer2_inode_ref(ip);
 		hammer2_mtx_ex(&ip->lock);
-		hammer2_inode_chain_sync(ip);
-		hammer2_inode_chain_flush(ip,
+		error2 = hammer2_inode_chain_sync(ip);
+		if (error2 && error == 0)
+			error = error2;
+		error2 = hammer2_inode_chain_flush(ip,
 		    HAMMER2_XOP_INODE_STOP | HAMMER2_XOP_FSSYNC |
 		    HAMMER2_XOP_VOLHDR);
+		if (error2 && error == 0)
+			error = error2;
 		hammer2_inode_unlock(ip); /* unlock+drop */
 	}
 	debug_hprintf("FILESYSTEM SYNC STAGE 2 DONE\n");
 
 	hammer2_bioq_sync(pmp);
 
-	error = 0;
 	hammer2_trans_done(pmp, HAMMER2_TRANS_ISFLUSH);
 
 	return (error);

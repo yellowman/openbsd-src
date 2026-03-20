@@ -57,7 +57,26 @@ vfs_modifying_vnode(struct vnode *vp, int flags)
 	mp = vp->v_mount;
 	if (mp == NULL)
 		return (0);
-	return (VFS_MODIFYING(mp, vp, flags));
+	return (VFS_MODIFYING(mp, vp, flags | VFS_MODIFYING_LOCKHELD));
+}
+
+static __inline int
+vfs_modifying_vnode_unlocked(struct vnode *vp, int flags)
+{
+	struct mount *mp;
+	int error, relock_error;
+
+	if (vp == NULL)
+		return (0);
+	mp = vp->v_mount;
+	if (mp == NULL)
+		return (0);
+	VOP_UNLOCK(vp);
+	error = VFS_MODIFYING(mp, vp, flags);
+	relock_error = vn_lock(vp, LK_EXCLUSIVE | LK_RETRY);
+	if (error == 0)
+		error = relock_error;
+	return (error);
 }
 
 #ifdef VFSLCKDEBUG
@@ -228,7 +247,10 @@ VOP_SETATTR(struct vnode *vp, struct vattr *vap, struct ucred *cred,
 
 	if (vp->v_op->vop_setattr == NULL)
 		return (EOPNOTSUPP);
-	error = vfs_modifying_vnode(vp, 0);
+	if (vp->v_type == VREG)
+		error = vfs_modifying_vnode_unlocked(vp, 0);
+	else
+		error = vfs_modifying_vnode(vp, 0);
 	if (error)
 		return (error);
 
@@ -268,9 +290,10 @@ VOP_WRITE(struct vnode *vp, struct uio *uio, int ioflag,
 	if (vp->v_op->vop_write == NULL)
 		return (EOPNOTSUPP);
 	if (vp->v_type == VREG) {
-		error = vfs_modifying_vnode(vp,
-		    (uio && uio->uio_segflg == UIO_SYSSPACE) ?
-		    VFS_MODIFYING_BUFCACHE : 0);
+		if (uio && uio->uio_segflg == UIO_SYSSPACE)
+			error = vfs_modifying_vnode(vp, VFS_MODIFYING_BUFCACHE);
+		else
+			error = vfs_modifying_vnode_unlocked(vp, 0);
 		if (error)
 			return (error);
 	}
