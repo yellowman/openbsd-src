@@ -52,6 +52,7 @@ static int hammer2_devvp_same(const hammer2_devvp_t *,
     const hammer2_devvp_t *);
 static int hammer2_devvp_list_exact_match(const hammer2_devvp_list_t *,
     const hammer2_devvp_list_t *);
+static void hammer2_pfs_schedule_sync(hammer2_pfs_t *);
 static void hammer2_mount_helper(struct mount *, hammer2_pfs_t *);
 static void hammer2_unmount_helper(struct mount *, hammer2_pfs_t *,
     hammer2_dev_t *);
@@ -81,6 +82,8 @@ int hammer2_dio_limit = 256;
 int hammer2_bulkfree_tps = 5000;
 int hammer2_limit_scan_depth;
 int hammer2_limit_saved_chains;
+int hammer2_limit_dirty_chains;
+int hammer2_limit_dirty_inodes;
 int hammer2_always_compress;
 int hammer2_flush_pipe = 100;
 
@@ -104,6 +107,8 @@ static const struct sysctl_bounded_args hammer2_vars[] = {
 	{ HAMMER2CTL_LIMIT_SAVED_CHAINS, &hammer2_limit_saved_chains, 0, INT_MAX, },
 	{ HAMMER2CTL_ALWAYS_COMPRESS, &hammer2_always_compress, 0, INT_MAX, },
 	{ HAMMER2CTL_FLUSH_PIPE, &hammer2_flush_pipe, 0, INT_MAX, },
+	{ HAMMER2CTL_LIMIT_DIRTY_CHAINS, &hammer2_limit_dirty_chains, 0, INT_MAX, },
+	{ HAMMER2CTL_LIMIT_DIRTY_INODES, &hammer2_limit_dirty_inodes, 0, INT_MAX, },
 };
 
 static unsigned long
@@ -154,7 +159,6 @@ hammer2_start(struct mount *mp, int flags, struct proc *p)
 static int
 hammer2_init(struct vfsconf *vfsp)
 {
-	long hammer2_limit_dirty_chains; /* originally sysctl */
 
 	KASSERT(sizeof(struct hammer2_mount_info) == sizeof(struct hammer2_args));
 	KASSERT(sizeof(struct hammer2_mount_info) <= 160); /* union mount_info */
@@ -187,6 +191,13 @@ hammer2_init(struct vfsconf *vfsp)
 		hammer2_limit_dirty_chains = HAMMER2_LIMIT_DIRTY_CHAINS;
 	if (hammer2_limit_dirty_chains < 1000)
 		hammer2_limit_dirty_chains = 1000;
+
+	hammer2_limit_dirty_inodes = desiredvnodes / 25;
+	if (hammer2_limit_dirty_inodes < 100)
+		hammer2_limit_dirty_inodes = 100;
+	if (hammer2_limit_dirty_inodes > HAMMER2_LIMIT_DIRTY_INODES)
+		hammer2_limit_dirty_inodes = HAMMER2_LIMIT_DIRTY_INODES;
+
 	hammer2_limit_saved_chains = hammer2_limit_dirty_chains * 5;
 
 	return (0);
@@ -240,6 +251,8 @@ hammer2_pfsalloc(hammer2_chain_t *chain, const hammer2_inode_data_t *ripdata,
 		hammer2_lkc_init(&pmp->trans_cv, "h2mp_tx_cv");
 		hammer2_lk_init(&pmp->bioq_lock, "h2mp_bioq");
 		hammer2_lkc_init(&pmp->bioq_cv, "h2mp_bioq_cv");
+		hammer2_lk_init(&pmp->memory_lock, "h2mp_mem");
+		hammer2_lkc_init(&pmp->memory_cv, "h2mp_mem_cv");
 		TAILQ_INIT(&pmp->syncq);
 		TAILQ_INIT(&pmp->depq);
 		hammer2_inum_hash_init(pmp);
@@ -310,6 +323,8 @@ hammer2_pfsalloc(hammer2_chain_t *chain, const hammer2_inode_data_t *ripdata,
 		 */
 		if (pmp->mp)
 			++chain->hmp->mount_count;
+		if (chain->flags & HAMMER2_CHAIN_MODIFIED)
+			hammer2_pfs_memory_inc(pmp);
 		++j;
 	}
 	iroot->cluster.nchains = j;
@@ -403,6 +418,8 @@ hammer2_pfsfree(hammer2_pfs_t *pmp)
 		hammer2_lkc_destroy(&pmp->trans_cv);
 		hammer2_lk_destroy(&pmp->bioq_lock);
 		hammer2_lkc_destroy(&pmp->bioq_cv);
+		hammer2_lk_destroy(&pmp->memory_lock);
+		hammer2_lkc_destroy(&pmp->memory_cv);
 		hammer2_inum_hash_destroy(pmp);
 		hashfree(pmp->ipdep_lists, HAMMER2_IHASH_SIZE, M_HAMMER2);
 		if (pmp->fspec)
@@ -1162,6 +1179,101 @@ hammer2_devvp_list_exact_match(const hammer2_devvp_list_t *lhs,
  *
  * We must bump the mount_count on related devices for any mounted PFSs.
  */
+
+static void
+hammer2_pfs_schedule_sync(hammer2_pfs_t *pmp)
+{
+	struct mount *mp;
+	struct vnode *syncvp;
+
+	if (pmp == NULL)
+		return;
+	mp = pmp->mp;
+	if (mp == NULL || (mp->mnt_flag & MNT_RDONLY))
+		return;
+	syncvp = mp->mnt_syncer;
+	if (syncvp)
+		vn_syncer_add_to_worklist(syncvp, 1);
+}
+
+int
+hammer2_pfs_memory_wait(hammer2_pfs_t *pmp)
+{
+	int dirty_chains;
+	int dirty_inodes;
+	int error;
+
+	if (pmp == NULL || pmp->mp == NULL)
+		return (0);
+
+	for (;;) {
+		hammer2_lk_ex(&pmp->memory_lock);
+		dirty_chains = pmp->inmem_dirty_chains;
+		dirty_inodes = pmp->sideq_count;
+
+		if (dirty_chains > hammer2_limit_dirty_chains / 2 ||
+		    dirty_inodes > hammer2_limit_dirty_inodes / 2)
+			hammer2_pfs_schedule_sync(pmp);
+
+		if (dirty_chains < hammer2_limit_dirty_chains &&
+		    dirty_inodes < hammer2_limit_dirty_inodes) {
+			hammer2_lk_unlock(&pmp->memory_lock);
+			break;
+		}
+
+		error = hammer2_lkc_sleep(&pmp->memory_cv, &pmp->memory_lock,
+		    "h2memw", hz);
+		hammer2_lk_unlock(&pmp->memory_lock);
+		if (error == ERESTART || error == EINTR)
+			return (error);
+	}
+
+	return (0);
+}
+
+void
+hammer2_pfs_memory_wakeup(hammer2_pfs_t *pmp, int count)
+{
+	int dirty_chains;
+	int dirty_inodes;
+
+	if (pmp == NULL)
+		return;
+
+	hammer2_lk_ex(&pmp->memory_lock);
+	pmp->inmem_dirty_chains += count;
+	if (pmp->inmem_dirty_chains < 0)
+		pmp->inmem_dirty_chains = 0;
+	dirty_chains = pmp->inmem_dirty_chains;
+	dirty_inodes = pmp->sideq_count;
+
+	if (dirty_chains <= hammer2_limit_dirty_chains * 2 / 3 &&
+	    dirty_inodes <= hammer2_limit_dirty_inodes * 2 / 3)
+		hammer2_lkc_wakeup(&pmp->memory_cv);
+	hammer2_lk_unlock(&pmp->memory_lock);
+}
+
+void
+hammer2_pfs_memory_inc(hammer2_pfs_t *pmp)
+{
+	int dirty_chains;
+	int dirty_inodes;
+	int dosched = 0;
+
+	if (pmp == NULL)
+		return;
+	hammer2_lk_ex(&pmp->memory_lock);
+	++pmp->inmem_dirty_chains;
+	dirty_chains = pmp->inmem_dirty_chains;
+	dirty_inodes = pmp->sideq_count;
+	if (dirty_chains > hammer2_limit_dirty_chains / 2 ||
+	    dirty_inodes > hammer2_limit_dirty_inodes / 2)
+		dosched = 1;
+	hammer2_lk_unlock(&pmp->memory_lock);
+	if (dosched)
+		hammer2_pfs_schedule_sync(pmp);
+}
+
 static void
 hammer2_mount_helper(struct mount *mp, hammer2_pfs_t *pmp)
 {
@@ -1293,6 +1405,7 @@ again:
 	if (hmp->vchain.flags & HAMMER2_CHAIN_MODIFIED) {
 		atomic_add_int(&hammer2_count_chain_modified, -1);
 		atomic_clear_int(&hmp->vchain.flags, HAMMER2_CHAIN_MODIFIED);
+		hammer2_pfs_memory_wakeup(hmp->vchain.pmp, -1);
 	}
 	if (hmp->vchain.flags & HAMMER2_CHAIN_UPDATE)
 		atomic_clear_int(&hmp->vchain.flags, HAMMER2_CHAIN_UPDATE);
@@ -1300,6 +1413,7 @@ again:
 	if (hmp->fchain.flags & HAMMER2_CHAIN_MODIFIED) {
 		atomic_add_int(&hammer2_count_chain_modified, -1);
 		atomic_clear_int(&hmp->fchain.flags, HAMMER2_CHAIN_MODIFIED);
+		hammer2_pfs_memory_wakeup(hmp->fchain.pmp, -1);
 	}
 	if (hmp->fchain.flags & HAMMER2_CHAIN_UPDATE)
 		atomic_clear_int(&hmp->fchain.flags, HAMMER2_CHAIN_UPDATE);
@@ -1672,7 +1786,7 @@ hammer2_vfs_sync_pmp(hammer2_pfs_t *pmp, int waitfor __unused)
 	hammer2_depend_t *depend, *depend_next;
 	struct vnode *vp;
 	uint32_t pass2;
-	int error, dorestart;
+	int error, dorestart, wakecount;
 
 	/*
 	 * Move all inodes on sideq to syncq.  This will clear sideq.
@@ -1692,9 +1806,13 @@ hammer2_vfs_sync_pmp(hammer2_pfs_t *pmp, int waitfor __unused)
 	 * SIDEQ to SYNCQ.  PASS2 propagation by inode_lock4() and
 	 * inode_depend() are atomic with the spin-lock.
 	 */
+	if (pmp->mp && (pmp->mp->mnt_flag & MNT_RDONLY) == 0)
+		uvm_vnp_sync(pmp->mp);
+
 	hammer2_trans_init(pmp, HAMMER2_TRANS_ISFLUSH);
 	debug_hprintf("FILESYSTEM SYNC BOUNDARY\n");
 	dorestart = 0;
+	wakecount = 0;
 
 	/*
 	 * Move inodes from depq to syncq, releasing the related
@@ -1734,6 +1852,7 @@ restart:
 	hammer2_spin_unex(&pmp->list_spin);
 	hammer2_trans_clearflags(pmp, HAMMER2_TRANS_WAITING);
 	dorestart = 0;
+	hammer2_pfs_memory_wakeup(pmp, 0);
 
 	/*
 	 * Now run through all inodes on syncq.
@@ -1765,6 +1884,10 @@ restart:
 		 */
 		if (pass2 & HAMMER2_INODE_SYNCQ_WAKEUP)
 			wakeup(&ip->flags);
+		if (++wakecount >= hammer2_limit_dirty_inodes / 20 + 1) {
+			wakecount = 0;
+			hammer2_pfs_memory_wakeup(pmp, 0);
+		}
 
 		/*
 		 * We need the vp in order to vfsync() dirty buffers, so if
@@ -1920,6 +2043,7 @@ restart:
 		hammer2_spin_ex(&pmp->list_spin);
 	}
 	hammer2_spin_unex(&pmp->list_spin);
+	hammer2_pfs_memory_wakeup(pmp, 0);
 
 	if (dorestart || (pmp->trans.flags & HAMMER2_TRANS_RESCAN)) {
 		/*
@@ -2236,6 +2360,8 @@ hammer2_voldata_modify(hammer2_dev_t *hmp)
 	if ((hmp->vchain.flags & HAMMER2_CHAIN_MODIFIED) == 0) {
 		atomic_add_int(&hammer2_count_chain_modified, 1);
 		atomic_set_int(&hmp->vchain.flags, HAMMER2_CHAIN_MODIFIED);
+		if (hmp->vchain.pmp)
+			hammer2_pfs_memory_inc(hmp->vchain.pmp);
 		hmp->vchain.bref.mirror_tid = hmp->voldata.mirror_tid + 1;
 	}
 }

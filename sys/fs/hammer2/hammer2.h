@@ -876,6 +876,9 @@ struct hammer2_pfs {
 	hammer2_lk_t		bioq_lock;
 	hammer2_lkc_t		bioq_cv;
 	int			bioq_inprog;
+	hammer2_lk_t		memory_lock;
+	hammer2_lkc_t		memory_cv;
+	int			inmem_dirty_chains;
 	struct mount		*mp;
 	struct uuid		pfs_clid;
 	hammer2_trans_t		trans;
@@ -925,6 +928,8 @@ extern int hammer2_dio_limit;
 extern int hammer2_bulkfree_tps;
 extern int hammer2_limit_scan_depth;
 extern int hammer2_limit_saved_chains;
+extern int hammer2_limit_dirty_chains;
+extern int hammer2_limit_dirty_inodes;
 extern int hammer2_always_compress;
 extern int hammer2_flush_pipe;
 
@@ -1117,6 +1122,9 @@ int hammer2_strategy(void *v);
 void hammer2_xop_strategy_read(hammer2_xop_t *, void *, int);
 void hammer2_xop_strategy_write(hammer2_xop_t *, void *, int);
 void hammer2_bioq_sync(hammer2_pfs_t *);
+int hammer2_pfs_memory_wait(hammer2_pfs_t *);
+void hammer2_pfs_memory_wakeup(hammer2_pfs_t *, int);
+void hammer2_pfs_memory_inc(hammer2_pfs_t *);
 void hammer2_dedup_clear(hammer2_dev_t *);
 
 /* hammer2_subr.c */

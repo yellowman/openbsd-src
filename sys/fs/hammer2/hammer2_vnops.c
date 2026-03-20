@@ -47,14 +47,22 @@
 #include <sys/file.h>
 #include <sys/specdev.h>
 
+#include <uvm/uvm_vnode.h>
+#include <uvm/uvm_pager.h>
+
 #include <miscfs/fifofs/fifo.h>
 
 /* Also see sys/sys/vnode.h. */
 #define IO_ASYNC	0x10000000
 
-static void hammer2_truncate_file(hammer2_inode_t *, hammer2_key_t);
-static void hammer2_extend_file(hammer2_inode_t *, hammer2_key_t);
-static void hammer2_truncate_buffers(hammer2_inode_t *, hammer2_key_t);
+static int hammer2_truncate_file(hammer2_inode_t *, hammer2_key_t);
+static int hammer2_extend_file(hammer2_inode_t *, hammer2_key_t);
+static int hammer2_truncate_buffers(hammer2_inode_t *, hammer2_key_t);
+static int hammer2_extend_buffers(hammer2_inode_t *, hammer2_key_t,
+    hammer2_key_t, struct buf **);
+static void hammer2_vnode_mmap_sync(struct vnode *);
+
+extern boolean_t uvn_flush(struct uvm_object *, voff_t, voff_t, int);
 
 #ifdef DIAGNOSTIC
 extern int prtactive;
@@ -101,7 +109,7 @@ hammer2_inactive(void *v)
 		 */
 		hammer2_inode_unlock(ip);
 		hammer2_mtx_ex(&ip->truncate_lock);
-		hammer2_truncate_buffers(ip, 0);
+		(void)hammer2_truncate_buffers(ip, 0);
 		hammer2_mtx_unlock(&ip->truncate_lock);
 		hammer2_inode_lock(ip, 0);
 
@@ -190,6 +198,21 @@ hammer2_reclaim(void *v)
 	return (0);
 }
 
+static void
+hammer2_vnode_mmap_sync(struct vnode *vp)
+{
+	struct uvm_vnode *uvn;
+
+	if (vp == NULL || vp->v_type != VREG || vp->v_uvm == NULL)
+		return;
+	uvn = vp->v_uvm;
+	rw_enter(uvn->u_obj.vmobjlock, RW_WRITE);
+	if (uvn->u_flags & UVM_VNODE_VALID)
+		(void)uvn_flush(&uvn->u_obj, 0, 0,
+		    PGO_CLEANIT | PGO_ALLPAGES | PGO_DOACTCLUST);
+	rw_exit(uvn->u_obj.vmobjlock);
+}
+
 /*
  * Currently this function synchronizes the front-end inode state to the
  * backend chain topology, then flushes the inode's chain and sub-topology
@@ -209,6 +232,18 @@ hammer2_fsync(void *v)
 	hammer2_inode_t *ip = VTOI(vp);
 	int error1 = 0, error2;
 
+	/*
+	 * OpenBSD's VM pager is separate from the logical buffer cache.
+	 * For an explicit fsync, flush mapped dirty pages first while the
+	 * vnode is unlocked so pager I/O can reacquire the vnode cleanly.
+	 */
+	if (vp->v_type == VREG && ap->a_waitfor != MNT_LAZY && vp->v_mount &&
+	    (vp->v_mount->mnt_flag & MNT_RDONLY) == 0) {
+		VOP_UNLOCK(vp);
+		hammer2_vnode_mmap_sync(vp);
+		(void)vn_lock(vp, LK_EXCLUSIVE | LK_RETRY);
+	}
+
 	hammer2_trans_init(ip->pmp, 0);
 
 	/*
@@ -223,6 +258,8 @@ hammer2_fsync(void *v)
 	 * doing scattered reads.
 	 */
 	vflushbuf(vp, ap->a_waitfor == MNT_WAIT);
+	if (ap->a_waitfor == MNT_WAIT)
+		(void)vwaitforio(vp, 0, "h2fsync", INFSLP);
 
 	/* Flush any inode changes. */
 	hammer2_inode_lock(ip, 0);
@@ -440,6 +477,9 @@ hammer2_setattr(void *v)
 	    vap->va_gen != (u_long)VNOVAL)
 		return (EINVAL);
 
+	error = hammer2_pfs_memory_wait(ip->pmp);
+	if (error)
+		return (error);
 	hammer2_trans_init(ip->pmp, 0);
 	hammer2_inode_lock(ip, 0);
 
@@ -503,11 +543,15 @@ hammer2_setattr(void *v)
 				break;
 			if (vap->va_size < ip->meta.size) {
 				hammer2_mtx_ex(&ip->truncate_lock);
-				hammer2_truncate_file(ip, vap->va_size);
+				error = hammer2_truncate_file(ip, vap->va_size);
 				hammer2_mtx_unlock(&ip->truncate_lock);
 			} else {
-				hammer2_extend_file(ip, vap->va_size);
+				hammer2_mtx_ex(&ip->truncate_lock);
+				error = hammer2_extend_file(ip, vap->va_size);
+				hammer2_mtx_unlock(&ip->truncate_lock);
 			}
+			if (error)
+				goto done;
 			hammer2_update_time(&ctime);
 			hammer2_inode_modify(ip);
 			ip->meta.ctime = ctime;
@@ -834,7 +878,7 @@ hammer2_write_file(hammer2_inode_t *ip, struct uio *uio, int ioflag,
 	ssize_t overrun;
 	uint64_t mtime;
 	int lblksize, loff, trivial, endofblk;
-	int modified = 0, error = 0;
+	int modified = 0, error = 0, error2;
 
 	KKASSERT(uio->uio_rw == UIO_WRITE);
 	KKASSERT(uio->uio_offset >= 0);
@@ -874,7 +918,12 @@ hammer2_write_file(hammer2_inode_t *ip, struct uio *uio, int ioflag,
 	if (uio->uio_offset + uio->uio_resid > old_eof) {
 		new_eof = uio->uio_offset + uio->uio_resid;
 		modified = 1;
-		hammer2_extend_file(ip, new_eof);
+		error = hammer2_extend_file(ip, new_eof);
+		if (error) {
+			hammer2_mtx_unlock(&ip->lock);
+			hammer2_mtx_unlock(&ip->truncate_lock);
+			return (error);
+		}
 	} else {
 		new_eof = old_eof;
 	}
@@ -989,7 +1038,9 @@ hammer2_write_file(hammer2_inode_t *ip, struct uio *uio, int ioflag,
 		hammer2_mtx_unlock(&ip->truncate_lock);
 		hammer2_mtx_ex(&ip->lock); /* note lock order */
 		hammer2_mtx_ex(&ip->truncate_lock); /* note lock order */
-		hammer2_truncate_file(ip, old_eof);
+		error2 = hammer2_truncate_file(ip, old_eof);
+		if (error2)
+			error = error2;
 		if (ip->flags & HAMMER2_INODE_MODIFIED) {
 			/*
 			 * If we successfully wrote any data, and we are not the superuser
@@ -1065,6 +1116,11 @@ hammer2_write(void *v)
 	 * UVM pageout and other kernel-originated buffer-cache writes arrive
 	 * as UIO_SYSSPACE.
 	 */
+	if (uio->uio_segflg != UIO_SYSSPACE) {
+		error = hammer2_pfs_memory_wait(ip->pmp);
+		if (error)
+			return (error);
+	}
 	if (uio->uio_segflg == UIO_SYSSPACE)
 		hammer2_trans_init(ip->pmp, HAMMER2_TRANS_BUFCACHE);
 	else
@@ -1084,19 +1140,21 @@ hammer2_write(void *v)
  * logical buffer cache are separate here, so shrinking a file has to
  * update both sides explicitly.
  */
-static void
+static int
 hammer2_truncate_buffers(hammer2_inode_t *ip, hammer2_key_t nsize)
 {
 	struct vnode *vp = ip->vp;
 	struct buf *bp;
+	struct buf *tbp;
 	daddr_t first_lbn;
 	daddr_t lbn;
 	int boff;
 	int nblksize;
 	int s;
+	int error;
 
 	if (vp == NULL)
-		return;
+		return (0);
 
 	/*
 	 * The UVM and logical buffer cache are separate on OpenBSD.
@@ -1109,9 +1167,6 @@ hammer2_truncate_buffers(hammer2_inode_t *ip, hammer2_key_t nsize)
 	(void)vwaitforio(vp, 0, "h2trbio", INFSLP);
 	splx(s);
 
-	uvm_vnp_setsize(vp, nsize);
-	uvm_vnp_uncache(vp);
-
 	nblksize = hammer2_calc_logical(ip, 0, NULL, NULL);
 	boff = (int)(nsize & (nblksize - 1));
 	first_lbn = (daddr_t)(nsize / nblksize);
@@ -1119,64 +1174,128 @@ hammer2_truncate_buffers(hammer2_inode_t *ip, hammer2_key_t nsize)
 		++first_lbn;
 
 	/*
+	 * If EOF lands in the middle of a logical buffer, preserve the bytes
+	 * before EOF and zero the tail first so any I/O failure aborts the
+	 * truncate before we disturb the vnode's VM view.
+	 */
+	bp = NULL;
+	if (boff) {
+		lbn = first_lbn - 1;
+		bp = getblk(vp, lbn, nblksize, 0, 0);
+		if ((bp->b_flags & B_CACHE) == 0) {
+			brelse(bp);
+			bp = NULL;
+			error = bread(vp, lbn, nblksize, &bp);
+			if (error) {
+				if (bp)
+					brelse(bp);
+				return (error);
+			}
+		}
+		if (boff < bp->b_bufsize)
+			memset(bp->b_data + boff, 0, bp->b_bufsize - boff);
+	}
+
+	uvm_vnp_setsize(vp, nsize);
+	uvm_vnp_uncache(vp);
+
+	/*
 	 * Discard any fully truncated logical buffers, clean or dirty.
 	 * Iterate one buffer at a time because brelse() removes the buffer
 	 * from the vnode's lists when B_INVAL is set.
 	 */
 	for (;;) {
-		bp = NULL;
+		tbp = NULL;
 		s = splbio();
 
-		LIST_FOREACH(bp, &vp->v_cleanblkhd, b_vnbufs) {
-			if (bp->b_lblkno >= 0 && bp->b_lblkno >= first_lbn)
+		LIST_FOREACH(tbp, &vp->v_cleanblkhd, b_vnbufs) {
+			if (tbp->b_lblkno >= 0 && tbp->b_lblkno >= first_lbn)
 				break;
 		}
-		if (bp == NULL) {
-			LIST_FOREACH(bp, &vp->v_dirtyblkhd, b_vnbufs) {
-				if (bp->b_lblkno >= 0 && bp->b_lblkno >= first_lbn)
+		if (tbp == NULL) {
+			LIST_FOREACH(tbp, &vp->v_dirtyblkhd, b_vnbufs) {
+				if (tbp->b_lblkno >= 0 &&
+				    tbp->b_lblkno >= first_lbn)
 					break;
 			}
 		}
-		if (bp == NULL) {
+		if (tbp == NULL) {
 			splx(s);
 			break;
 		}
-		if (bp->b_flags & B_BUSY) {
-			bp->b_flags |= B_WANTED;
-			(void)tsleep_nsec(bp, PRIBIO + 1, "h2trbuf", INFSLP);
+		if (tbp->b_flags & B_BUSY) {
+			tbp->b_flags |= B_WANTED;
+			(void)tsleep_nsec(tbp, PRIBIO + 1, "h2trbuf", INFSLP);
 			splx(s);
 			continue;
 		}
-		bufcache_take(bp);
-		buf_acquire_nomap(bp);
-		bp->b_flags |= B_INVAL;
+		bufcache_take(tbp);
+		buf_acquire_nomap(tbp);
+		tbp->b_flags |= B_INVAL;
 		splx(s);
-		brelse(bp);
+		brelse(tbp);
 	}
 
-	/*
-	 * If EOF lands in the middle of a logical buffer, preserve the bytes
-	 * before EOF and zero the tail.  The zeroed tail must remain dirty so
-	 * a later fsync/sync writes it before the resized inode topology is
-	 * flushed to media.
-	 */
-	if (boff == 0)
-		return;
+	if (bp)
+		bdwrite(bp);
 
-	lbn = first_lbn - 1;
-	bp = getblk(vp, lbn, nblksize, 0, 0);
+	return (0);
+}
+
+/*
+ * OpenBSD analogue of DragonFly's nvextendbuf().  Growing a file that
+ * ends in the middle of a logical buffer has to preserve the existing
+ * bytes in that block and zero the newly exposed range so a later
+ * re-read or re-extend cannot expose stale tail data from the cache.
+ *
+ * If a partial EOF block must be retained, return it busy via *bpp with
+ * the post-EOF tail already zeroed.  The caller is responsible for
+ * releasing it after the inode size transition has been committed.
+ */
+static int
+hammer2_extend_buffers(hammer2_inode_t *ip, hammer2_key_t osize,
+    hammer2_key_t nsize, struct buf **bpp)
+{
+	struct vnode *vp = ip->vp;
+	struct buf *bp;
+	hammer2_key_t lbase;
+	daddr_t lbn;
+	int boff;
+	int lblksize;
+	int s;
+	int error;
+
+	*bpp = NULL;
+	if (vp == NULL || nsize <= osize || osize == 0)
+		return (0);
+
+	lblksize = hammer2_calc_logical(ip, osize - 1, &lbase, NULL);
+	KKASSERT(lblksize <= MAXBSIZE);
+	boff = (int)(osize - lbase);
+	if (boff == 0)
+		return (0);
+
+	lbn = lbase / lblksize;
+	s = splbio();
+	(void)vwaitforio(vp, 0, "h2exbio", INFSLP);
+	splx(s);
+
+	bp = getblk(vp, lbn, lblksize, 0, 0);
 	if ((bp->b_flags & B_CACHE) == 0) {
 		brelse(bp);
 		bp = NULL;
-		if (bread(vp, lbn, nblksize, &bp) != 0) {
+		error = bread(vp, lbn, lblksize, &bp);
+		if (error) {
 			if (bp)
 				brelse(bp);
-			return;
+			return (error);
 		}
 	}
 	if (boff < bp->b_bufsize)
 		memset(bp->b_data + boff, 0, bp->b_bufsize - boff);
-	bdwrite(bp);
+	*bpp = bp;
+
+	return (0);
 }
 
 /*
@@ -1194,19 +1313,25 @@ hammer2_truncate_buffers(hammer2_inode_t *ip, hammer2_key_t nsize)
  * WARNING! Caller assumes responsibility for removing dead blocks
  *	    if INODE_RESIZED is set.
  */
-static void
+static int
 hammer2_truncate_file(hammer2_inode_t *ip, hammer2_key_t nsize)
 {
+	int error;
+
 	hammer2_mtx_assert_locked(&ip->lock);
 
 	hammer2_mtx_unlock(&ip->lock);
-	hammer2_truncate_buffers(ip, nsize);
+	error = hammer2_truncate_buffers(ip, nsize);
 	hammer2_mtx_ex(&ip->lock);
+	if (error)
+		return (error);
 	KKASSERT((ip->flags & HAMMER2_INODE_RESIZED) == 0);
 	ip->osize = ip->meta.size;
 	ip->meta.size = nsize;
 	atomic_set_int(&ip->flags, HAMMER2_INODE_RESIZED);
 	hammer2_inode_modify(ip);
+
+	return (0);
 }
 
 /*
@@ -1224,7 +1349,7 @@ hammer2_truncate_file(hammer2_inode_t *ip, hammer2_key_t nsize)
  * WARNING! Caller assumes responsibility for transitioning out
  *	    of the inode DIRECTDATA mode if INODE_RESIZED is set.
  */
-static void
+static int
 hammer2_extend_file(hammer2_inode_t *ip, hammer2_key_t nsize)
 {
 	hammer2_key_t osize;
@@ -1235,6 +1360,11 @@ hammer2_extend_file(hammer2_inode_t *ip, hammer2_key_t nsize)
 
 	KKASSERT((ip->flags & HAMMER2_INODE_RESIZED) == 0);
 	osize = ip->meta.size;
+	bp = NULL;
+
+	error = hammer2_extend_buffers(ip, osize, nsize, &bp);
+	if (error)
+		return (error);
 
 	hammer2_inode_modify(ip);
 	ip->osize = osize;
@@ -1248,30 +1378,22 @@ hammer2_extend_file(hammer2_inode_t *ip, hammer2_key_t nsize)
 	 * with the meta-data topology flush.
 	 *
 	 * We must retain and re-dirty the buffer cache buffer containing
-	 * the direct data so it can be written to a real block.  It should
-	 * not be possible for a bread error to occur since the original data
-	 * is extracted from the inode structure directly.
+	 * the direct data so it can be written to a real block.
 	 */
 	if (osize <= HAMMER2_EMBEDDED_BYTES && nsize > HAMMER2_EMBEDDED_BYTES) {
-		if (osize) {
-			error = bread(ip->vp, 0, hammer2_get_logical(), &bp);
-			atomic_set_int(&ip->flags, HAMMER2_INODE_RESIZED);
-			hammer2_inode_chain_sync(ip);
-			if (error == 0)
-				bdwrite(bp);
-			else
-				brelse(bp);
-		} else {
-			atomic_set_int(&ip->flags, HAMMER2_INODE_RESIZED);
-			hammer2_inode_chain_sync(ip);
-		}
+		atomic_set_int(&ip->flags, HAMMER2_INODE_RESIZED);
+		hammer2_inode_chain_sync(ip);
 	}
 	hammer2_mtx_unlock(&ip->lock);
 	if (ip->vp) {
 		uvm_vnp_setsize(ip->vp, nsize);
 		uvm_vnp_uncache(ip->vp);
 	}
+	if (bp)
+		bdwrite(bp);
 	hammer2_mtx_ex(&ip->lock);
+
+	return (0);
 }
 
 static int
@@ -1572,6 +1694,9 @@ hammer2_mknod(void *v)
 	 * Create the device inode and then create the directory entry.
 	 * dip must be locked before nip to avoid deadlock.
 	 */
+	error = hammer2_pfs_memory_wait(dip->pmp);
+	if (error)
+		return (error);
 	hammer2_trans_init(dip->pmp, 0);
 	inum = hammer2_trans_newinum(dip->pmp);
 
@@ -1676,6 +1801,9 @@ hammer2_mkdir(void *v)
 	 * Create the directory inode and then create the directory entry.
 	 * dip must be locked before nip to avoid deadlock.
 	 */
+	error = hammer2_pfs_memory_wait(dip->pmp);
+	if (error)
+		goto out;
 	hammer2_trans_init(dip->pmp, 0);
 	inum = hammer2_trans_newinum(dip->pmp);
 
@@ -1770,6 +1898,9 @@ hammer2_create(void *v)
 	 * Create the regular file inode and then create the directory entry.
 	 * dip must be locked before nip to avoid deadlock.
 	 */
+	error = hammer2_pfs_memory_wait(dip->pmp);
+	if (error)
+		goto out;
 	hammer2_trans_init(dip->pmp, 0);
 	inum = hammer2_trans_newinum(dip->pmp);
 
@@ -1868,6 +1999,9 @@ hammer2_rmdir(void *v)
 		goto out;
 	}
 
+	error = hammer2_pfs_memory_wait(dip->pmp);
+	if (error)
+		goto out;
 	hammer2_trans_init(dip->pmp, 0);
 	hammer2_inode_lock(dip, 0);
 
@@ -1958,6 +2092,9 @@ hammer2_remove(void *v)
 		goto out;
 	}
 
+	error = hammer2_pfs_memory_wait(dip->pmp);
+	if (error)
+		goto out;
 	hammer2_trans_init(dip->pmp, 0);
 	hammer2_inode_lock(dip, 0);
 
@@ -2226,6 +2363,9 @@ hammer2_rename(void *v)
 		}
 	}
 
+	error = hammer2_pfs_memory_wait(tdip->pmp);
+	if (error)
+		goto abortit;
 	hammer2_trans_init(tdip->pmp, 0);
 	hammer2_inode_ref(fip); /* extra ref */
 
@@ -2445,6 +2585,9 @@ hammer2_link(void *v)
 	 * is locked.
 	 */
 	KKASSERT(ip->pmp);
+	error = hammer2_pfs_memory_wait(ip->pmp);
+	if (error)
+		goto out;
 	hammer2_trans_init(ip->pmp, 0);
 
 	/*
@@ -2524,6 +2667,9 @@ hammer2_symlink(void *v)
 	 * Create the softlink as an inode and then create the directory entry.
 	 * dip must be locked before nip to avoid deadlock.
 	 */
+	error = hammer2_pfs_memory_wait(dip->pmp);
+	if (error)
+		goto out;
 	hammer2_trans_init(dip->pmp, 0);
 	inum = hammer2_trans_newinum(dip->pmp);
 

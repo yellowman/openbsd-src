@@ -332,8 +332,22 @@ static void hammer2_write_bp(hammer2_chain_t *, char *, int, int, hammer2_tid_t,
 static void
 hammer2_bioq_enter(hammer2_pfs_t *pmp)
 {
+	int limit;
+	int lowat;
 
 	hammer2_lk_ex(&pmp->bioq_lock);
+	for (;;) {
+		limit = hammer2_flush_pipe;
+		if (limit <= 0 || pmp->bioq_inprog < limit)
+			break;
+		lowat = limit - ((limit + 3) / 4);
+		if (lowat < 1)
+			lowat = 1;
+		do {
+			hammer2_lkc_sleep(&pmp->bioq_cv, &pmp->bioq_lock,
+			    "h2wpipe", 0);
+		} while (pmp->bioq_inprog > lowat);
+	}
 	++pmp->bioq_inprog;
 	hammer2_lk_unlock(&pmp->bioq_lock);
 }
@@ -387,14 +401,6 @@ hammer2_strategy_write(struct vop_strategy_args *ap)
 	xop->bp = bp;
 	xop->lbase = lbase;
 	hammer2_xop_start(&xop->head, &hammer2_strategy_write_desc);
-
-	/*
-	 * DragonFly throttles the number of logical writes in flight so a long
-	 * dirty run cannot outrun the backend and then stall catastrophically
-	 * later.  OpenBSD lacks the same bio tracking primitives, so use the
-	 * logical-write counter as a cv-backed pressure valve here.
-	 */
-	hammer2_bioq_wait(pmp, hammer2_flush_pipe);
 
 	hammer2_xop_retire(&xop->head, HAMMER2_XOPMASK_VOP);
 
