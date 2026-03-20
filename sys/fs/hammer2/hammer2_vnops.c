@@ -60,7 +60,7 @@ static int hammer2_extend_file(hammer2_inode_t *, hammer2_key_t);
 static int hammer2_truncate_buffers(hammer2_inode_t *, hammer2_key_t);
 static int hammer2_extend_buffers(hammer2_inode_t *, hammer2_key_t,
     hammer2_key_t, struct buf **);
-static void hammer2_vnode_mmap_sync(struct vnode *);
+static int hammer2_vnode_mmap_sync(struct vnode *);
 
 extern boolean_t uvn_flush(struct uvm_object *, voff_t, voff_t, int);
 
@@ -198,19 +198,21 @@ hammer2_reclaim(void *v)
 	return (0);
 }
 
-static void
+static int
 hammer2_vnode_mmap_sync(struct vnode *vp)
 {
 	struct uvm_vnode *uvn;
+	boolean_t ok = TRUE;
 
 	if (vp == NULL || vp->v_type != VREG || vp->v_uvm == NULL)
-		return;
+		return (0);
 	uvn = vp->v_uvm;
 	rw_enter(uvn->u_obj.vmobjlock, RW_WRITE);
 	if (uvn->u_flags & UVM_VNODE_VALID)
-		(void)uvn_flush(&uvn->u_obj, 0, 0,
-		    PGO_CLEANIT | PGO_ALLPAGES | PGO_DOACTCLUST);
+		ok = uvn_flush(&uvn->u_obj, 0, 0,
+		    PGO_CLEANIT | PGO_ALLPAGES | PGO_DOACTCLUST | PGO_SYNCIO);
 	rw_exit(uvn->u_obj.vmobjlock);
+	return (ok ? 0 : EIO);
 }
 
 /*
@@ -230,7 +232,7 @@ hammer2_fsync(void *v)
 	} */ *ap = v;
 	struct vnode *vp = ap->a_vp;
 	hammer2_inode_t *ip = VTOI(vp);
-	int error1 = 0, error2;
+	int error1 = 0, error2, error3, mmap_error = 0;
 
 	/*
 	 * OpenBSD's VM pager is separate from the logical buffer cache.
@@ -240,7 +242,7 @@ hammer2_fsync(void *v)
 	if (vp->v_type == VREG && ap->a_waitfor != MNT_LAZY && vp->v_mount &&
 	    (vp->v_mount->mnt_flag & MNT_RDONLY) == 0) {
 		VOP_UNLOCK(vp);
-		hammer2_vnode_mmap_sync(vp);
+		mmap_error = hammer2_vnode_mmap_sync(vp);
 		(void)vn_lock(vp, LK_EXCLUSIVE | LK_RETRY);
 	}
 
@@ -258,8 +260,6 @@ hammer2_fsync(void *v)
 	 * doing scattered reads.
 	 */
 	vflushbuf(vp, ap->a_waitfor == MNT_WAIT);
-	if (ap->a_waitfor == MNT_WAIT)
-		(void)vwaitforio(vp, 0, "h2fsync", INFSLP);
 
 	/* Flush any inode changes. */
 	hammer2_inode_lock(ip, 0);
@@ -279,6 +279,18 @@ hammer2_fsync(void *v)
 
 	hammer2_inode_unlock(ip);
 	hammer2_trans_done(ip->pmp, 0);
+
+	if (mmap_error && error1 == 0)
+		error1 = mmap_error;
+	if (ap->a_waitfor != MNT_LAZY) {
+		error2 = hammer2_inode_wsync_wait(ip);
+		if (error2 && error1 == 0)
+			error1 = error2;
+		error3 = hammer2_pfs_fsync_devices(ip->pmp, ap->a_cred,
+		    ap->a_waitfor, ap->a_p);
+		if (error3 && error1 == 0)
+			error1 = error3;
+	}
 
 	return (error1);
 }
@@ -477,9 +489,6 @@ hammer2_setattr(void *v)
 	    vap->va_gen != (u_long)VNOVAL)
 		return (EINVAL);
 
-	error = hammer2_pfs_memory_wait(ip->pmp);
-	if (error)
-		return (error);
 	hammer2_trans_init(ip->pmp, 0);
 	hammer2_inode_lock(ip, 0);
 
@@ -1116,11 +1125,6 @@ hammer2_write(void *v)
 	 * UVM pageout and other kernel-originated buffer-cache writes arrive
 	 * as UIO_SYSSPACE.
 	 */
-	if (uio->uio_segflg != UIO_SYSSPACE) {
-		error = hammer2_pfs_memory_wait(ip->pmp);
-		if (error)
-			return (error);
-	}
 	if (uio->uio_segflg == UIO_SYSSPACE)
 		hammer2_trans_init(ip->pmp, HAMMER2_TRANS_BUFCACHE);
 	else
@@ -1694,9 +1698,6 @@ hammer2_mknod(void *v)
 	 * Create the device inode and then create the directory entry.
 	 * dip must be locked before nip to avoid deadlock.
 	 */
-	error = hammer2_pfs_memory_wait(dip->pmp);
-	if (error)
-		return (error);
 	hammer2_trans_init(dip->pmp, 0);
 	inum = hammer2_trans_newinum(dip->pmp);
 
@@ -1801,9 +1802,6 @@ hammer2_mkdir(void *v)
 	 * Create the directory inode and then create the directory entry.
 	 * dip must be locked before nip to avoid deadlock.
 	 */
-	error = hammer2_pfs_memory_wait(dip->pmp);
-	if (error)
-		goto out;
 	hammer2_trans_init(dip->pmp, 0);
 	inum = hammer2_trans_newinum(dip->pmp);
 
@@ -1898,9 +1896,6 @@ hammer2_create(void *v)
 	 * Create the regular file inode and then create the directory entry.
 	 * dip must be locked before nip to avoid deadlock.
 	 */
-	error = hammer2_pfs_memory_wait(dip->pmp);
-	if (error)
-		goto out;
 	hammer2_trans_init(dip->pmp, 0);
 	inum = hammer2_trans_newinum(dip->pmp);
 
@@ -1999,9 +1994,6 @@ hammer2_rmdir(void *v)
 		goto out;
 	}
 
-	error = hammer2_pfs_memory_wait(dip->pmp);
-	if (error)
-		goto out;
 	hammer2_trans_init(dip->pmp, 0);
 	hammer2_inode_lock(dip, 0);
 
@@ -2092,9 +2084,6 @@ hammer2_remove(void *v)
 		goto out;
 	}
 
-	error = hammer2_pfs_memory_wait(dip->pmp);
-	if (error)
-		goto out;
 	hammer2_trans_init(dip->pmp, 0);
 	hammer2_inode_lock(dip, 0);
 
@@ -2363,9 +2352,6 @@ hammer2_rename(void *v)
 		}
 	}
 
-	error = hammer2_pfs_memory_wait(tdip->pmp);
-	if (error)
-		goto abortit;
 	hammer2_trans_init(tdip->pmp, 0);
 	hammer2_inode_ref(fip); /* extra ref */
 
@@ -2585,9 +2571,6 @@ hammer2_link(void *v)
 	 * is locked.
 	 */
 	KKASSERT(ip->pmp);
-	error = hammer2_pfs_memory_wait(ip->pmp);
-	if (error)
-		goto out;
 	hammer2_trans_init(ip->pmp, 0);
 
 	/*
@@ -2667,9 +2650,6 @@ hammer2_symlink(void *v)
 	 * Create the softlink as an inode and then create the directory entry.
 	 * dip must be locked before nip to avoid deadlock.
 	 */
-	error = hammer2_pfs_memory_wait(dip->pmp);
-	if (error)
-		goto out;
 	hammer2_trans_init(dip->pmp, 0);
 	inum = hammer2_trans_newinum(dip->pmp);
 

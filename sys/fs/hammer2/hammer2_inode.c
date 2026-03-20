@@ -525,6 +525,79 @@ hammer2_inode_ref(hammer2_inode_t *ip)
 	atomic_add_int(&ip->refs, 1);
 }
 
+static void
+hammer2_wsync_ref(hammer2_wsync_t *wsync)
+{
+	if (wsync)
+		atomic_inc_int(&wsync->refs);
+}
+
+static void
+hammer2_wsync_drop(hammer2_wsync_t *wsync)
+{
+	if (wsync == NULL)
+		return;
+	if (atomic_dec_int_nv(&wsync->refs) == 0)
+		hfree(wsync, M_HAMMER2, sizeof(*wsync));
+}
+
+hammer2_wref_t *
+hammer2_wref_alloc(hammer2_inode_t *ip)
+{
+	hammer2_wref_t *wref;
+	hammer2_wsync_t *wsync;
+
+	wref = hmalloc(sizeof(*wref), M_HAMMER2, M_WAITOK | M_ZERO);
+	wsync = ip->wsync;
+	KASSERT(wsync);
+	hammer2_wsync_ref(wsync);
+	atomic_inc_int(&wsync->count);
+	wref->wsync = wsync;
+	return (wref);
+}
+
+void
+hammer2_wref_complete(hammer2_wref_t *wref)
+{
+	hammer2_wsync_t *wsync;
+	int s;
+
+	if (wref == NULL)
+		return;
+	wsync = wref->wsync;
+	wref->wsync = NULL;
+	if (wsync) {
+		(void)atomic_dec_int_nv(&wsync->count);
+		s = splbio();
+		wakeup(wsync);
+		splx(s);
+		hammer2_wsync_drop(wsync);
+	}
+	hfree(wref, M_HAMMER2, sizeof(*wref));
+}
+
+int
+hammer2_inode_wsync_wait(hammer2_inode_t *ip)
+{
+	hammer2_wsync_t *wsync;
+	int s, error = 0;
+
+	wsync = ip->wsync;
+	if (wsync == NULL)
+		return (0);
+	hammer2_wsync_ref(wsync);
+	s = splbio();
+	while (wsync->count != 0) {
+		error = tsleep_nsec(wsync, PRIBIO + 1, "h2wsync", INFSLP);
+		if (error == ERESTART || error == EINTR)
+			break;
+		error = 0;
+	}
+	splx(s);
+	hammer2_wsync_drop(wsync);
+	return (error);
+}
+
 /*
  * Drop an inode reference, freeing the inode when the last reference goes
  * away.
@@ -574,6 +647,8 @@ hammer2_inode_drop(hammer2_inode_t *ip)
 				hammer2_mtx_destroy(&ip->lock);
 				hammer2_mtx_destroy(&ip->truncate_lock);
 				hammer2_spin_destroy(&ip->cluster_spin);
+				hammer2_wsync_drop(ip->wsync);
+				ip->wsync = NULL;
 
 				pool_put(&hammer2_pool_inode, ip);
 				atomic_add_int(&hammer2_count_inode_allocated,
@@ -766,6 +841,9 @@ again:
 	}
 
 	nip->pmp = pmp;
+	nip->wsync = hmalloc(sizeof(*nip->wsync), M_HAMMER2,
+	    M_WAITOK | M_ZERO);
+	nip->wsync->refs = 1;
 
 	/* Calculate ipdep index. */
 	nip->ipdep_idx = nip->meta.inum % HAMMER2_IHASH_SIZE;

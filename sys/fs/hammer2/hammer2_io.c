@@ -53,6 +53,16 @@ static hammer2_io_t *hammer2_io_hash_lookup(hammer2_dev_t *, hammer2_off_t,
 static hammer2_io_t *hammer2_io_hash_enter(hammer2_dev_t *, hammer2_io_t *,
     uint64_t *);
 static void hammer2_io_hash_cleanup(hammer2_dev_t *, int);
+static void hammer2_io_track_iodone(struct buf *);
+
+struct hammer2_wtrack {
+	hammer2_wref_t	*wrefs;
+	void		(*iodone)(struct buf *);
+	void		*saveaddr;
+	int		docall;
+};
+
+typedef struct hammer2_wtrack hammer2_wtrack_t;
 
 static __inline void
 hammer2_assert_io_refs(hammer2_io_t *dio)
@@ -60,6 +70,41 @@ hammer2_assert_io_refs(hammer2_io_t *dio)
 	KKASSERT(dio);
 	hammer2_mtx_assert_ex(&dio->lock);
 	KKASSERT((dio->refs & HAMMER2_DIO_MASK) != 0);
+}
+
+static void
+hammer2_io_track_iodone(struct buf *bp)
+{
+	hammer2_wtrack_t *track;
+	hammer2_wref_t *wref, *next;
+	void (*iodone)(struct buf *);
+	void *saveaddr;
+	int docall;
+
+	track = bp->b_saveaddr;
+	KASSERT(track);
+	wref = track->wrefs;
+	iodone = track->iodone;
+	saveaddr = track->saveaddr;
+	docall = track->docall;
+	bp->b_saveaddr = saveaddr;
+	bp->b_iodone = iodone;
+	hfree(track, M_HAMMER2, sizeof(*track));
+
+	while (wref) {
+		next = wref->next;
+		hammer2_wref_complete(wref);
+		wref = next;
+	}
+
+	if (docall && iodone) {
+		iodone(bp);
+	} else if (bp->b_flags & B_ASYNC) {
+		brelse(bp);
+	} else {
+		CLR(bp->b_flags, B_WANTED);
+		wakeup(bp);
+	}
 }
 
 void
@@ -278,6 +323,7 @@ hammer2_io_putblk(hammer2_io_t **diop)
 	struct buf *bp;
 	uint64_t orefs;
 	int dio_limit;
+	int do_write;
 
 	dio = *diop;
 	*diop = NULL;
@@ -297,7 +343,8 @@ hammer2_io_putblk(hammer2_io_t **diop)
 	orefs = dio->refs;
 	if ((dio->refs & HAMMER2_DIO_MASK) == 1) {
 		dio->refs--;
-		dio->refs &= ~(HAMMER2_DIO_GOOD | HAMMER2_DIO_DIRTY);
+		dio->refs &= ~(HAMMER2_DIO_GOOD | HAMMER2_DIO_DIRTY |
+		    HAMMER2_DIO_FLUSH | HAMMER2_DIO_SYNC);
 	} else {
 		dio->refs--;
 		hammer2_mtx_unlock(&dio->lock);
@@ -308,39 +355,24 @@ hammer2_io_putblk(hammer2_io_t **diop)
 	hmp = dio->hmp;
 	bp = dio->bp;
 	dio->bp = NULL;
+	do_write = 0;
 
-	/* Write out and dispose of buffer. */
+	/* Classify disposal before dropping the dio lock. */
 	if ((orefs & HAMMER2_DIO_GOOD) && bp) {
-		/* Non-errored disposal of buffer. */
 		if (orefs & HAMMER2_DIO_DIRTY) {
-			/*
-			 * Allows dirty buffers to accumulate and
-			 * possibly be canceled (e.g. by a 'rm'),
-			 * by default we will burst-write later.
-			 *
-			 * We generally do NOT want to issue an actual
-			 * b[a]write() or cluster_write() here.  Due to
-			 * the way chains are locked, buffers may be cycled
-			 * in and out quite often and disposal here can cause
-			 * multiple writes or write-read stalls.
-			 *
-			 * If FLUSH is set we do want to issue the actual
-			 * write.  This typically occurs in the write-behind
-			 * case when writing to large files.
-			 */
-			/* No cluster_write() in OpenBSD. */
-			if (dio->refs & HAMMER2_DIO_FLUSH)
-				bawrite(bp);
-			else
-				bdwrite(bp);
-			hammer2_inc_iostat(&hmp->iostat_write, dio->btype,
-			    dio->psize);
+			if (orefs & HAMMER2_DIO_FLUSH) {
+				if (orefs & HAMMER2_DIO_SYNC)
+					do_write = 3;
+				else
+					do_write = 2;
+			} else {
+				do_write = 1;
+			}
 		} else {
-			bqrelse(bp);
+			do_write = -1;
 		}
 	} else if (bp) {
-		/* Errored disposal of buffer. */
-		brelse(bp);
+		do_write = -2;
 	}
 
 	/* Update iofree_count before disposing of the dio. */
@@ -348,6 +380,35 @@ hammer2_io_putblk(hammer2_io_t **diop)
 
 	KKASSERT(!(dio->refs & HAMMER2_DIO_GOOD));
 	hammer2_mtx_unlock(&dio->lock);
+
+	/* Write out and dispose of buffer. */
+	if (bp) {
+		switch (do_write) {
+		case 3:
+			(void)bwrite(bp);
+			hammer2_inc_iostat(&hmp->iostat_write, dio->btype,
+			    dio->psize);
+			break;
+		case 2:
+			bawrite(bp);
+			hammer2_inc_iostat(&hmp->iostat_write, dio->btype,
+			    dio->psize);
+			break;
+		case 1:
+			bdwrite(bp);
+			hammer2_inc_iostat(&hmp->iostat_write, dio->btype,
+			    dio->psize);
+			break;
+		case -1:
+			bqrelse(bp);
+			break;
+		case -2:
+		default:
+			brelse(bp);
+			break;
+		}
+	}
+
 	/* Another process may come in and get/put this dio. */
 
 	/*
@@ -433,10 +494,43 @@ hammer2_io_bdwrite(hammer2_io_t **diop)
 int
 hammer2_io_bwrite(hammer2_io_t **diop)
 {
-	atomic_set_32(&(*diop)->refs, HAMMER2_DIO_DIRTY | HAMMER2_DIO_FLUSH);
+	atomic_set_32(&(*diop)->refs,
+	    HAMMER2_DIO_DIRTY | HAMMER2_DIO_FLUSH | HAMMER2_DIO_SYNC);
 	hammer2_io_putblk(diop);
 
 	return (0); /* XXX */
+}
+
+void
+hammer2_io_track_write(hammer2_io_t *dio, hammer2_wref_t **wrefp)
+{
+	hammer2_wtrack_t *track;
+	hammer2_wref_t *wref;
+	struct buf *bp;
+
+	wref = *wrefp;
+	if (wref == NULL)
+		return;
+
+	hammer2_mtx_ex(&dio->lock);
+	bp = dio->bp;
+	KASSERT(bp);
+	if ((bp->b_flags & B_CALL) != 0 && bp->b_iodone == hammer2_io_track_iodone) {
+		track = bp->b_saveaddr;
+		KASSERT(track);
+	} else {
+		track = hmalloc(sizeof(*track), M_HAMMER2, M_WAITOK | M_ZERO);
+		track->iodone = bp->b_iodone;
+		track->saveaddr = bp->b_saveaddr;
+		track->docall = ((bp->b_flags & B_CALL) != 0);
+		bp->b_saveaddr = track;
+		bp->b_iodone = hammer2_io_track_iodone;
+		bp->b_flags |= B_CALL;
+	}
+	wref->next = track->wrefs;
+	track->wrefs = wref;
+	hammer2_mtx_unlock(&dio->lock);
+	*wrefp = NULL;
 }
 
 void

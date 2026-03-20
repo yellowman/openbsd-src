@@ -40,6 +40,7 @@
 
 #include <sys/sysctl.h>
 #include <sys/specdev.h>
+#include <sys/dkio.h>
 
 static int hammer2_unmount(struct mount *, int, struct proc *);
 static int hammer2_recovery(hammer2_dev_t *);
@@ -53,6 +54,7 @@ static int hammer2_devvp_same(const hammer2_devvp_t *,
 static int hammer2_devvp_list_exact_match(const hammer2_devvp_list_t *,
     const hammer2_devvp_list_t *);
 static void hammer2_pfs_schedule_sync(hammer2_pfs_t *);
+static int hammer2_vfs_modifying(struct mount *, struct vnode *, int);
 static void hammer2_mount_helper(struct mount *, hammer2_pfs_t *);
 static void hammer2_unmount_helper(struct mount *, hammer2_pfs_t *,
     hammer2_dev_t *);
@@ -1229,6 +1231,63 @@ hammer2_pfs_memory_wait(hammer2_pfs_t *pmp)
 	}
 
 	return (0);
+}
+
+static int
+hammer2_vfs_modifying(struct mount *mp, struct vnode *vp, int flags)
+{
+	hammer2_pfs_t *pmp;
+
+	(void)vp;
+	if (mp == NULL)
+		return (0);
+	pmp = MPTOPMP(mp);
+	if (pmp == NULL)
+		return (0);
+	if (flags & VFS_MODIFYING_BUFCACHE)
+		return (0);
+	return (hammer2_pfs_memory_wait(pmp));
+}
+
+int
+hammer2_pfs_fsync_devices(hammer2_pfs_t *pmp, struct ucred *cred, int waitfor,
+    struct proc *p)
+{
+	hammer2_dev_t *hmp;
+	hammer2_devvp_t *e;
+	struct vnode *devvp;
+	int error = 0, fsync_error, cache_error, force;
+	int i;
+
+	(void)cred;
+	if (pmp == NULL || waitfor == MNT_LAZY)
+		return (0);
+	for (i = 0; i < HAMMER2_MAXCLUSTER; ++i) {
+		hmp = pmp->pfs_hmps[i];
+		if (hmp == NULL)
+			continue;
+		TAILQ_FOREACH(e, &hmp->devvp_list, entry) {
+			devvp = e->devvp;
+			if (devvp == NULL)
+				continue;
+			vn_lock(devvp, LK_EXCLUSIVE | LK_RETRY);
+			fsync_error = VOP_FSYNC(devvp, FSCRED, waitfor,
+			    p ? p : curproc);
+			if (waitfor == MNT_WAIT && fsync_error == 0) {
+				force = 1;
+				cache_error = VOP_IOCTL(devvp, DIOCCACHESYNC, &force,
+				    FWRITE, FSCRED, p ? p : curproc);
+				if (cache_error == ENOTTY || cache_error == EOPNOTSUPP)
+					cache_error = 0;
+				if (cache_error && error == 0)
+					error = cache_error;
+			}
+			VOP_UNLOCK(devvp);
+			if (fsync_error && error == 0)
+				error = fsync_error;
+		}
+	}
+	return (error);
 }
 
 void
@@ -2425,6 +2484,7 @@ const struct vfsops hammer2_vfsops = {
 	.vfs_quotactl = hammer2_quotactl,
 	.vfs_statfs = hammer2_statfs,
 	.vfs_sync = hammer2_sync,
+	.vfs_modifying = hammer2_vfs_modifying,
 	.vfs_vget = hammer2_vget,
 	.vfs_fhtovp = hammer2_fhtovp,
 	.vfs_vptofh = hammer2_vptofh,

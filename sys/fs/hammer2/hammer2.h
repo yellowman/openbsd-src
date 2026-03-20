@@ -91,6 +91,8 @@ struct hammer2_depend;
 struct hammer2_inode;
 struct hammer2_dev;
 struct hammer2_pfs;
+struct hammer2_wsync;
+struct hammer2_wref;
 union hammer2_xop;
 
 typedef struct hammer2_io hammer2_io_t;
@@ -99,6 +101,8 @@ typedef struct hammer2_depend hammer2_depend_t;
 typedef struct hammer2_inode hammer2_inode_t;
 typedef struct hammer2_dev hammer2_dev_t;
 typedef struct hammer2_pfs hammer2_pfs_t;
+typedef struct hammer2_wsync hammer2_wsync_t;
+typedef struct hammer2_wref hammer2_wref_t;
 typedef union hammer2_xop hammer2_xop_t;
 
 /* global list of PFS */
@@ -166,6 +170,16 @@ struct hammer2_io {
 	uint64_t		dedup_alloc;	/* allocated / de-dupable */
 };
 
+struct hammer2_wsync {
+	volatile unsigned int	refs;
+	volatile unsigned int	count;
+};
+
+struct hammer2_wref {
+	struct hammer2_wref	*next;
+	hammer2_wsync_t		*wsync;
+};
+
 struct hammer2_io_hash {
 	hammer2_spin_t		spin;
 	struct hammer2_io	*base;
@@ -176,6 +190,7 @@ typedef struct hammer2_io_hash	hammer2_io_hash_t;
 #define HAMMER2_DIO_GOOD	0x40000000U	/* dio->bp is stable */
 #define HAMMER2_DIO_DIRTY	0x10000000U	/* flush last drop */
 #define HAMMER2_DIO_FLUSH	0x08000000U	/* immediate flush */
+#define HAMMER2_DIO_SYNC	0x04000000U	/* wait for device completion */
 #define HAMMER2_DIO_MASK	0x00FFFFFFU
 
 struct hammer2_inum_hash {
@@ -453,6 +468,7 @@ struct hammer2_inode {
 	int			ccache_nchains;
 	hammer2_inode_meta_t	meta;		/* copy of meta-data */
 	hammer2_pfs_t		*pmp;		/* PFS mount */
+	hammer2_wsync_t		*wsync;		/* per-inode write completion tracker */
 	hammer2_off_t		osize;
 	struct vnode		*vp;
 	unsigned int		refs;		/* +vpref, +flushref */
@@ -523,6 +539,7 @@ typedef struct hammer2_trans hammer2_trans_t;
 #define HAMMER2_TRANS_WAITING		0x08000000	/* someone waiting */
 #define HAMMER2_TRANS_RESCAN		0x04000000	/* rescan sideq */
 #define HAMMER2_TRANS_MASK		0x00FFFFFF	/* count mask */
+
 
 #define HAMMER2_FREEMAP_HEUR_NRADIX	4	/* pwr 2 PBUFRADIX-LBUFRADIX */
 #define HAMMER2_FREEMAP_HEUR_TYPES	8
@@ -693,6 +710,7 @@ struct hammer2_xop_strategy {
 	hammer2_xop_head_t	head;
 	hammer2_key_t		lbase;
 	struct buf		*bp;
+	hammer2_wref_t		*wref;
 };
 
 struct hammer2_xop_bmap {
@@ -1060,6 +1078,9 @@ hammer2_chain_t *hammer2_inode_chain_and_parent(hammer2_inode_t *, int,
 hammer2_inode_t *hammer2_inode_lookup(hammer2_pfs_t *, hammer2_tid_t);
 void hammer2_inode_ref(hammer2_inode_t *);
 void hammer2_inode_drop(hammer2_inode_t *);
+hammer2_wref_t *hammer2_wref_alloc(hammer2_inode_t *);
+void hammer2_wref_complete(hammer2_wref_t *);
+int hammer2_inode_wsync_wait(hammer2_inode_t *);
 int hammer2_igetv(hammer2_inode_t *, struct vnode **);
 hammer2_inode_t *hammer2_inode_get(hammer2_pfs_t *, hammer2_xop_head_t *,
     hammer2_tid_t, int);
@@ -1093,6 +1114,7 @@ hammer2_io_t *hammer2_io_getquick(hammer2_dev_t *, off_t, int);
 void hammer2_io_bawrite(hammer2_io_t **);
 void hammer2_io_bdwrite(hammer2_io_t **);
 int hammer2_io_bwrite(hammer2_io_t **);
+void hammer2_io_track_write(hammer2_io_t *, hammer2_wref_t **);
 void hammer2_io_setdirty(hammer2_io_t *);
 void hammer2_io_brelse(hammer2_io_t **);
 void hammer2_io_bqrelse(hammer2_io_t **);
@@ -1156,6 +1178,8 @@ hammer2_pfs_t *hammer2_pfsalloc(hammer2_chain_t *, const hammer2_inode_data_t *,
 void hammer2_pfsdealloc(hammer2_pfs_t *, int, int);
 int hammer2_sync(struct mount *, int, int, struct ucred *, struct proc *);
 int hammer2_vfs_sync_pmp(hammer2_pfs_t *, int);
+int hammer2_pfs_fsync_devices(hammer2_pfs_t *, struct ucred *, int,
+    struct proc *);
 void hammer2_voldata_lock(hammer2_dev_t *);
 void hammer2_voldata_unlock(hammer2_dev_t *);
 void hammer2_voldata_modify(hammer2_dev_t *);

@@ -551,6 +551,7 @@ struct vfsops {
 				    struct proc *p);
 	int	(*vfs_sync)(struct mount *mp, int waitfor, int stall,
 				    struct ucred *cred, struct proc *p);
+	int	(*vfs_modifying)(struct mount *mp, struct vnode *vp, int flags);
 	int	(*vfs_vget)(struct mount *mp, ino_t ino,
 				    struct vnode **vpp);
 	int	(*vfs_fhtovp)(struct mount *mp, struct fid *fhp,
@@ -571,6 +572,10 @@ struct vfsops {
 #define VFS_QUOTACTL(MP,C,U,A,P)  (*(MP)->mnt_op->vfs_quotactl)(MP, C, U, A, P)
 #define VFS_STATFS(MP, SBP, P)	  (*(MP)->mnt_op->vfs_statfs)(MP, SBP, P)
 #define VFS_SYNC(MP, W, S, C, P)  (*(MP)->mnt_op->vfs_sync)(MP, W, S, C, P)
+#define VFS_MODIFYING_BUFCACHE	0x00000001
+#define VFS_MODIFYING(MP, VP, F) \
+	(((MP) && (MP)->mnt_op->vfs_modifying) ? \
+	(*(MP)->mnt_op->vfs_modifying)((MP), (VP), (F)) : 0)
 #define VFS_VGET(MP, INO, VPP)	  (*(MP)->mnt_op->vfs_vget)(MP, INO, VPP)
 #define VFS_FHTOVP(MP, FIDP, VPP) \
 	(*(MP)->mnt_op->vfs_fhtovp)(MP, FIDP, VPP)

@@ -317,17 +317,19 @@ hammer2_strategy_read_completion(hammer2_chain_t *focus, const char *data,
 }
 
 static void hammer2_write_file_core(char *, hammer2_inode_t *,
-    hammer2_chain_t **, hammer2_key_t, int, int, hammer2_tid_t, int *);
+    hammer2_chain_t **, hammer2_key_t, int, int, hammer2_tid_t, int *,
+    hammer2_wref_t **);
 static void hammer2_compress_and_write(char *, hammer2_inode_t *,
     hammer2_chain_t **, hammer2_key_t, int, int, hammer2_tid_t, int *, int,
-    int);
+    int, hammer2_wref_t **);
 static void hammer2_zero_check_and_write(char *, hammer2_inode_t *,
-    hammer2_chain_t **, hammer2_key_t, int, int, hammer2_tid_t, int *, int);
+    hammer2_chain_t **, hammer2_key_t, int, int, hammer2_tid_t, int *, int,
+    hammer2_wref_t **);
 static int test_block_zeros(const char *, size_t);
 static void zero_write(char *, hammer2_inode_t *, hammer2_chain_t **,
     hammer2_key_t, hammer2_tid_t, int *);
 static void hammer2_write_bp(hammer2_chain_t *, char *, int, int, hammer2_tid_t,
-    int *, int);
+    int *, int, hammer2_wref_t **);
 
 static void
 hammer2_bioq_enter(hammer2_pfs_t *pmp)
@@ -399,6 +401,7 @@ hammer2_strategy_write(struct vop_strategy_args *ap)
 	xop = hammer2_xop_alloc(ip,
 	    HAMMER2_XOP_MODIFYING | HAMMER2_XOP_STRATEGY);
 	xop->bp = bp;
+	xop->wref = hammer2_wref_alloc(ip);
 	xop->lbase = lbase;
 	hammer2_xop_start(&xop->head, &hammer2_strategy_write_desc);
 
@@ -415,6 +418,7 @@ hammer2_xop_strategy_write(hammer2_xop_t *arg, void *scratch, int clindex)
 	hammer2_inode_t *ip = xop->head.ip1; /* retained by ref */
 	hammer2_key_t lbase = xop->lbase;
 	struct buf *bp = xop->bp;
+	hammer2_wref_t *wref = xop->wref;
 	char *bio_data = scratch;
 	int s, error, lblksize, pblksize;
 
@@ -426,7 +430,7 @@ hammer2_xop_strategy_write(hammer2_xop_t *arg, void *scratch, int clindex)
 
 	parent = hammer2_inode_chain(ip, clindex, HAMMER2_RESOLVE_ALWAYS);
 	hammer2_write_file_core(bio_data, ip, &parent, lbase, IO_ASYNC,
-	    pblksize, xop->head.mtid, &error);
+	    pblksize, xop->head.mtid, &error, &wref);
 	if (parent) {
 		hammer2_chain_unlock(parent);
 		hammer2_chain_drop(parent);
@@ -451,6 +455,9 @@ hammer2_xop_strategy_write(hammer2_xop_t *arg, void *scratch, int clindex)
 		biodone(bp);
 		splx(s);
 	}
+	if (wref)
+		hammer2_wref_complete(wref);
+	xop->wref = NULL;
 	hammer2_trans_assert_strategy(ip->pmp);
 	hammer2_trans_done(ip->pmp, HAMMER2_TRANS_BUFCACHE);
 	hammer2_bioq_leave(ip->pmp);
@@ -583,7 +590,7 @@ failed:
 static void
 hammer2_write_file_core(char *data, hammer2_inode_t *ip,
     hammer2_chain_t **parentp, hammer2_key_t lbase, int ioflag, int pblksize,
-    hammer2_tid_t mtid, int *errorp)
+    hammer2_tid_t mtid, int *errorp, hammer2_wref_t **wrefp)
 {
 	hammer2_chain_t *chain;
 	hammer2_inode_data_t *wipdata;
@@ -620,7 +627,7 @@ hammer2_write_file_core(char *data, hammer2_inode_t *ip,
 			atomic_clear_int(&chain->flags, HAMMER2_CHAIN_INITIAL);
 		} else {
 			hammer2_write_bp(chain, data, ioflag, pblksize, mtid,
-			    errorp, ip->meta.check_algo);
+			    errorp, ip->meta.check_algo, wrefp);
 		}
 		if (chain) {
 			hammer2_chain_unlock(chain);
@@ -630,7 +637,7 @@ hammer2_write_file_core(char *data, hammer2_inode_t *ip,
 	case HAMMER2_COMP_AUTOZERO:
 		/* Check for zero-fill only. */
 		hammer2_zero_check_and_write(data, ip, parentp, lbase, ioflag,
-		    pblksize, mtid, errorp, ip->meta.check_algo);
+		    pblksize, mtid, errorp, ip->meta.check_algo, wrefp);
 		break;
 	case HAMMER2_COMP_LZ4:
 	case HAMMER2_COMP_ZLIB:
@@ -638,7 +645,7 @@ hammer2_write_file_core(char *data, hammer2_inode_t *ip,
 		/* Check for zero-fill and attempt compression. */
 		hammer2_compress_and_write(data, ip, parentp, lbase, ioflag,
 		    pblksize, mtid, errorp, ip->meta.comp_algo,
-		    ip->meta.check_algo);
+		    ip->meta.check_algo, wrefp);
 		break;
 	}
 }
@@ -651,7 +658,8 @@ hammer2_write_file_core(char *data, hammer2_inode_t *ip,
 static void
 hammer2_compress_and_write(char *data, hammer2_inode_t *ip,
     hammer2_chain_t **parentp, hammer2_key_t lbase, int ioflag, int pblksize,
-    hammer2_tid_t mtid, int *errorp, int comp_algo, int check_algo)
+    hammer2_tid_t mtid, int *errorp, int comp_algo, int check_algo,
+    hammer2_wref_t **wrefp)
 {
 	hammer2_chain_t *chain;
 	hammer2_inode_data_t *wipdata;
@@ -857,6 +865,7 @@ hammer2_compress_and_write(char *data, hammer2_inode_t *ip,
 			atomic_clear_int(&chain->flags, HAMMER2_CHAIN_INITIAL);
 			hammer2_dedup_record(chain, dio, bdata);
 			/* Now write the related dio. */
+			hammer2_io_track_write(dio, wrefp);
 			if (ioflag & IO_SYNC)
 				hammer2_io_bwrite(&dio);
 			else if (ioflag & IO_ASYNC)
@@ -885,7 +894,8 @@ done:
 static void
 hammer2_zero_check_and_write(char *data, hammer2_inode_t *ip,
     hammer2_chain_t **parentp, hammer2_key_t lbase, int ioflag, int pblksize,
-    hammer2_tid_t mtid, int *errorp, int check_algo)
+    hammer2_tid_t mtid, int *errorp, int check_algo,
+    hammer2_wref_t **wrefp)
 {
 	hammer2_chain_t *chain;
 	char *bdata;
@@ -910,7 +920,7 @@ hammer2_zero_check_and_write(char *data, hammer2_inode_t *ip,
 			/* Do nothing. */
 		} else if (bdata) {
 			hammer2_write_bp(chain, data, ioflag, pblksize, mtid,
-			    errorp, check_algo);
+			    errorp, check_algo, wrefp);
 		} else {
 			/* Dedup occurred. */
 			chain->bref.methods =
@@ -984,7 +994,7 @@ zero_write(char *data, hammer2_inode_t *ip, hammer2_chain_t **parentp,
  */
 static void
 hammer2_write_bp(hammer2_chain_t *chain, char *data, int ioflag, int pblksize,
-    hammer2_tid_t mtid, int *errorp, int check_algo)
+    hammer2_tid_t mtid, int *errorp, int check_algo, hammer2_wref_t **wrefp)
 {
 	hammer2_inode_data_t *wipdata;
 	hammer2_io_t *dio;
@@ -1028,6 +1038,7 @@ hammer2_write_bp(hammer2_chain_t *chain, char *data, int ioflag, int pblksize,
 		atomic_clear_int(&chain->flags, HAMMER2_CHAIN_INITIAL);
 		hammer2_dedup_record(chain, dio, bdata);
 		/* Now write the related dio. */
+		hammer2_io_track_write(dio, wrefp);
 		if (ioflag & IO_SYNC)
 			hammer2_io_bwrite(&dio);
 		else if (ioflag & IO_ASYNC)

@@ -47,6 +47,19 @@
 #include <sys/unistd.h>
 #include <sys/systm.h>
 
+static __inline int
+vfs_modifying_vnode(struct vnode *vp, int flags)
+{
+	struct mount *mp;
+
+	if (vp == NULL)
+		return (0);
+	mp = vp->v_mount;
+	if (mp == NULL)
+		return (0);
+	return (VFS_MODIFYING(mp, vp, flags));
+}
+
 #ifdef VFSLCKDEBUG
 #define ASSERT_VP_ISLOCKED(vp) do {				\
 	if (((vp)->v_flag & VLOCKSWORK) && !VOP_ISLOCKED(vp)) {	\
@@ -89,6 +102,7 @@ int
 VOP_CREATE(struct vnode *dvp, struct vnode **vpp, 
     struct componentname *cnp, struct vattr *vap)
 {
+	int error;
 	struct vop_create_args a;
 	a.a_dvp = dvp;
 	a.a_vpp = vpp;
@@ -99,6 +113,9 @@ VOP_CREATE(struct vnode *dvp, struct vnode **vpp,
 
 	if (dvp->v_op->vop_create == NULL)
 		return (EOPNOTSUPP);
+	error = vfs_modifying_vnode(dvp, 0);
+	if (error)
+		return (error);
 
 	return ((dvp->v_op->vop_create)(&a));
 }
@@ -107,6 +124,7 @@ int
 VOP_MKNOD(struct vnode *dvp, struct vnode **vpp, 
     struct componentname *cnp, struct vattr *vap)
 {
+	int error;
 	struct vop_mknod_args a;
 	a.a_dvp = dvp;
 	a.a_vpp = vpp;
@@ -117,6 +135,9 @@ VOP_MKNOD(struct vnode *dvp, struct vnode **vpp,
 
 	if (dvp->v_op->vop_mknod == NULL)
 		return (EOPNOTSUPP);
+	error = vfs_modifying_vnode(dvp, 0);
+	if (error)
+		return (error);
 
 	return ((dvp->v_op->vop_mknod)(&a));
 }
@@ -195,6 +216,7 @@ int
 VOP_SETATTR(struct vnode *vp, struct vattr *vap, struct ucred *cred, 
     struct proc *p)
 {
+	int error;
 	struct vop_setattr_args a;
 	a.a_vp = vp;
 	a.a_vap = vap;
@@ -206,6 +228,9 @@ VOP_SETATTR(struct vnode *vp, struct vattr *vap, struct ucred *cred,
 
 	if (vp->v_op->vop_setattr == NULL)
 		return (EOPNOTSUPP);
+	error = vfs_modifying_vnode(vp, 0);
+	if (error)
+		return (error);
 
 	return ((vp->v_op->vop_setattr)(&a));
 }
@@ -231,6 +256,7 @@ int
 VOP_WRITE(struct vnode *vp, struct uio *uio, int ioflag, 
     struct ucred *cred)
 {
+	int error;
 	struct vop_write_args a;
 	a.a_vp = vp;
 	a.a_uio = uio;
@@ -241,6 +267,13 @@ VOP_WRITE(struct vnode *vp, struct uio *uio, int ioflag,
 
 	if (vp->v_op->vop_write == NULL)
 		return (EOPNOTSUPP);
+	if (vp->v_type == VREG) {
+		error = vfs_modifying_vnode(vp,
+		    (uio && uio->uio_segflg == UIO_SYSSPACE) ?
+		    VFS_MODIFYING_BUFCACHE : 0);
+		if (error)
+			return (error);
+	}
 
 	return ((vp->v_op->vop_write)(&a));
 }
@@ -328,7 +361,9 @@ VOP_REMOVE(struct vnode *dvp, struct vnode *vp, struct componentname *cnp)
 	ASSERT_VP_ISLOCKED(dvp);
 	ASSERT_VP_ISLOCKED(vp);
 
-	error = dvp->v_op->vop_remove(&a);
+	error = vfs_modifying_vnode(dvp, 0);
+	if (error == 0)
+		error = dvp->v_op->vop_remove(&a);
 
 	if (dvp == vp)
 		vrele(vp);
@@ -342,6 +377,7 @@ VOP_REMOVE(struct vnode *dvp, struct vnode *vp, struct componentname *cnp)
 int
 VOP_LINK(struct vnode *dvp, struct vnode *vp, struct componentname *cnp)
 {
+	int error;
 	struct vop_link_args a;
 	a.a_dvp = dvp;
 	a.a_vp = vp;
@@ -351,6 +387,9 @@ VOP_LINK(struct vnode *dvp, struct vnode *vp, struct componentname *cnp)
 
 	if (dvp->v_op->vop_link == NULL)
 		return (EOPNOTSUPP);
+	error = vfs_modifying_vnode(dvp, 0);
+	if (error)
+		return (error);
 
 	return ((dvp->v_op->vop_link)(&a));
 }
@@ -360,6 +399,7 @@ VOP_RENAME(struct vnode *fdvp, struct vnode *fvp,
     struct componentname *fcnp, struct vnode *tdvp, struct vnode *tvp, 
     struct componentname *tcnp)
 {
+	int error;
 	struct vop_rename_args a;
 	a.a_fdvp = fdvp;
 	a.a_fvp = fvp;
@@ -372,6 +412,14 @@ VOP_RENAME(struct vnode *fdvp, struct vnode *fvp,
 
 	if (fdvp->v_op->vop_rename == NULL) 
 		return (EOPNOTSUPP);
+	error = vfs_modifying_vnode(fdvp, 0);
+	if (error)
+		return (error);
+	if (tdvp && tdvp->v_mount != fdvp->v_mount) {
+		error = vfs_modifying_vnode(tdvp, 0);
+		if (error)
+			return (error);
+	}
 
 	return ((fdvp->v_op->vop_rename)(&a));
 }
@@ -380,6 +428,7 @@ int
 VOP_MKDIR(struct vnode *dvp, struct vnode **vpp, 
     struct componentname *cnp, struct vattr *vap)
 {
+	int error;
 	struct vop_mkdir_args a;
 	a.a_dvp = dvp;
 	a.a_vpp = vpp;
@@ -390,6 +439,9 @@ VOP_MKDIR(struct vnode *dvp, struct vnode **vpp,
 
 	if (dvp->v_op->vop_mkdir == NULL)
 		return (EOPNOTSUPP);
+	error = vfs_modifying_vnode(dvp, 0);
+	if (error)
+		return (error);
 
 	return ((dvp->v_op->vop_mkdir)(&a));
 }
@@ -397,6 +449,7 @@ VOP_MKDIR(struct vnode *dvp, struct vnode **vpp,
 int
 VOP_RMDIR(struct vnode *dvp, struct vnode *vp, struct componentname *cnp)
 {
+	int error;
 	struct vop_rmdir_args a;
 	a.a_dvp = dvp;
 	a.a_vp = vp;
@@ -409,6 +462,9 @@ VOP_RMDIR(struct vnode *dvp, struct vnode *vp, struct componentname *cnp)
 
 	if (dvp->v_op->vop_rmdir == NULL)
 		return (EOPNOTSUPP);
+	error = vfs_modifying_vnode(dvp, 0);
+	if (error)
+		return (error);
 
 	return ((dvp->v_op->vop_rmdir)(&a));
 }
@@ -417,6 +473,7 @@ int
 VOP_SYMLINK(struct vnode *dvp, struct vnode **vpp, 
     struct componentname *cnp, struct vattr *vap, char *target)
 {
+	int error;
 	struct vop_symlink_args a;
 	a.a_dvp = dvp;
 	a.a_vpp = vpp;
@@ -428,6 +485,9 @@ VOP_SYMLINK(struct vnode *dvp, struct vnode **vpp,
 
 	if (dvp->v_op->vop_symlink == NULL)
 		return (EOPNOTSUPP);
+	error = vfs_modifying_vnode(dvp, 0);
+	if (error)
+		return (error);
 
 	return ((dvp->v_op->vop_symlink)(&a));
 }
