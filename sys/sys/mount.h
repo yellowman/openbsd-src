@@ -267,24 +267,6 @@ struct hammer2_args {
 };
 
 /*
- * Arguments to mount HAMMER2 file systems
- */
-struct hammer2_args {
-	char		*fspec;
-	struct export_args export_info;	/* network export information */
-	int		hflags;		/* extended hammer2 mount flags */
-};
-
-/*
- * Arguments to mount HAMMER2 file systems
- */
-struct hammer2_args {
-	char		*fspec;
-	struct export_args export_info;	/* network export information */
-	int		hflags;		/* extended hammer2 mount flags */
-};
-
-/*
  * file system statistics
  */
 
