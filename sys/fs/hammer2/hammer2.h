@@ -926,6 +926,7 @@ extern int hammer2_bulkfree_tps;
 extern int hammer2_limit_scan_depth;
 extern int hammer2_limit_saved_chains;
 extern int hammer2_always_compress;
+extern int hammer2_flush_pipe;
 
 extern hammer2_xop_desc_t hammer2_ipcluster_desc;
 extern hammer2_xop_desc_t hammer2_readdir_desc;

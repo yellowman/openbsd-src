@@ -54,6 +54,7 @@ static void hammer2_strategy_read_completion(hammer2_chain_t *, const char *,
     struct buf *);
 static void hammer2_bioq_enter(hammer2_pfs_t *);
 static void hammer2_bioq_leave(hammer2_pfs_t *);
+static void hammer2_bioq_wait(hammer2_pfs_t *, int);
 static void hammer2_dedup_record(hammer2_chain_t *, hammer2_io_t *,
     const char *);
 static hammer2_off_t hammer2_dedup_lookup(hammer2_dev_t *, char **, int);
@@ -343,8 +344,24 @@ hammer2_bioq_leave(hammer2_pfs_t *pmp)
 
 	hammer2_lk_ex(&pmp->bioq_lock);
 	KKASSERT(pmp->bioq_inprog > 0);
-	if (--pmp->bioq_inprog == 0)
-		hammer2_lkc_wakeup(&pmp->bioq_cv);
+	--pmp->bioq_inprog;
+	/*
+	 * Wake any waiters whenever forward progress is made.  DragonFly uses
+	 * a bit-packed atomic counter with hysteresis for this path; the
+	 * OpenBSD port uses a simpler cv-based wait and recheck loop.
+	 */
+	hammer2_lkc_wakeup(&pmp->bioq_cv);
+	hammer2_lk_unlock(&pmp->bioq_lock);
+}
+
+static void
+hammer2_bioq_wait(hammer2_pfs_t *pmp, int count)
+{
+
+	hammer2_lk_ex(&pmp->bioq_lock);
+	while (pmp->bioq_inprog > count)
+		hammer2_lkc_sleep(&pmp->bioq_cv, &pmp->bioq_lock,
+		    "h2lwinp", 0);
 	hammer2_lk_unlock(&pmp->bioq_lock);
 }
 
@@ -370,6 +387,15 @@ hammer2_strategy_write(struct vop_strategy_args *ap)
 	xop->bp = bp;
 	xop->lbase = lbase;
 	hammer2_xop_start(&xop->head, &hammer2_strategy_write_desc);
+
+	/*
+	 * DragonFly throttles the number of logical writes in flight so a long
+	 * dirty run cannot outrun the backend and then stall catastrophically
+	 * later.  OpenBSD lacks the same bio tracking primitives, so use the
+	 * logical-write counter as a cv-backed pressure valve here.
+	 */
+	hammer2_bioq_wait(pmp, hammer2_flush_pipe);
+
 	hammer2_xop_retire(&xop->head, HAMMER2_XOPMASK_VOP);
 
 	return (0);
@@ -431,11 +457,7 @@ void
 hammer2_bioq_sync(hammer2_pfs_t *pmp)
 {
 
-	hammer2_lk_ex(&pmp->bioq_lock);
-	while (pmp->bioq_inprog > 0)
-		hammer2_lkc_sleep(&pmp->bioq_cv, &pmp->bioq_lock,
-		    "h2bioq", 0);
-	hammer2_lk_unlock(&pmp->bioq_lock);
+	hammer2_bioq_wait(pmp, 0);
 }
 
 /*

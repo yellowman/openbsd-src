@@ -100,7 +100,9 @@ hammer2_inactive(void *v)
 		 * dispose of the inode as much as possible right here.
 		 */
 		hammer2_inode_unlock(ip);
+		hammer2_mtx_ex(&ip->truncate_lock);
 		hammer2_truncate_buffers(ip, 0);
+		hammer2_mtx_unlock(&ip->truncate_lock);
 		hammer2_inode_lock(ip, 0);
 
 		/* Delete the file on-media. */
@@ -752,7 +754,8 @@ hammer2_read_file(hammer2_inode_t *ip, struct uio *uio, int ioflag)
 		lbn = lbase / lblksize;
 		error = bread(vp, lbn, lblksize, &bp);
 		if (error) {
-			brelse(bp);
+			if (bp)
+				brelse(bp);
 			break;
 		}
 		loff = (int)(uio->uio_offset - lbase);
@@ -763,7 +766,8 @@ hammer2_read_file(hammer2_inode_t *ip, struct uio *uio, int ioflag)
 			n = (int)(isize - uio->uio_offset);
 		error = uiomove(bp->b_data + loff, n, uio);
 		if (error) {
-			brelse(bp);
+			if (bp)
+				brelse(bp);
 			break;
 		}
 		brelse(bp);
@@ -911,6 +915,7 @@ hammer2_write_file(hammer2_inode_t *ip, struct uio *uio, int ioflag,
 			trivial = 1;
 
 		/* Get the buffer. */
+		bp = NULL;
 		if (trivial) {
 			/*
 			 * Even though we are entirely overwriting the buffer
@@ -931,7 +936,8 @@ hammer2_write_file(hammer2_inode_t *ip, struct uio *uio, int ioflag,
 			error = bread(vp, lbn, lblksize, &bp);
 		}
 		if (error) {
-			brelse(bp);
+			if (bp)
+				brelse(bp);
 			break;
 		}
 

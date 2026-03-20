@@ -82,6 +82,7 @@ int hammer2_bulkfree_tps = 5000;
 int hammer2_limit_scan_depth;
 int hammer2_limit_saved_chains;
 int hammer2_always_compress;
+int hammer2_flush_pipe = 100;
 
 /* not sysctl */
 int malloc_leak_m_hammer2;
@@ -102,6 +103,7 @@ static const struct sysctl_bounded_args hammer2_vars[] = {
 	{ HAMMER2CTL_LIMIT_SCAN_DEPTH, &hammer2_limit_scan_depth, 0, INT_MAX, },
 	{ HAMMER2CTL_LIMIT_SAVED_CHAINS, &hammer2_limit_saved_chains, 0, INT_MAX, },
 	{ HAMMER2CTL_ALWAYS_COMPRESS, &hammer2_always_compress, 0, INT_MAX, },
+	{ HAMMER2CTL_FLUSH_PIPE, &hammer2_flush_pipe, 0, INT_MAX, },
 };
 
 static unsigned long
@@ -1091,7 +1093,7 @@ hammer2_unmount(struct mount *mp, int mntflags, struct proc *p)
 	if (mntflags & MNT_FORCE)
 		flags |= FORCECLOSE;
 	if (pmp->iroot) {
-		error = vflush(mp, NULLVP, flags);
+		error = vflush(mp, NULL, flags);
 		if (error) {
 			hprintf("vflush failed %d\n", error);
 			goto failed;

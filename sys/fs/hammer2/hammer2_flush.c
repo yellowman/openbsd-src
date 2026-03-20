@@ -1267,8 +1267,10 @@ hammer2_xop_inode_flush(hammer2_xop_t *arg, void *scratch, int clindex)
 		TAILQ_FOREACH(e, &hmp->devvp_list, entry) {
 			devvp = e->devvp;
 			KKASSERT(devvp);
+			vn_lock(devvp, LK_EXCLUSIVE | LK_RETRY);
 			vol_error = VOP_IOCTL(devvp, DIOCCACHESYNC, &force,
 			    FWRITE, FSCRED, curproc);
+			VOP_UNLOCK(devvp);
 			if (vol_error) {
 				hprintf("cachesync error %d device \"%s\"\n",
 				    vol_error, e->path);
