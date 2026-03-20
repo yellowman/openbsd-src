@@ -1301,15 +1301,17 @@ hammer2_bmap_impl(void *v)
 			*ap->a_vpp = NULL;
 		*ap->a_bnp = -1;
 	} else {
+		hammer2_off_t data_off;
+
 		KKASSERT(xop->offset != HAMMER2_OFF_MASK);
-		if (ap->a_vpp) {
-			vol = hammer2_get_volume(hmp, xop->offset);
-			KKASSERT(vol);
-			KKASSERT(vol->dev);
-			KKASSERT(vol->dev->devvp);
+		data_off = xop->offset & ~HAMMER2_OFF_MASK_RADIX;
+		vol = hammer2_get_volume(hmp, data_off);
+		KKASSERT(vol);
+		KKASSERT(vol->dev);
+		KKASSERT(vol->dev->devvp);
+		if (ap->a_vpp)
 			*ap->a_vpp = vol->dev->devvp;
-		}
-		*ap->a_bnp = xop->offset / DEV_BSIZE; /* XXX radix bits */
+		*ap->a_bnp = (data_off - vol->offset) / DEV_BSIZE;
 	}
 	hammer2_xop_retire(&xop->head, HAMMER2_XOPMASK_VOP);
 

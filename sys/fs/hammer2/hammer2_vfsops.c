@@ -48,6 +48,10 @@ static int hammer2_remount_impl(hammer2_dev_t *);
 static int hammer2_remount(hammer2_dev_t *, struct mount *);
 static int hammer2_statfs(struct mount *, struct statfs *, struct proc *);
 static void hammer2_update_pmps(hammer2_dev_t *);
+static int hammer2_devvp_same(const hammer2_devvp_t *,
+    const hammer2_devvp_t *);
+static int hammer2_devvp_list_exact_match(const hammer2_devvp_list_t *,
+    const hammer2_devvp_list_t *);
 static void hammer2_mount_helper(struct mount *, hammer2_pfs_t *);
 static void hammer2_unmount_helper(struct mount *, hammer2_pfs_t *,
     hammer2_dev_t *);
@@ -505,7 +509,7 @@ hammer2_mount(struct mount *mp, const char *path, void *data,
 	hammer2_chain_t *chain, *parent;
 	const hammer2_inode_data_t *ripdata;
 	hammer2_devvp_list_t devvpl;
-	hammer2_devvp_t *e, *e_tmp;
+	hammer2_devvp_t *e;
 	hammer2_chain_t *schain;
 	hammer2_xop_head_t *xop;
 	hammer2_cluster_t *cluster;
@@ -513,7 +517,7 @@ hammer2_mount(struct mount *mp, const char *path, void *data,
 	char fnamestr[MNAMELEN] = {0};
 	char *label = NULL;
 	int rdonly = (mp->mnt_flag & MNT_RDONLY) != 0;
-	int i, error, devvp_found;
+	int i, error;
 	size_t dlen;
 
 	if (args == NULL) {
@@ -616,24 +620,12 @@ hammer2_mount(struct mount *mp, const char *path, void *data,
 		 * so also check to see if the underlying device matches.
 		 */
 		TAILQ_FOREACH(hmp_tmp, &hammer2_mntlist, mntentry) {
-			TAILQ_FOREACH(e_tmp, &hmp_tmp->devvp_list, entry) {
-				devvp_found = 0;
-				TAILQ_FOREACH(e, &devvpl, entry) {
-					KKASSERT(e->devvp);
-					if (e_tmp->devvp == e->devvp)
-						devvp_found = 1;
-					if (e_tmp->devvp->v_rdev &&
-					    e_tmp->devvp->v_rdev == e->devvp->v_rdev)
-						devvp_found = 1;
-				}
-				if (!devvp_found)
-					goto next_hmp;
-			}
+			if (!hammer2_devvp_list_exact_match(&hmp_tmp->devvp_list,
+			    &devvpl))
+				continue;
 			hmp = hmp_tmp;
 			debug_hprintf("hmp matched\n");
 			break;
-next_hmp:
-			continue;
 		}
 		/*
 		 * If no match this may be a fresh H2 mount, make sure
@@ -1119,6 +1111,47 @@ failed:
 		hammer2_assert_clean();
 
 	return (error);
+}
+
+static int
+hammer2_devvp_same(const hammer2_devvp_t *a, const hammer2_devvp_t *b)
+{
+
+	KKASSERT(a->devvp);
+	KKASSERT(b->devvp);
+	if (a->devvp == b->devvp)
+		return (1);
+	if (a->devvp->v_rdev && a->devvp->v_rdev == b->devvp->v_rdev)
+		return (1);
+	return (0);
+}
+
+static int
+hammer2_devvp_list_exact_match(const hammer2_devvp_list_t *lhs,
+    const hammer2_devvp_list_t *rhs)
+{
+	const hammer2_devvp_t *e1, *e2;
+	int n1 = 0, n2 = 0, found;
+
+	TAILQ_FOREACH(e1, lhs, entry)
+		++n1;
+	TAILQ_FOREACH(e2, rhs, entry)
+		++n2;
+	if (n1 != n2)
+		return (0);
+
+	TAILQ_FOREACH(e1, lhs, entry) {
+		found = 0;
+		TAILQ_FOREACH(e2, rhs, entry) {
+			if (hammer2_devvp_same(e1, e2)) {
+				found = 1;
+				break;
+			}
+		}
+		if (!found)
+			return (0);
+	}
+	return (1);
 }
 
 /*

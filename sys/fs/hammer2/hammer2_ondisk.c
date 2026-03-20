@@ -396,21 +396,30 @@ static int
 hammer2_verify_volumes_2(const hammer2_volume_t *volumes,
     const hammer2_volume_data_t *rootvoldata)
 {
-	const hammer2_volume_t *vol;
+	const hammer2_volume_t *vol, *pvol;
 	hammer2_off_t off, total_size = 0;
 	const char *path;
 	int i, nvolumes = 0;
 
-	/* Check initialized volume count. */
+	/* Check initialized volume count and total size. */
 	for (i = 0; i < HAMMER2_MAX_VOLUMES; ++i) {
 		vol = &volumes[i];
 		if (vol->id != -1) {
 			nvolumes++;
+			if (total_size + vol->size < total_size) {
+				hprintf("sum of volume sizes overflowed\n");
+				return (EINVAL);
+			}
 			total_size += vol->size;
 		}
 	}
 
 	/* Check volume header. */
+	if (rootvoldata->nvolumes == 0 ||
+	    rootvoldata->nvolumes > HAMMER2_MAX_VOLUMES) {
+		hprintf("bad multi-volume count %d\n", rootvoldata->nvolumes);
+		return (EINVAL);
+	}
 	if (rootvoldata->nvolumes != nvolumes) {
 		hprintf("volume header requires %d devices, %d specified\n",
 		    rootvoldata->nvolumes, nvolumes);
@@ -429,6 +438,17 @@ hammer2_verify_volumes_2(const hammer2_volume_t *volumes,
 			    i, (long long)off);
 			return (EINVAL);
 		}
+		vol = &volumes[i];
+		if (vol->id != i) {
+			if (vol->id == -1) {
+				hprintf("volume id %d missing\n", i);
+			} else {
+				path = vol->dev->path;
+				hprintf("%s has inconsistent id %d, expected %d\n",
+				    path, vol->id, i);
+			}
+			return (EINVAL);
+		}
 	}
 	for (i = nvolumes; i < HAMMER2_MAX_VOLUMES; ++i) {
 		off = rootvoldata->volu_loff[i];
@@ -437,13 +457,17 @@ hammer2_verify_volumes_2(const hammer2_volume_t *volumes,
 			    i, (long long)off);
 			return (EINVAL);
 		}
+		if (volumes[i].id != -1) {
+			path = volumes[i].dev->path;
+			hprintf("%s has unexpected id %d beyond count %d\n",
+			    path, volumes[i].id, nvolumes);
+			return (EINVAL);
+		}
 	}
 
 	/* Check volumes. */
-	for (i = 0; i < HAMMER2_MAX_VOLUMES; ++i) {
+	for (i = 0; i < nvolumes; ++i) {
 		vol = &volumes[i];
-		if (vol->id == -1)
-			continue;
 		path = vol->dev->path;
 		/* Check offset. */
 		if (vol->offset & HAMMER2_FREEMAP_LEVEL1_MASK) {
@@ -454,12 +478,9 @@ hammer2_verify_volumes_2(const hammer2_volume_t *volumes,
 		}
 		/* Check vs previous volume. */
 		if (i) {
-			if (vol->id <= (vol-1)->id) {
-				hprintf("%s has inconsistent id %d\n",
-				    path, vol->id);
-				return (EINVAL);
-			}
-			if (vol->offset != (vol-1)->offset + (vol-1)->size) {
+			pvol = &volumes[i - 1];
+			if (vol->offset < pvol->offset ||
+			    vol->offset - pvol->offset != pvol->size) {
 				hprintf("%s has inconsistent offset %016llx\n",
 				    path, (long long)vol->offset);
 				return (EINVAL);
@@ -793,8 +814,10 @@ hammer2_get_volume(hammer2_dev_t *hmp, hammer2_off_t offset)
 	/* Do binary search if users really use this many supported volumes. */
 	for (i = 0; i < hmp->nvolumes; ++i) {
 		vol = &hmp->volumes[i];
-		if ((offset >= vol->offset) &&
-		    (offset < vol->offset + vol->size)) {
+		if (vol->id == -1 || vol->dev == NULL)
+			continue;
+		if (offset >= vol->offset &&
+		    offset - vol->offset < vol->size) {
 			ret = vol;
 			break;
 		}

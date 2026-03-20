@@ -1257,34 +1257,52 @@ hammer2_xop_inode_flush(hammer2_xop_t *arg, void *scratch, int clindex)
 	 */
 	if (fsync_error == 0 && flush_error == 0 &&
 	    (hmp->vchain.flags & HAMMER2_CHAIN_VOLUMESYNC)) {
-		/* Synchronize the disk before flushing the volume header. */
+		/*
+		 * Synchronize every component device before committing the
+		 * synchronized root volume header.  For a multi-volume mount,
+		 * the root volume header is only durable if all device caches
+		 * have been drained first.
+		 */
 		force = 1;
-		fsync_error = VOP_IOCTL(hmp->devvp, DIOCCACHESYNC, &force,
-		    FWRITE, FSCRED, curproc);
+		TAILQ_FOREACH(e, &hmp->devvp_list, entry) {
+			devvp = e->devvp;
+			KKASSERT(devvp);
+			vol_error = VOP_IOCTL(devvp, DIOCCACHESYNC, &force,
+			    FWRITE, FSCRED, curproc);
+			if (vol_error) {
+				hprintf("cachesync error %d device \"%s\"\n",
+				    vol_error, e->path);
+				if (fsync_error == 0)
+					fsync_error = vol_error;
+			}
+		}
 
 		/*
 		 * Then we can safely flush the version of the
 		 * volume header synchronized by the flush code.
 		 */
-		j = hmp->volhdrno + 1;
-		if (j < 0)
-			j = 0;
-		if (j >= HAMMER2_NUM_VOLHDRS)
-			j = 0;
-		if (j * HAMMER2_ZONE_BYTES64 + HAMMER2_SEGSIZE >
-		    hmp->volsync.volu_size)
-			j = 0;
-		debug_hprintf("sync volhdr %d size %016llx\n",
-		    j, (long long)hmp->volsync.volu_size);
+		if (fsync_error == 0) {
+			j = hmp->volhdrno + 1;
+			if (j < 0)
+				j = 0;
+			if (j >= HAMMER2_NUM_VOLHDRS)
+				j = 0;
+			if (j * HAMMER2_ZONE_BYTES64 + HAMMER2_SEGSIZE >
+			    hmp->volsync.volu_size)
+				j = 0;
+			debug_hprintf("sync volhdr %d size %016llx\n",
+			    j, (long long)hmp->volsync.volu_size);
 
-		blkno = ((off_t)j * HAMMER2_ZONE_BYTES64) / DEV_BSIZE;
-		bp = getblk(hmp->devvp, blkno, HAMMER2_VOLUME_BYTES, 0, 0);
-		atomic_clear_int(&hmp->vchain.flags, HAMMER2_CHAIN_VOLUMESYNC);
-		bcopy(&hmp->volsync, bp->b_data, HAMMER2_VOLUME_BYTES);
-		vol_error = bwrite(bp);
-		hmp->volhdrno = j;
-		if (vol_error)
-			fsync_error = vol_error;
+			blkno = ((off_t)j * HAMMER2_ZONE_BYTES64) / DEV_BSIZE;
+			bp = getblk(hmp->devvp, blkno, HAMMER2_VOLUME_BYTES, 0, 0);
+			atomic_clear_int(&hmp->vchain.flags,
+			    HAMMER2_CHAIN_VOLUMESYNC);
+			bcopy(&hmp->volsync, bp->b_data, HAMMER2_VOLUME_BYTES);
+			vol_error = bwrite(bp);
+			hmp->volhdrno = j;
+			if (vol_error)
+				fsync_error = vol_error;
+		}
 	}
 	if (flush_error)
 		total_error = flush_error;
