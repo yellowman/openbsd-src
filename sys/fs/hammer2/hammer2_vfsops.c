@@ -232,6 +232,8 @@ hammer2_pfsalloc(hammer2_chain_t *chain, const hammer2_inode_data_t *ripdata,
 		}
 		hammer2_lk_init(&pmp->trans_lock, "h2mp_tx");
 		hammer2_lkc_init(&pmp->trans_cv, "h2mp_tx_cv");
+		hammer2_lk_init(&pmp->bioq_lock, "h2mp_bioq");
+		hammer2_lkc_init(&pmp->bioq_cv, "h2mp_bioq_cv");
 		TAILQ_INIT(&pmp->syncq);
 		TAILQ_INIT(&pmp->depq);
 		hammer2_inum_hash_init(pmp);
@@ -393,6 +395,8 @@ hammer2_pfsfree(hammer2_pfs_t *pmp)
 		}
 		hammer2_lk_destroy(&pmp->trans_lock);
 		hammer2_lkc_destroy(&pmp->trans_cv);
+		hammer2_lk_destroy(&pmp->bioq_lock);
+		hammer2_lkc_destroy(&pmp->bioq_cv);
 		hammer2_inum_hash_destroy(pmp);
 		hashfree(pmp->ipdep_lists, HAMMER2_IHASH_SIZE, M_HAMMER2);
 		if (pmp->fspec)
@@ -1591,17 +1595,20 @@ static int
 hammer2_remount(hammer2_dev_t *hmp, struct mount *mp)
 {
 	hammer2_pfs_t *pmp = MPTOPMP(mp);
-	int error;
+	int ronly_save, error;
 
-	if (pmp->rdonly == 0 && (mp->mnt_flag & MNT_RDONLY)) {
-		pmp->rdonly = 1;
-	} else if (pmp->rdonly == 1 && (mp->mnt_flag & MNT_WANTRDWR)) {
-		if (hmp->rdonly) {
-			error = hammer2_remount_impl(hmp);
-			if (error)
-				return (error);
-		}
+	ronly_save = pmp->rdonly;
+	if (pmp->rdonly == 1 && (mp->mnt_flag & MNT_WANTRDWR))
 		pmp->rdonly = 0;
+	else if (pmp->rdonly == 0 && (mp->mnt_flag & MNT_RDONLY))
+		pmp->rdonly = 1;
+
+	if (hmp->rdonly && (mp->mnt_flag & MNT_WANTRDWR)) {
+		error = hammer2_remount_impl(hmp);
+		if (error) {
+			pmp->rdonly = ronly_save;
+			return (error);
+		}
 	}
 
 	debug_hprintf("MNT_WANTRDWR %d MNT_RDONLY %d rdonly %d/%d/%d\n",
@@ -1919,7 +1926,7 @@ restart:
 
 	hammer2_bioq_sync(pmp);
 
-	error = 0; /* XXX */
+	error = 0;
 	hammer2_trans_done(pmp, HAMMER2_TRANS_ISFLUSH);
 
 	return (error);

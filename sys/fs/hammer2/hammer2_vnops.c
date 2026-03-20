@@ -49,6 +49,9 @@
 
 #include <miscfs/fifofs/fifo.h>
 
+/* Also see sys/sys/vnode.h. */
+#define IO_ASYNC	0x10000000
+
 static void hammer2_truncate_file(hammer2_inode_t *, hammer2_key_t);
 static void hammer2_extend_file(hammer2_inode_t *, hammer2_key_t);
 
@@ -893,7 +896,7 @@ hammer2_write_file(hammer2_inode_t *ip, struct uio *uio, int ioflag,
 		n = lblksize - loff;
 		if (n > uio->uio_resid) {
 			n = uio->uio_resid;
-			if (((hammer2_key_t)loff == lbase) &&
+			if (loff == 0 &&
 			    (uio->uio_offset + n == new_eof))
 				trivial = 1;
 			endofblk = 0;
@@ -941,8 +944,8 @@ hammer2_write_file(hammer2_inode_t *ip, struct uio *uio, int ioflag,
 			bp->b_flags |= B_NOCACHE;
 
 		/*
-		 * WARNING: Pageout daemon will issue UIO_NOCOPY writes
-		 *	    with IO_SYNC or IO_ASYNC set.  These writes
+		 * WARNING: OpenBSD's pageout path issues UIO_SYSSPACE writes
+		 *	    with IO_SYNC or IO_ASYNC semantics.  These writes
 		 *	    must be handled as the pageout daemon expects.
 		 *
 		 * NOTE!    H2 relies on cluster_write() here because it
@@ -956,11 +959,16 @@ hammer2_write_file(hammer2_inode_t *ip, struct uio *uio, int ioflag,
 		 *	    it the block allocations will be all over the
 		 *	    map.
 		 */
-		/* No cluster_write() in OpenBSD. */
+		/*
+		 * OpenBSD does not have cluster_write(), but we still want
+		 * full logical-block writes and async/pageout-originated writes
+		 * to hit the backend promptly so CoW allocations do not wind up
+		 * needlessly scattered by the buffer daemon.
+		 */
 		if (ioflag & IO_SYNC)
 			(void)bwrite(bp);
-		/* else if (n + loff == lblksize)
-			bawrite(bp); */
+		else if ((ioflag & IO_ASYNC) || endofblk)
+			bawrite(bp);
 		else
 			bdwrite(bp);
 	}
@@ -1044,13 +1052,17 @@ hammer2_write(void *v)
 	 * To avoid deadlocking against the VM system, we must flag any
 	 * transaction related to the buffer cache or other direct
 	 * VM page manipulation.
+	 *
+	 * DragonFly uses UIO_NOCOPY here.  OpenBSD's uio has no equivalent;
+	 * UVM pageout and other kernel-originated buffer-cache writes arrive
+	 * as UIO_SYSSPACE.
 	 */
-	if (0)
+	if (uio->uio_segflg == UIO_SYSSPACE)
 		hammer2_trans_init(ip->pmp, HAMMER2_TRANS_BUFCACHE);
 	else
 		hammer2_trans_init(ip->pmp, 0);
 	error = hammer2_write_file(ip, uio, ap->a_ioflag, ap->a_cred);
-	if (0)
+	if (uio->uio_segflg == UIO_SYSSPACE)
 		hammer2_trans_done(ip->pmp,
 		    HAMMER2_TRANS_BUFCACHE | HAMMER2_TRANS_SIDEQ);
 	else

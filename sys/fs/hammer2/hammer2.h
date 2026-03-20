@@ -873,6 +873,9 @@ struct hammer2_pfs {
 	hammer2_lkc_t		xop_cv[HAMMER2_IHASH_SIZE];
 	hammer2_lk_t		trans_lock;	/* XXX temporary */
 	hammer2_lkc_t		trans_cv;
+	hammer2_lk_t		bioq_lock;
+	hammer2_lkc_t		bioq_cv;
+	int			bioq_inprog;
 	struct mount		*mp;
 	struct uuid		pfs_clid;
 	hammer2_trans_t		trans;

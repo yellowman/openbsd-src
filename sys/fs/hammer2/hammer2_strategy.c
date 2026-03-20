@@ -52,6 +52,8 @@ static int hammer2_strategy_read(struct vop_strategy_args *);
 static int hammer2_strategy_write(struct vop_strategy_args *);
 static void hammer2_strategy_read_completion(hammer2_chain_t *, const char *,
     struct buf *);
+static void hammer2_bioq_enter(hammer2_pfs_t *);
+static void hammer2_bioq_leave(hammer2_pfs_t *);
 static void hammer2_dedup_record(hammer2_chain_t *, hammer2_io_t *,
     const char *);
 static hammer2_off_t hammer2_dedup_lookup(hammer2_dev_t *, char **, int);
@@ -326,6 +328,26 @@ static void zero_write(char *, hammer2_inode_t *, hammer2_chain_t **,
 static void hammer2_write_bp(hammer2_chain_t *, char *, int, int, hammer2_tid_t,
     int *, int);
 
+static void
+hammer2_bioq_enter(hammer2_pfs_t *pmp)
+{
+
+	hammer2_lk_ex(&pmp->bioq_lock);
+	++pmp->bioq_inprog;
+	hammer2_lk_unlock(&pmp->bioq_lock);
+}
+
+static void
+hammer2_bioq_leave(hammer2_pfs_t *pmp)
+{
+
+	hammer2_lk_ex(&pmp->bioq_lock);
+	KKASSERT(pmp->bioq_inprog > 0);
+	if (--pmp->bioq_inprog == 0)
+		hammer2_lkc_wakeup(&pmp->bioq_cv);
+	hammer2_lk_unlock(&pmp->bioq_lock);
+}
+
 static int
 hammer2_strategy_write(struct vop_strategy_args *ap)
 {
@@ -340,6 +362,7 @@ hammer2_strategy_write(struct vop_strategy_args *ap)
 
 	atomic_set_int(&ip->flags, HAMMER2_INODE_DIRTYDATA);
 	hammer2_trans_assert_strategy(pmp);
+	hammer2_bioq_enter(pmp);
 	hammer2_trans_init(pmp, HAMMER2_TRANS_BUFCACHE);
 
 	xop = hammer2_xop_alloc(ip,
@@ -398,14 +421,21 @@ hammer2_xop_strategy_write(hammer2_xop_t *arg, void *scratch, int clindex)
 	}
 	hammer2_trans_assert_strategy(ip->pmp);
 	hammer2_trans_done(ip->pmp, HAMMER2_TRANS_BUFCACHE);
+	hammer2_bioq_leave(ip->pmp);
 }
 
 /*
- * Wait for pending I/O to complete.
+ * Wait for pending logical write I/O to complete.
  */
 void
 hammer2_bioq_sync(hammer2_pfs_t *pmp)
 {
+
+	hammer2_lk_ex(&pmp->bioq_lock);
+	while (pmp->bioq_inprog > 0)
+		hammer2_lkc_sleep(&pmp->bioq_cv, &pmp->bioq_lock,
+		    "h2bioq", 0);
+	hammer2_lk_unlock(&pmp->bioq_lock);
 }
 
 /*
