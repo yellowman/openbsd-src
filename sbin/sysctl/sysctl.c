@@ -1,4 +1,4 @@
-/*	$OpenBSD: sysctl.c,v 1.267 2025/06/21 22:08:44 bluhm Exp $	*/
+/*	$OpenBSD: sysctl.c,v 1.269 2025/12/27 22:25:31 kn Exp $	*/
 /*	$NetBSD: sysctl.c,v 1.9 1995/09/30 07:12:50 thorpej Exp $	*/
 
 /*
@@ -295,7 +295,7 @@ main(int argc, char *argv[])
 
 		while (getline(&line, &sz, fp) != -1) {
 			lp = line + strspn(line, " \t");
-			line[strcspn(line, " \t\n#")] = '\0';
+			lp[strcspn(lp, " \t\n#")] = '\0';
 
 			if (lp[0] != '\0')
 				parse(line, 1);
@@ -692,10 +692,6 @@ parse(char *string, int flags)
 			len = sysctl_inet6(string, &bufp, mib, flags, &type);
 			if (len < 0)
 				return;
-
-			if (mib[2] == IPPROTO_IPV6 &&
-			    mib[3] == IPV6CTL_SOIIKEY)
-				special |= HEX;
 
 			if ((mib[2] == IPPROTO_IPV6 && mib[3] == IPV6CTL_MRTMFC) ||
 			    (mib[2] == IPPROTO_IPV6 && mib[3] == IPV6CTL_MRTMIF)) {

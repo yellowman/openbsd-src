@@ -1,4 +1,4 @@
-/* $OpenBSD: ssh-pkcs11-client.c,v 1.23 2025/07/25 11:50:45 dtucker Exp $ */
+/* $OpenBSD: ssh-pkcs11-client.c,v 1.26 2026/02/09 22:11:39 dtucker Exp $ */
 /*
  * Copyright (c) 2010 Markus Friedl.  All rights reserved.
  * Copyright (c) 2014 Pedro Martelletto. All rights reserved.
@@ -26,9 +26,6 @@
 #include <unistd.h>
 #include <errno.h>
 #include <limits.h>
-
-#include <openssl/ecdsa.h>
-#include <openssl/rsa.h>
 
 #include "pathnames.h"
 #include "xmalloc.h"
@@ -277,6 +274,7 @@ pkcs11_sign(struct sshkey *key,
 	ret = 0;
 
  fail:
+	free(signature);
 	sshbuf_free(msg);
 	return ret;
 }
@@ -355,6 +353,7 @@ pkcs11_start_helper(const char *path)
 		}
 		close(pair[0]);
 		close(pair[1]);
+		closefrom(STDERR_FILENO + 1);
 		prog = getenv("SSH_PKCS11_HELPER");
 		if (prog == NULL || strlen(prog) == 0)
 			prog = _PATH_SSH_PKCS11_HELPER;

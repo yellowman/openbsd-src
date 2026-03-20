@@ -1,4 +1,4 @@
-/*	$OpenBSD: ip6_mroute.c,v 1.153 2025/07/25 22:24:06 mvs Exp $	*/
+/*	$OpenBSD: ip6_mroute.c,v 1.156 2025/11/13 23:30:01 bluhm Exp $	*/
 /*	$NetBSD: ip6_mroute.c,v 1.59 2003/12/10 09:28:38 itojun Exp $	*/
 /*	$KAME: ip6_mroute.c,v 1.45 2001/03/25 08:38:51 itojun Exp $	*/
 
@@ -348,8 +348,6 @@ mrt6_sysctl_mif(void *oldp, size_t *oldlenp)
 
 		needed += sizeof(minfo);
 		if (where && needed <= given) {
-			int error;
-
 			error = copyout(&minfo, where, sizeof(minfo));
 			if (error)
 				break;
@@ -953,18 +951,6 @@ ip6_mforward(struct ip6_hdr *ip6, struct ifnet *ifp, struct mbuf *m, int flags)
 	 */
 	if (IN6_IS_ADDR_UNSPECIFIED(&ip6->ip6_src)) {
 		ip6stat_inc(ip6s_cantforward);
-		if (ip6_log_time + atomic_load_int(&ip6_log_interval) <
-		    getuptime()) {
-			char src[INET6_ADDRSTRLEN], dst[INET6_ADDRSTRLEN];
-
-			ip6_log_time = getuptime();
-
-			inet_ntop(AF_INET6, &ip6->ip6_src, src, sizeof(src));
-			inet_ntop(AF_INET6, &ip6->ip6_dst, dst, sizeof(dst));
-			log(LOG_DEBUG, "cannot forward "
-			    "from %s to %s nxt %d received on interface %u\n",
-			    src, dst, ip6->ip6_nxt, m->m_pkthdr.ph_ifidx);
-		}
 		return 0;
 	}
 
@@ -1245,6 +1231,8 @@ mrt6_iflookupbymif(mifi_t mifi, unsigned int rtableid)
 {
 	struct mif6	*m6;
 	struct ifnet	*ifp;
+
+	NET_ASSERT_LOCKED();
 
 	TAILQ_FOREACH(ifp, &ifnetlist, if_list) {
 		if (ifp->if_rdomain != rtableid)

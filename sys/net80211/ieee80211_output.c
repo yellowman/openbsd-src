@@ -1,4 +1,4 @@
-/*	$OpenBSD: ieee80211_output.c,v 1.141 2025/06/14 08:46:34 jsg Exp $	*/
+/*	$OpenBSD: ieee80211_output.c,v 1.147 2026/03/19 16:50:32 chris Exp $	*/
 /*	$NetBSD: ieee80211_output.c,v 1.13 2004/05/31 11:02:55 dyoung Exp $	*/
 
 /*-
@@ -208,7 +208,7 @@ ieee80211_mgmt_output(struct ifnet *ifp, struct ieee80211_node *ni,
 	IEEE80211_ADDR_COPY(wh->i_addr3, ni->ni_bssid);
 
 	/* check if protection is required for this mgmt frame */
-	if ((ic->ic_caps & IEEE80211_C_MFP) &&
+	if ((ni->ni_flags & IEEE80211_NODE_MFP) &&
 	    (type == IEEE80211_FC0_SUBTYPE_DISASSOC ||
 	     type == IEEE80211_FC0_SUBTYPE_DEAUTH ||
 	     type == IEEE80211_FC0_SUBTYPE_ACTION)) {
@@ -325,6 +325,12 @@ const struct ieee80211_edca_ac_params
 		[EDCA_AC_VI] = { 3,  4, 2,  94 },
 		[EDCA_AC_VO] = { 2,  3, 2,  47 }
 	},
+	[IEEE80211_MODE_11AX] = {
+		[EDCA_AC_BK] = { 4, 10, 7,   0 },
+		[EDCA_AC_BE] = { 4, 10, 3,   0 },
+		[EDCA_AC_VI] = { 3,  4, 2,  94 },
+		[EDCA_AC_VO] = { 2,  3, 2,  47 }
+	},
 };
 
 #ifndef IEEE80211_STA_ONLY
@@ -355,6 +361,12 @@ const struct ieee80211_edca_ac_params
 		[EDCA_AC_VO] = { 2,  3, 1,  47 }
 	},
 	[IEEE80211_MODE_11AC] = {
+		[EDCA_AC_BK] = { 4, 10, 7,   0 },
+		[EDCA_AC_BE] = { 4,  6, 3,   0 },
+		[EDCA_AC_VI] = { 3,  4, 1,  94 },
+		[EDCA_AC_VO] = { 2,  3, 1,  47 }
+	},
+	[IEEE80211_MODE_11AX] = {
 		[EDCA_AC_BK] = { 4, 10, 7,   0 },
 		[EDCA_AC_BE] = { 4,  6, 3,   0 },
 		[EDCA_AC_VI] = { 3,  4, 1,  94 },
@@ -416,6 +428,45 @@ ieee80211_up_to_ac(struct ieee80211com *ic, int up)
 	return ac;
 }
 
+enum ieee80211_edca_ac
+ieee80211_classify_limit(struct ieee80211com *ic, enum ieee80211_edca_ac ac)
+{
+	const suseconds_t txop_interval = 100 * 1000; /* 100 msec, in usec */
+	/* Maximum amounts of high-prio Tx opportunities, per 100ms. */
+	static const int txop_limit[EDCA_NUM_AC] = {
+		0,	/* Best Effort */
+		0,	/* Background */
+		4,	/* Video */
+		2	/* Voice */
+	};
+
+	if (txop_limit[ac] <= 0) /* not rate-limited */
+		return ac;
+
+	if (ic->ic_edca_txop_count[ac] < txop_limit[ac]) {
+		if (ic->ic_edca_txop_count[ac] == 0)
+			getmicrouptime(&ic->ic_edca_txop_time[ac]);
+		ic->ic_edca_txop_count[ac]++;
+	} else {
+		struct timeval now, delta;
+
+		getmicrouptime(&now);
+		timersub(&now, &ic->ic_edca_txop_time[ac], &delta);
+
+		/*
+		 * Fall back on best-effort if the limit has been exceeded
+		 * within the current rate-limiting window.
+		 */
+		if (delta.tv_sec == 0 && delta.tv_usec < txop_interval)
+			return EDCA_AC_BE;
+
+		ic->ic_edca_txop_count[ac] = 1;
+		ic->ic_edca_txop_time[ac] = now;
+	}
+
+	return ac;
+}
+
 /*
  * Get mbuf's user-priority: if mbuf is not VLAN tagged, select user-priority
  * based on the DSCP (Differentiated Services Codepoint) field.
@@ -425,16 +476,28 @@ ieee80211_classify(struct ieee80211com *ic, struct mbuf *m)
 {
 	struct ether_header eh;
 	u_int8_t ds_field;
+	enum ieee80211_edca_ac ac;
+
+	/* Map EDCA categories (0-3) to User Priority TIDs (0-7) */
+	static const int edca_to_up[EDCA_NUM_AC] = {
+		0,	/* Best Effort */
+		1,	/* Background */
+		5,	/* Video (primary) */
+		6	/* Voice (primary) */
+	};
+
 #if NVLAN > 0
-	if (m->m_flags & M_VLANTAG)	/* use VLAN 802.1D user-priority */
-		return EVL_PRIOFTAG(m->m_pkthdr.ether_vtag);
+	if (m->m_flags & M_VLANTAG) {	/* use VLAN 802.1D user-priority */
+		ac = EVL_PRIOFTAG(m->m_pkthdr.ether_vtag);
+		return edca_to_up[ieee80211_classify_limit(ic, ac)];
+	}
 #endif
 	m_copydata(m, 0, sizeof(eh), (caddr_t)&eh);
 	if (eh.ether_type == htons(ETHERTYPE_IP)) {
 		struct ip ip;
 		m_copydata(m, sizeof(eh), sizeof(ip), (caddr_t)&ip);
 		if (ip.ip_v != 4)
-			return 0;
+			return edca_to_up[EDCA_AC_BE];
 		ds_field = ip.ip_tos;
 	}
 #ifdef INET6
@@ -444,31 +507,44 @@ ieee80211_classify(struct ieee80211com *ic, struct mbuf *m)
 		m_copydata(m, sizeof(eh), sizeof(ip6), (caddr_t)&ip6);
 		flowlabel = ntohl(ip6.ip6_flow);
 		if ((flowlabel >> 28) != 6)
-			return 0;
+			return edca_to_up[EDCA_AC_BE];
 		ds_field = (flowlabel >> 20) & 0xff;
 	}
 #endif	/* INET6 */
 	else	/* neither IPv4 nor IPv6 */
-		return 0;
+		return edca_to_up[EDCA_AC_BE];
 
 	/*
-	 * Map Differentiated Services Codepoint field (see RFC2474).
+	 * Map Differentiated Services Codepoint field (see RFC8325).
 	 * Preserves backward compatibility with IP Precedence field.
 	 */
 	switch (ds_field & 0xfc) {
-	case IPTOS_PREC_PRIORITY:
-		return EDCA_AC_VI;
-	case IPTOS_PREC_IMMEDIATE:
-		return EDCA_AC_BK;
-	case IPTOS_PREC_FLASH:
-	case IPTOS_PREC_FLASHOVERRIDE:
-	case IPTOS_PREC_CRITIC_ECP:
-	case IPTOS_PREC_INTERNETCONTROL:
-	case IPTOS_PREC_NETCONTROL:
-		return EDCA_AC_VO;
+	case IPTOS_DSCP_CS7:
+	case IPTOS_DSCP_CS6:
+	case IPTOS_DSCP_EF:
+	case IPTOS_DSCP_VA:
+		ac = EDCA_AC_VO;
+		break;
+	case IPTOS_DSCP_CS5:
+	case IPTOS_DSCP_AF41:
+	case IPTOS_DSCP_AF42:
+	case IPTOS_DSCP_AF43:
+	case IPTOS_DSCP_CS4:
+	case IPTOS_DSCP_AF31:
+	case IPTOS_DSCP_AF32:
+	case IPTOS_DSCP_AF33:
+	case IPTOS_DSCP_CS3:
+		ac = EDCA_AC_VI;
+		break;
+	case IPTOS_DSCP_CS1:
+		ac = EDCA_AC_BK;
+		break;
 	default:
-		return EDCA_AC_BE;
+		/* unused, or explicitly mapped to UP 0 */
+		return edca_to_up[EDCA_AC_BE];
 	}
+
+	return edca_to_up[ieee80211_classify_limit(ic, ac)];
 }
 
 int
@@ -985,6 +1061,7 @@ ieee80211_add_rsn_body(u_int8_t *frm, struct ieee80211com *ic,
 	const u_int8_t *oui = wpa ? MICROSOFT_OUI : IEEE80211_OUI;
 	u_int8_t *pcount;
 	u_int16_t count, rsncaps;
+	int pmf = 0;
 
 	/* write Version field */
 	LE_WRITE_2(frm, 1); frm += 2;
@@ -1059,10 +1136,22 @@ ieee80211_add_rsn_body(u_int8_t *frm, struct ieee80211com *ic,
 	if (wpa)
 		return frm;
 
+	if (ic->ic_caps & IEEE80211_C_MFP) {
+		/*
+		 * When acting as client station, only announce PMF support
+		 * to access points which support PMF. There are access points
+		 * out there which do not support PMF and won't even initiate
+		 * the 4-way handshake with us if the PMF-capable bit is set.
+		 */
+		if (ic->ic_opmode != IEEE80211_M_STA ||
+		    (ni->ni_rsncaps & IEEE80211_RSNCAP_MFPC))
+			pmf = 1;
+	}
+
 	/* write RSN Capabilities field */
 	rsncaps = (ni->ni_rsncaps & (IEEE80211_RSNCAP_PTKSA_RCNT_MASK |
 	    IEEE80211_RSNCAP_GTKSA_RCNT_MASK));
-	if (ic->ic_caps & IEEE80211_C_MFP) {
+	if (pmf) {
 		rsncaps |= IEEE80211_RSNCAP_MFPC;
 		if (ic->ic_flags & IEEE80211_F_MFPR)
 			rsncaps |= IEEE80211_RSNCAP_MFPR;
@@ -1079,7 +1168,7 @@ ieee80211_add_rsn_body(u_int8_t *frm, struct ieee80211com *ic,
 		frm += IEEE80211_PMKID_LEN;
 	}
 
-	if (!(ic->ic_caps & IEEE80211_C_MFP))
+	if (!pmf)
 		return frm;
 
 	if ((ni->ni_flags & IEEE80211_NODE_PMKID) == 0) {
@@ -1210,6 +1299,46 @@ ieee80211_add_vhtcaps(u_int8_t *frm, struct ieee80211com *ic)
 	return frm;
 }
 
+/*
+ * Add an HE Capabilities element to a frame.
+ *
+ * This uses the Extension element format (EID 255) with the
+ * IEEE80211_ELEMID_EXT_HECAPS extension ID.
+ */
+u_int8_t *
+ieee80211_add_hecaps(u_int8_t *frm, struct ieee80211com *ic)
+{
+	u_int8_t phycap0;
+	int mcslen;
+
+	phycap0 = ic->ic_he_phy_cap[0];
+	mcslen = IEEE80211_HE_MCS_NSS_SIZE(phycap0);
+
+	*frm++ = IEEE80211_ELEMID_EXTENSION;
+	*frm++ = 1 + IEEE80211_HE_CAPS_FIXED_LEN + mcslen;
+	*frm++ = IEEE80211_ELEMID_EXT_HECAPS;
+
+	memcpy(frm, ic->ic_he_mac_cap, IEEE80211_HE_MAC_CAPS_LEN);
+	frm += IEEE80211_HE_MAC_CAPS_LEN;
+	memcpy(frm, ic->ic_he_phy_cap, IEEE80211_HE_PHY_CAPS_LEN);
+	frm += IEEE80211_HE_PHY_CAPS_LEN;
+
+	LE_WRITE_2(frm, ic->ic_he_rxmcs_80); frm += 2;
+	LE_WRITE_2(frm, ic->ic_he_txmcs_80); frm += 2;
+
+	if (phycap0 & IEEE80211_HE_PHYCAP0_CHAN_WIDTH_160_IN_5G) {
+		LE_WRITE_2(frm, ic->ic_he_rxmcs_160); frm += 2;
+		LE_WRITE_2(frm, ic->ic_he_txmcs_160); frm += 2;
+	}
+	if (phycap0 &
+	    IEEE80211_HE_PHYCAP0_CHAN_WIDTH_8080_IN_5G) {
+		LE_WRITE_2(frm, ic->ic_he_rxmcs_80p80); frm += 2;
+		LE_WRITE_2(frm, ic->ic_he_txmcs_80p80); frm += 2;
+	}
+
+	return frm;
+}
+
 #ifndef IEEE80211_STA_ONLY
 /*
  * Add a Timeout Interval element to a frame (see 7.3.2.49).
@@ -1253,14 +1382,31 @@ ieee80211_getmgmt(int flags, int type, u_int pktlen)
  * [tlv] Supported rates
  * [tlv] Extended Supported Rates (802.11g)
  * [tlv] HT Capabilities (802.11n)
+ * [tlv] VHT Capabilities (802.11ac)
+ * [tlv] HE Capabilities (802.11ax)
  */
 struct mbuf *
 ieee80211_get_probe_req(struct ieee80211com *ic, struct ieee80211_node *ni)
 {
 	const struct ieee80211_rateset *rs =
-	    &ic->ic_sup_rates[ieee80211_chan2mode(ic, ni->ni_chan)];
+	    &ic->ic_sup_rates[ieee80211_node_abg_mode(ic, ni)];
 	struct mbuf *m;
+	int addvht = 0;
+	u_int hecapslen = 0;
 	u_int8_t *frm;
+
+	if ((ic->ic_flags & IEEE80211_F_VHTON) && ni->ni_chan != NULL &&
+	    IEEE80211_IS_CHAN_5GHZ(ni->ni_chan) &&
+	    IEEE80211_IS_CHAN_AC(ni->ni_chan))
+		addvht = 1;
+
+	if ((ic->ic_flags & (IEEE80211_F_HTON | IEEE80211_F_HEON)) ==
+	    (IEEE80211_F_HTON | IEEE80211_F_HEON) &&
+	    (ic->ic_modecaps & (1 << IEEE80211_MODE_11AX)) &&
+	    ni->ni_chan != NULL && IEEE80211_CHAN_HE(ni->ni_chan)) {
+		hecapslen = 2 + 1 + IEEE80211_HE_CAPS_FIXED_LEN +
+		    IEEE80211_HE_MCS_NSS_SIZE(ic->ic_he_phy_cap[0]);
+	}
 
 	m = ieee80211_getmgmt(M_DONTWAIT, MT_DATA,
 	    2 + ic->ic_des_esslen +
@@ -1268,7 +1414,8 @@ ieee80211_get_probe_req(struct ieee80211com *ic, struct ieee80211_node *ni)
 	    ((rs->rs_nrates > IEEE80211_RATE_SIZE) ?
 		2 + rs->rs_nrates - IEEE80211_RATE_SIZE : 0) +
 	    ((ic->ic_flags & IEEE80211_F_HTON) ? 28 + 9 : 0) +
-	    ((ic->ic_flags & IEEE80211_F_VHTON) ? 14 : 0));
+	    (addvht ? 14 : 0) +
+	    hecapslen);
 	if (m == NULL)
 		return NULL;
 
@@ -1281,8 +1428,10 @@ ieee80211_get_probe_req(struct ieee80211com *ic, struct ieee80211_node *ni)
 		frm = ieee80211_add_htcaps(frm, ic);
 		frm = ieee80211_add_wme_info(frm, ic);
 	}
-	if (ic->ic_flags & IEEE80211_F_VHTON)
-		frm = ieee80211_add_htcaps(frm, ic);
+	if (addvht)
+		frm = ieee80211_add_vhtcaps(frm, ic);
+	if (hecapslen)
+		frm = ieee80211_add_hecaps(frm, ic);
 
 	m->m_pkthdr.len = m->m_len = frm - mtod(m, u_int8_t *);
 
@@ -1425,6 +1574,8 @@ ieee80211_get_deauth(struct ieee80211com *ic, struct ieee80211_node *ni,
  * [tlv] RSN (802.11i)
  * [tlv] QoS Capability (802.11e)
  * [tlv] HT Capabilities (802.11n)
+ * [tlv] VHT Capabilities (802.11ac)
+ * [tlv] HE Capabilities (802.11ax)
  */
 struct mbuf *
 ieee80211_get_assoc_req(struct ieee80211com *ic, struct ieee80211_node *ni,
@@ -1434,6 +1585,21 @@ ieee80211_get_assoc_req(struct ieee80211com *ic, struct ieee80211_node *ni,
 	struct mbuf *m;
 	u_int8_t *frm;
 	u_int16_t capinfo;
+	int addvht = 0;
+	u_int hecapslen = 0;
+
+	if ((ic->ic_flags & IEEE80211_F_VHTON) && ni->ni_chan != NULL &&
+	    IEEE80211_IS_CHAN_5GHZ(ni->ni_chan) &&
+	    IEEE80211_IS_CHAN_AC(ni->ni_chan))
+		addvht = 1;
+
+	if ((ic->ic_flags & (IEEE80211_F_HTON | IEEE80211_F_HEON)) ==
+	    (IEEE80211_F_HTON | IEEE80211_F_HEON) &&
+	    (ic->ic_modecaps & (1 << IEEE80211_MODE_11AX)) &&
+	    ni->ni_chan != NULL && IEEE80211_CHAN_HE(ni->ni_chan)) {
+		hecapslen = 2 + 1 + IEEE80211_HE_CAPS_FIXED_LEN +
+		    IEEE80211_HE_MCS_NSS_SIZE(ic->ic_he_phy_cap[0]);
+	}
 
 	m = ieee80211_getmgmt(M_DONTWAIT, MT_DATA,
 	    2 + 2 +
@@ -1451,7 +1617,8 @@ ieee80211_get_assoc_req(struct ieee80211com *ic, struct ieee80211_node *ni,
 	      (ni->ni_rsnprotos & IEEE80211_PROTO_WPA)) ?
 		2 + IEEE80211_WPAIE_MAXLEN : 0) +
 	    ((ic->ic_flags & IEEE80211_F_HTON) ? 28 + 9 : 0) +
-	    ((ic->ic_flags & IEEE80211_F_VHTON) ? 14 : 0));
+	    (addvht ? 14 : 0) +
+	    hecapslen);
 	if (m == NULL)
 		return NULL;
 
@@ -1486,8 +1653,10 @@ ieee80211_get_assoc_req(struct ieee80211com *ic, struct ieee80211_node *ni,
 		frm = ieee80211_add_htcaps(frm, ic);
 		frm = ieee80211_add_wme_info(frm, ic);
 	}
-	if (ic->ic_flags & IEEE80211_F_VHTON)
+	if (addvht)
 		frm = ieee80211_add_vhtcaps(frm, ic);
+	if (hecapslen)
+		frm = ieee80211_add_hecaps(frm, ic);
 
 	m->m_pkthdr.len = m->m_len = frm - mtod(m, u_int8_t *);
 

@@ -1,4 +1,4 @@
-/*	$OpenBSD: output-bird.c,v 1.24 2025/07/08 14:19:21 job Exp $ */
+/*	$OpenBSD: output-bird.c,v 1.26 2025/10/30 23:18:06 job Exp $ */
 /*
  * Copyright (c) 2019 Claudio Jeker <claudio@openbsd.org>
  * Copyright (c) 2020 Robert Scheck <robert@fedoraproject.org>
@@ -25,17 +25,17 @@ output_bird(FILE *out, struct validation_data *vd, struct stats *st)
 {
 	struct vrp	*v;
 	struct vap	*vap;
-	time_t		 now = get_current_time();
 	size_t		 i;
 
 	if (fprintf(out, "# For BIRD %s\n#\n", excludeaspa ? "2" : "2.16+") < 0)
 		return -1;
 
-	if (outputheader(out, st) < 0)
+	if (outputheader(out, vd, st) < 0)
 		return -1;
 
 	if (fprintf(out, "\ndefine force_roa_table_update = %lld;\n\n"
-	    "roa4 table ROAS4;\nroa6 table ROAS6;\n", (long long)now) < 0)
+	    "roa4 table ROAS4;\nroa6 table ROAS6;\n",
+	    (long long)vd->buildtime) < 0)
 		return -1;
 
 	if (!excludeaspa) {

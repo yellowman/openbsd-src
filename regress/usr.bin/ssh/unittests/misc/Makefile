@@ -1,7 +1,8 @@
-#	$OpenBSD: Makefile,v 1.10 2025/04/15 04:00:42 djm Exp $
+#	$OpenBSD: Makefile,v 1.13 2026/02/06 23:39:14 dtucker Exp $
 
 PROG=test_misc
 SRCS=tests.c
+SRCS+=	test_misc.c
 SRCS+=	test_convtime.c
 SRCS+=	test_expand.c
 SRCS+=	test_parse.c
@@ -9,6 +10,7 @@ SRCS+=	test_argv.c
 SRCS+=	test_strdelim.c
 SRCS+=	test_hpdelim.c
 SRCS+=	test_ptimeout.c
+SRCS+=	test_xextendf.c
 
 # From usr.bin/ssh/Makefile.inc
 SRCS+=	sshbuf.c
@@ -23,7 +25,7 @@ SRCS+=	addr.c
 SRCS+=	addrmatch.c
 
 # From usr.bin/ssh/sshd/Makefile
-SRCS+=	atomicio.c cleanup.c fatal.c
+SRCS+=	atomicio.c cleanup.c fatal.c ssherr-libcrypto.c
 
 REGRESS_TARGETS=run-regress-${PROG}
 

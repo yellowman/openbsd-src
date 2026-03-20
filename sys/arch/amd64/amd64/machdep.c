@@ -1,4 +1,4 @@
-/*	$OpenBSD: machdep.c,v 1.301 2025/07/13 20:06:54 bluhm Exp $	*/
+/*	$OpenBSD: machdep.c,v 1.307 2026/03/11 16:18:42 kettenis Exp $	*/
 /*	$NetBSD: machdep.c,v 1.3 2003/05/07 22:58:18 fvdl Exp $	*/
 
 /*-
@@ -101,6 +101,7 @@
 #include <machine/kcore.h>
 #include <machine/tss.h>
 #include <machine/ghcb.h>
+#include <machine/kexec.h>
 
 #include <dev/isa/isareg.h>
 #include <dev/ic/i8042reg.h>
@@ -201,6 +202,7 @@ paddr_t lo32_paddr;
 paddr_t tramp_pdirpa;
 
 int kbd_reset;
+int hibernate_delay;
 int lid_action = 1;
 int pwr_action = 1;
 int forceukbd;
@@ -495,6 +497,7 @@ extern int need_retpoline;
 extern int cpu_sev_guestmode;
 
 const struct sysctl_bounded_args cpuctl_vars[] = {
+	{ CPU_HIBERNATEDELAY, &hibernate_delay, 0, 86400 },
 	{ CPU_LIDACTION, &lid_action, -1, 2 },
 	{ CPU_PWRACTION, &pwr_action, 0, 2 },
 	{ CPU_CPUID, &cpu_id, SYSCTL_INT_READONLY },
@@ -512,6 +515,7 @@ cpu_sysctl(int *name, u_int namelen, void *oldp, size_t *oldlenp, void *newp,
     size_t newlen, struct proc *p)
 {
 	extern uint64_t tsc_frequency;
+	char vmmode[16];
 	dev_t consdev;
 	dev_t dev;
 
@@ -567,6 +571,17 @@ cpu_sysctl(int *name, u_int namelen, void *oldp, size_t *oldlenp, void *newp,
 #endif
 	case CPU_TSCFREQ:
 		return (sysctl_rdquad(oldp, oldlenp, newp, tsc_frequency));
+	case CPU_VMMODE:
+		if (ISSET(cpu_ecxfeature, CPUIDECX_HV)) {
+			if (ISSET(cpu_sev_guestmode, SEV_STAT_ES_ENABLED))
+				strlcpy(vmmode, "SEV-ES", sizeof(vmmode));
+			else if (ISSET(cpu_sev_guestmode, SEV_STAT_ENABLED))
+				strlcpy(vmmode, "SEV", sizeof(vmmode));
+			else
+				strlcpy(vmmode, "guest", sizeof(vmmode));
+		} else
+			strlcpy(vmmode, "host", sizeof(vmmode));
+		return sysctl_rdstring(oldp, oldlenp, newp, vmmode);
 	default:
 		return (sysctl_bounded_arr(cpuctl_vars, nitems(cpuctl_vars),
 		    name, namelen, oldp, oldlenp, newp, newlen));
@@ -580,7 +595,7 @@ maybe_enable_user_cet(struct proc *p)
 #ifndef SMALL_KERNEL
 	/* Enable indirect-branch tracking if present and not disabled */
 	if ((xsave_mask & XFEATURE_CET_U) &&
-	    (p->p_p->ps_flags & PS_NOBTCFI) == 0) {
+	    (p->p_p->ps_iflags & PSI_NOBTCFI) == 0) {
 		uint64_t msr = rdmsr(MSR_U_CET);
 		wrmsr(MSR_U_CET, msr | MSR_CET_ENDBR_EN | MSR_CET_NO_TRACK_EN);
 	}
@@ -1341,8 +1356,9 @@ cpu_init_early_vctrap(paddr_t addr)
 	    GSEL(GCODE_SEL, SEL_KPL));
 	cpu_init_idt();
 
-	/* Tell vmm(4) about our GHCB. */
+	/* Tell the hypervisor about our GHCB. */
 	ghcb_paddr = addr;
+	ghcb_vaddr = addr + KERNBASE;
 	memset((void *)ghcb_vaddr, 0, 2 * PAGE_SIZE);
 	wrmsr(MSR_SEV_GHCB, ghcb_paddr);
 }
@@ -1474,6 +1490,8 @@ init_x86_64(paddr_t first_avail)
 		cpu_init_early_vctrap(first_avail);
 		first_avail += 2 * NBPG;
 	}
+	if (ISSET(cpu_sev_guestmode, SEV_STAT_ENABLED))
+		boothowto |= RB_COCOVM;
 
 	/*
 	 * locore0 mapped 3 pages for use before the pmap is initialized
@@ -1570,6 +1588,13 @@ init_x86_64(paddr_t first_avail)
 	if (avail_start < HIBERNATE_HIBALLOC_PAGE + PAGE_SIZE)
 		avail_start = HIBERNATE_HIBALLOC_PAGE + PAGE_SIZE;
 #endif /* HIBERNATE */
+
+#ifdef BOOT_KERNEL
+	if (avail_start < KEXEC_TRAMPOLINE + PAGE_SIZE)
+		avail_start = KEXEC_TRAMPOLINE + PAGE_SIZE;
+	if (avail_start < KEXEC_TRAMP_DATA + PAGE_SIZE)
+		avail_start = KEXEC_TRAMP_DATA + PAGE_SIZE;
+#endif
 
 	/*
 	 * We need to go through the BIOS memory map given, and

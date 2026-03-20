@@ -1368,9 +1368,6 @@ __freadptr
 __freadptrinc
 __fseterr
 __fwriting
-__sF
-__srget
-__swbuf
 __stderr
 __stdin
 __stdout
@@ -1611,6 +1608,8 @@ bcopy
 bzero
 explicit_bzero
 ffs
+ffsl
+ffsll
 index
 memccpy
 memchr

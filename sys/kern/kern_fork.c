@@ -1,4 +1,4 @@
-/*	$OpenBSD: kern_fork.c,v 1.273 2025/06/09 11:11:03 claudio Exp $	*/
+/*	$OpenBSD: kern_fork.c,v 1.278 2025/08/18 04:15:35 dlg Exp $	*/
 /*	$NetBSD: kern_fork.c,v 1.29 1996/02/09 18:59:34 christos Exp $	*/
 
 /*
@@ -116,7 +116,7 @@ int
 sys___tfork(struct proc *p, void *v, register_t *retval)
 {
 	struct sys___tfork_args /* {
-		syscallarg(const struct __tfork) *param;
+		syscallarg(const struct __tfork *) param;
 		syscallarg(size_t) psize;
 	} */ *uap = v;
 	size_t psize = SCARG(uap, psize);
@@ -199,7 +199,6 @@ process_initialize(struct process *pr, struct proc *p)
 	LIST_INIT(&pr->ps_children);
 	LIST_INIT(&pr->ps_orphans);
 	LIST_INIT(&pr->ps_sigiolst);
-	TAILQ_INIT(&pr->ps_tslpqueue);
 
 	rw_init(&pr->ps_lock, "pslock");
 	mtx_init(&pr->ps_mtx, IPL_HIGH);
@@ -250,9 +249,7 @@ process_new(struct proc *p, struct process *parent, int flags)
 	/* copy unveil if unveil is active */
 	unveil_copy(parent, pr);
 
-	pr->ps_flags = parent->ps_flags &
-	    (PS_SUGID | PS_SUGIDEXEC | PS_PLEDGE | PS_EXECPLEDGE |
-	    PS_WXNEEDED | PS_CHROOT);
+	pr->ps_flags = parent->ps_flags & PS_FLAGS_INHERITED_ON_FORK;
 	if (parent->ps_session->s_ttyvp != NULL)
 		pr->ps_flags |= parent->ps_flags & PS_CONTROLT;
 

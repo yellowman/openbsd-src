@@ -1,4 +1,4 @@
-/*	$OpenBSD: validate.c,v 1.79 2025/07/11 09:20:23 tb Exp $ */
+/*	$OpenBSD: validate.c,v 1.82 2026/01/13 21:36:17 job Exp $ */
 /*
  * Copyright (c) 2019 Kristaps Dzonsons <kristaps@bsd.lv>
  *
@@ -26,8 +26,6 @@
 #include <unistd.h>
 
 #include "extern.h"
-
-extern ASN1_OBJECT	*certpol_oid;
 
 /*
  * Walk up the chain of certificates trying to match our AS number to
@@ -142,7 +140,7 @@ valid_roa(const char *fn, struct cert *cert, struct roa *roa)
 
 		ip_addr_print(&roa->ips[i].addr, roa->ips[i].afi, buf,
 		    sizeof(buf));
-		warnx("%s: RFC 6482: uncovered IP: %s", fn, buf);
+		warnx("%s: RFC 9582: uncovered IP: %s", fn, buf);
 		return 0;
 	}
 
@@ -519,31 +517,6 @@ valid_aspa(const char *fn, struct cert *cert, struct aspa *aspa)
 	warnx("%s: ASPA: uncovered Customer ASID: %u", fn, aspa->custasid);
 
 	return 0;
-}
-
-/*
- * Validate Geofeed prefixes: check that the prefixes are contained.
- * Returns 1 if valid, 0 otherwise.
- */
-int
-valid_geofeed(const char *fn, struct cert *cert, struct geofeed *g)
-{
-	size_t	 i;
-	char	 buf[64];
-
-	for (i = 0; i < g->num_geoips; i++) {
-		if (ip_addr_check_covered(g->geoips[i].ip->afi,
-		    g->geoips[i].ip->min, g->geoips[i].ip->max, cert->ips,
-		    cert->num_ips) > 0)
-			continue;
-
-		ip_addr_print(&g->geoips[i].ip->ip, g->geoips[i].ip->afi, buf,
-		    sizeof(buf));
-		warnx("%s: Geofeed: uncovered IP: %s", fn, buf);
-		return 0;
-	}
-
-	return 1;
 }
 
 /*

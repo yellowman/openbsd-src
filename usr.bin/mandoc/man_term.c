@@ -1,6 +1,7 @@
-/* $OpenBSD: man_term.c,v 1.200 2025/07/16 14:23:55 schwarze Exp $ */
+/* $OpenBSD: man_term.c,v 1.202 2026/01/07 08:22:24 schwarze Exp $ */
 /*
- * Copyright (c) 2010-2020,2022-23,2025 Ingo Schwarze <schwarze@openbsd.org>
+ * Copyright (c) 2010-2020, 2022-23, 2025, 2026
+ *               Ingo Schwarze <schwarze@openbsd.org>
  * Copyright (c) 2008-2012 Kristaps Dzonsons <kristaps@bsd.lv>
  *
  * Permission to use, copy, modify, and distribute this software for any
@@ -692,6 +693,7 @@ pre_SS(DECL_ARGS)
 			term_vspace(p);
 		break;
 	case ROFFT_HEAD:
+		p->fontibi = 1;
 		term_fontrepl(p, TERMFONT_BOLD);
 		p->tcol->offset = term_len(p, p->defindent) / 2 + 1;
 		p->tcol->rmargin = mt->offset;
@@ -733,6 +735,7 @@ pre_SH(DECL_ARGS)
 			term_vspace(p);
 		break;
 	case ROFFT_HEAD:
+		p->fontibi = 1;
 		term_fontrepl(p, TERMFONT_BOLD);
 		p->tcol->offset = 0;
 		p->tcol->rmargin = mt->offset;
@@ -758,6 +761,8 @@ post_SH(DECL_ARGS)
 	case ROFFT_BLOCK:
 		break;
 	case ROFFT_HEAD:
+		p->fontibi = 0;
+		/* FALLTHROUGH */
 	case ROFFT_BODY:
 		term_newln(p);
 		break;
@@ -1034,6 +1039,7 @@ print_man_foot(struct termp *p, const struct roff_meta *meta)
 	/* Bottom left corner: operating system. */
 
 	p->tcol->offset = 0;
+	p->maxrmargin = p->defrmargin;
 	p->tcol->rmargin = p->maxrmargin > datelen ?
 	    (p->maxrmargin + term_len(p, 1) - datelen) / 2 : 0;
 	p->trailspace = 1;

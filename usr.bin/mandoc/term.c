@@ -1,6 +1,6 @@
-/* $OpenBSD: term.c,v 1.152 2025/07/16 14:23:55 schwarze Exp $ */
+/* $OpenBSD: term.c,v 1.155 2026/01/06 21:16:12 schwarze Exp $ */
 /*
- * Copyright (c) 2010-2022, 2025 Ingo Schwarze <schwarze@openbsd.org>
+ * Copyright (c) 2010-2022, 2025, 2026 Ingo Schwarze <schwarze@openbsd.org>
  * Copyright (c) 2008, 2009, 2010, 2011 Kristaps Dzonsons <kristaps@bsd.lv>
  *
  * Permission to use, copy, modify, and distribute this software for any
@@ -504,34 +504,36 @@ term_fontlast(struct termp *p)
 	p->fontq[p->fonti] = f;
 }
 
-/* Set font, save current, discard previous; for \f, .ft, .B etc. */
+/* Set font, save current, discard previous; for \f, .ft, and man(7). */
 void
 term_fontrepl(struct termp *p, enum termfont f)
 {
-
 	p->fontl = p->fontq[p->fonti];
+	if (p->fontibi && f == TERMFONT_UNDER)
+		f = TERMFONT_BI;
 	p->fontq[p->fonti] = f;
 }
 
-/* Set font, save previous. */
+/* Set font, save previous; for mdoc(7), eqn(7), and tbl(7). */
 void
 term_fontpush(struct termp *p, enum termfont f)
 {
+	enum termfont	 fl;
 
-	p->fontl = p->fontq[p->fonti];
+	fl = p->fontq[p->fonti];
 	if (++p->fonti == p->fontsz) {
 		p->fontsz += 8;
 		p->fontq = mandoc_reallocarray(p->fontq,
 		    p->fontsz, sizeof(*p->fontq));
 	}
-	p->fontq[p->fonti] = f;
+	p->fontq[p->fonti] = fl;
+	term_fontrepl(p, f);
 }
 
 /* Flush to make the saved pointer current again. */
 void
 term_fontpopq(struct termp *p, int i)
 {
-
 	assert(i >= 0);
 	if (p->fonti > i)
 		p->fonti = i;
@@ -541,8 +543,7 @@ term_fontpopq(struct termp *p, int i)
 void
 term_fontpop(struct termp *p)
 {
-
-	assert(p->fonti);
+	assert(p->fonti > 0);
 	p->fonti--;
 }
 
@@ -946,18 +947,14 @@ term_setwidth(struct termp *p, const char *wstr)
 
 	iop = 0;
 	width = 0;
-	if (NULL != wstr) {
-		switch (*wstr) {
-		case '+':
-			iop = 1;
-			wstr++;
-			break;
-		case '-':
-			iop = -1;
-			wstr++;
-			break;
-		default:
-			break;
+	if (wstr != NULL) {
+		if (*wstr == '+' || *wstr == '-') {
+			for (iop = 1;; wstr++) {
+				if (*wstr == '-')
+					iop = -iop;
+				else if (*wstr != '+')
+					break;
+			}
 		}
 		if (a2roffsu(wstr, &su, SCALE_MAX) != NULL)
 			width = term_hspan(p, &su);
@@ -1066,7 +1063,7 @@ term_strlen(const struct termp *p, const char *cp)
 				skip = 1;
 				continue;
 			case ESCAPE_OVERSTRIKE:
-				this_sz = 0;
+				max_sz = 0;
 				rhs = seq + ssz;
 				while (seq < rhs) {
 					if (*seq == '\\') {

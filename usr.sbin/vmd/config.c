@@ -1,4 +1,4 @@
-/*	$OpenBSD: config.c,v 1.78 2025/06/09 18:43:01 dv Exp $	*/
+/*	$OpenBSD: config.c,v 1.80 2026/01/14 03:09:05 dv Exp $	*/
 
 /*
  * Copyright (c) 2015 Reyk Floeter <reyk@openbsd.org>
@@ -190,7 +190,6 @@ config_setvm(struct privsep *ps, struct vmd_vm *vm, uint32_t peerid, uid_t uid)
 	int diskfds[VM_MAX_DISKS_PER_VM][VM_MAX_BASE_PER_DISK];
 	struct vmd_if		*vif;
 	struct vmop_create_params *vmc = &vm->vm_params;
-	struct vm_create_params	*vcp = &vmc->vmc_params;
 	unsigned int		 i, j;
 	int			 fd = -1, cdromfd = -1, kernfd = -1;
 	int			*tapfds = NULL;
@@ -227,13 +226,13 @@ config_setvm(struct privsep *ps, struct vmd_vm *vm, uint32_t peerid, uid_t uid)
 		}
 
 		log_debug("%s: vm %u restarted after %lld.%ld seconds,"
-		    " limit %d/%d", __func__, vcp->vcp_id, since_last.tv_sec,
+		    " limit %d/%d", __func__, vm->vm_vmid, since_last.tv_sec,
 		    since_last.tv_usec, vm->vm_start_limit,
 		    VM_START_RATE_LIMIT);
 
 		if (vm->vm_start_limit >= VM_START_RATE_LIMIT) {
-			log_warnx("%s: vm %u restarted too quickly",
-			    __func__, vcp->vcp_id);
+			log_warnx("%s: vm %u restarted too quickly", __func__,
+			    vm->vm_vmid);
 			return (EPERM);
 		}
 	}
@@ -290,7 +289,7 @@ config_setvm(struct privsep *ps, struct vmd_vm *vm, uint32_t peerid, uid_t uid)
 		    vmc->vmc_checkaccess & VMOP_CREATE_KERNEL,
 		    uid, R_OK) == -1) {
 			log_warnx("vm \"%s\" no read access to kernel "
-			    "%s", vcp->vcp_name, vm->vm_kernel_path);
+			    "%s", vmc->vmc_name, vm->vm_kernel_path);
 			ret = EPERM;
 			goto fail;
 		}
@@ -313,7 +312,7 @@ config_setvm(struct privsep *ps, struct vmd_vm *vm, uint32_t peerid, uid_t uid)
 		    vmc->vmc_checkaccess & VMOP_CREATE_CDROM,
 		    uid, R_OK) == -1) {
 			log_warnx("vm \"%s\" no read access to cdrom %s",
-			    vcp->vcp_name, vmc->vmc_cdrom);
+			    vmc->vmc_name, vmc->vmc_cdrom);
 			ret = EPERM;
 			goto fail;
 		}
@@ -343,7 +342,7 @@ config_setvm(struct privsep *ps, struct vmd_vm *vm, uint32_t peerid, uid_t uid)
 			    vmc->vmc_checkaccess & VMOP_CREATE_DISK,
 			    uid, aflags) == -1) {
 				log_warnx("vm \"%s\" unable to access "
-				    "disk %s", vcp->vcp_name, path);
+				    "disk %s", vmc->vmc_name, path);
 				errno = EPERM;
 				goto fail;
 			}
@@ -361,7 +360,7 @@ config_setvm(struct privsep *ps, struct vmd_vm *vm, uint32_t peerid, uid_t uid)
 				break;
 			if (n == -1) {
 				log_warnx("vm \"%s\" unable to read "
-				    "base for disk %s", vcp->vcp_name,
+				    "base for disk %s", vmc->vmc_name,
 				    vmc->vmc_disks[i]);
 				goto fail;
 			}
@@ -455,53 +454,51 @@ config_setvm(struct privsep *ps, struct vmd_vm *vm, uint32_t peerid, uid_t uid)
 
 	/* Send VM information */
 	/* XXX check proc_compose_imsg return values */
-	proc_compose_imsg(ps, PROC_VMM, -1, IMSG_VMDOP_START_VM_REQUEST,
+	proc_compose_imsg(ps, PROC_VMM, IMSG_VMDOP_START_VM_REQUEST,
 	    vm->vm_vmid, vm->vm_kernel, vmc, sizeof(*vmc));
 
 	if (strlen(vmc->vmc_cdrom))
-		proc_compose_imsg(ps, PROC_VMM, -1,
-		    IMSG_VMDOP_START_VM_CDROM, vm->vm_vmid, cdromfd,
-		    NULL, 0);
+		proc_compose_imsg(ps, PROC_VMM, IMSG_VMDOP_START_VM_CDROM,
+		    vm->vm_vmid, cdromfd, NULL, 0);
 
 	for (i = 0; i < vmc->vmc_ndisks; i++) {
 		for (j = 0; j < VM_MAX_BASE_PER_DISK; j++) {
 			if (diskfds[i][j] == -1)
 				break;
-			proc_compose_imsg(ps, PROC_VMM, -1,
+			proc_compose_imsg(ps, PROC_VMM,
 			    IMSG_VMDOP_START_VM_DISK, vm->vm_vmid,
 			    diskfds[i][j], &i, sizeof(i));
 		}
 	}
 	for (i = 0; i < vmc->vmc_nnics; i++) {
-		proc_compose_imsg(ps, PROC_VMM, -1,
-		    IMSG_VMDOP_START_VM_IF, vm->vm_vmid, tapfds[i],
-		    &i, sizeof(i));
+		proc_compose_imsg(ps, PROC_VMM, IMSG_VMDOP_START_VM_IF,
+		    vm->vm_vmid, tapfds[i], &i, sizeof(i));
 
 		memset(&var, 0, sizeof(var));
 		var.var_vmid = vm->vm_vmid;
 		var.var_nic_idx = i;
-		proc_compose_imsg(ps, PROC_PRIV, -1, IMSG_VMDOP_PRIV_GET_ADDR,
+		proc_compose_imsg(ps, PROC_PRIV, IMSG_VMDOP_PRIV_GET_ADDR,
 		    vm->vm_vmid, dup(tapfds[i]), &var, sizeof(var));
 	}
 
-	proc_compose_imsg(ps, PROC_VMM, -1, IMSG_VMDOP_START_VM_END,
+	proc_compose_imsg(ps, PROC_VMM, IMSG_VMDOP_START_VM_END,
 	    vm->vm_vmid, fd, NULL, 0);
 
 	free(tapfds);
 
 	/* Collapse any memranges after the vm was sent to PROC_VMM */
-	if (vcp->vcp_nmemranges > 0) {
-		for (i = 0; i < vcp->vcp_nmemranges; i++)
-			bytes += vcp->vcp_memranges[i].vmr_size;
-		memset(&vcp->vcp_memranges, 0, sizeof(vcp->vcp_memranges));
-		vcp->vcp_nmemranges = 0;
-		vcp->vcp_memranges[0].vmr_size = bytes;
+	if (vmc->vmc_nmemranges > 0) {
+		for (i = 0; i < vmc->vmc_nmemranges; i++)
+			bytes += vmc->vmc_memranges[i].vmr_size;
+		memset(&vmc->vmc_memranges, 0, sizeof(vmc->vmc_memranges));
+		vmc->vmc_nmemranges = 0;
+		vmc->vmc_memranges[0].vmr_size = bytes;
 	}
 	vm->vm_state |= VM_STATE_RUNNING;
 	return (0);
 
  fail:
-	log_warnx("failed to start vm %s", vcp->vcp_name);
+	log_warnx("failed to start vm %s", vmc->vmc_name);
 
 	if (vm->vm_kernel != -1)
 		close(kernfd);

@@ -1,4 +1,4 @@
-/*	$OpenBSD: printconf.c,v 1.182 2025/03/10 14:11:38 claudio Exp $	*/
+/*	$OpenBSD: printconf.c,v 1.185 2026/03/02 09:51:48 claudio Exp $	*/
 
 /*
  * Copyright (c) 2003, 2004 Henning Brauer <henning@openbsd.org>
@@ -365,12 +365,6 @@ print_set(struct filter_set_head *set)
 			printf("origin ");
 			print_origin(s->action.origin);
 			break;
-		case ACTION_RTLABEL_ID:
-		case ACTION_PFTABLE_ID:
-		case ACTION_SET_NEXTHOP_REF:
-			/* not possible */
-			printf("king bula saiz: config broken");
-			break;
 		}
 	}
 	printf("}");
@@ -670,18 +664,11 @@ print_originsets(struct prefixset_head *psh)
 {
 	struct prefixset	*ps;
 	struct roa		*roa;
-	struct bgpd_addr	 addr;
 
 	SIMPLEQ_FOREACH(ps, psh, entry) {
 		printf("origin-set \"%s\" {", ps->name);
 		RB_FOREACH(roa, roa_tree, &ps->roaitems) {
-			printf("\n\t");
-			addr.aid = roa->aid;
-			addr.v6 = roa->prefix.inet6;
-			printf("%s/%u", log_addr(&addr), roa->prefixlen);
-			if (roa->prefixlen != roa->maxlen)
-				printf(" maxlen %u", roa->maxlen);
-			printf(" source-as %u", roa->asnum);
+			printf("\n\t%s", log_roa(roa));
 		}
 		printf("\n}\n\n");
 	}
@@ -1206,9 +1193,15 @@ print_mrt(struct bgpd_config *conf, uint32_t pid, uint32_t gid,
 	if (conf->mrt == NULL)
 		return;
 
+	/*
+	 * If pid == 0 then this needs to match for the any config rule
+	 * and in that case gid == 0 as well. If pid != 0 then either
+	 * match against peer_id or group_id depending which one is set.
+	 */
 	LIST_FOREACH(m, conf->mrt, entry)
-		if ((gid != 0 && m->group_id == gid) ||
-		    (m->peer_id == pid && m->group_id == gid)) {
+		if ((pid == 0 && m->peer_id == 0 && m->group_id == 0) ||
+		    (m->peer_id != 0 && m->peer_id == pid) ||
+		    (m->group_id != 0 && m->group_id == gid)) {
 			printf("%s%sdump ", prep, prep2);
 			if (m->rib[0])
 				printf("rib %s ", m->rib);

@@ -1,4 +1,4 @@
-/* $OpenBSD: ec_local.h,v 1.69 2025/05/25 05:19:26 jsing Exp $ */
+/* $OpenBSD: ec_local.h,v 1.74 2026/03/18 08:02:40 tb Exp $ */
 /*
  * Originally written by Bodo Moeller for the OpenSSL project.
  */
@@ -68,6 +68,9 @@
  * Sheueling Chang Shantz and Douglas Stebila of Sun Microsystems Laboratories.
  *
  */
+
+#ifndef HEADER_EC_LOCAL_H
+#define HEADER_EC_LOCAL_H
 
 #include <stdlib.h>
 
@@ -167,6 +170,7 @@ struct ec_group_st {
 
 struct ec_point_st {
 	const EC_METHOD *meth;
+	int nid;
 
 	/*
 	 * Jacobian projective coordinates: (X, Y, Z) represents (X/Z^2, Y/Z^3)
@@ -184,6 +188,7 @@ struct ec_point_st {
 
 const EC_METHOD *EC_GFp_simple_method(void);
 const EC_METHOD *EC_GFp_mont_method(void);
+const EC_METHOD *EC_GFp_homogeneous_projective_method(void);
 
 /* Compute r = scalar1 * point1 + scalar2 * point2 in non-constant time. */
 int ec_wnaf_mul(const EC_GROUP *group, EC_POINT *r, const BIGNUM *scalar1,
@@ -191,6 +196,7 @@ int ec_wnaf_mul(const EC_GROUP *group, EC_POINT *r, const BIGNUM *scalar1,
     BN_CTX *ctx);
 
 int ec_group_is_builtin_curve(const EC_GROUP *group, int *out_nid);
+int ec_group_and_point_compatible(const EC_GROUP *group, const EC_POINT *point);
 
 /*
  * Wrappers around the unergonomic EC_POINT_{oct2point,point2oct}().
@@ -250,11 +256,19 @@ struct ec_key_st {
 } /* EC_KEY */;
 
 int eckey_compute_pubkey(EC_KEY *eckey);
-int ecdh_compute_key(unsigned char **out, size_t *out_len,
+
+int ec_key_ecdh_compute_key(unsigned char **out, size_t *out_len,
     const EC_POINT *pub_key, const EC_KEY *ecdh);
-int ecdsa_verify(int type, const unsigned char *dgst, int dgst_len,
+int ec_key_ecdsa_sign_setup(EC_KEY *eckey, BN_CTX *in_ctx, BIGNUM **out_kinv,
+    BIGNUM **out_r);
+int ec_key_ecdsa_sign(int type, const unsigned char *digest, int digest_len,
+    unsigned char *signature, unsigned int *signature_len, const BIGNUM *kinv,
+    const BIGNUM *r, EC_KEY *eckey);
+ECDSA_SIG *ec_key_ecdsa_sign_sig(const unsigned char *digest, int digest_len,
+    const BIGNUM *in_kinv, const BIGNUM *in_r, EC_KEY *eckey);
+int ec_key_ecdsa_verify(int type, const unsigned char *dgst, int dgst_len,
     const unsigned char *sigbuf, int sig_len, EC_KEY *eckey);
-int ecdsa_verify_sig(const unsigned char *dgst, int dgst_len,
+int ec_key_ecdsa_verify_sig(const unsigned char *dgst, int dgst_len,
     const ECDSA_SIG *sig, EC_KEY *eckey);
 
 /*
@@ -264,3 +278,5 @@ int ecdh_KDF_X9_63(unsigned char *out, size_t outlen, const unsigned char *Z,
     size_t Zlen, const unsigned char *sinfo, size_t sinfolen, const EVP_MD *md);
 
 __END_HIDDEN_DECLS
+
+#endif /* HEADER_EC_LOCAL_H */

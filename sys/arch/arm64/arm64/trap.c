@@ -1,4 +1,4 @@
-/* $OpenBSD: trap.c,v 1.53 2025/07/22 09:20:41 kettenis Exp $ */
+/* $OpenBSD: trap.c,v 1.55 2026/03/08 17:07:31 deraadt Exp $ */
 /*-
  * Copyright (c) 2014 Andrew Turner
  * All rights reserved.
@@ -60,8 +60,12 @@ void dumpregs(struct trapframe*);
 static inline int
 is_unpriv_ldst(uint64_t elr)
 {
-	uint32_t insn = *(uint32_t *)elr;
-	return ((insn & 0x3f200c00) == 0x38000800);
+	if ((elr >> 63) == 1) {
+		uint32_t insn = *(uint32_t *)elr;
+		return ((insn & 0x3f200c00) == 0x38000800);
+	}
+
+	return 0;
 }
 
 static inline int
@@ -71,6 +75,24 @@ accesstype(uint64_t esr, int exe)
 		return PROT_EXEC;
 	return (!(esr & ISS_DATA_CM) && (esr & ISS_DATA_WnR)) ?
 	    PROT_WRITE : PROT_READ;
+}
+
+static inline void
+fault(const char *fmt, ...)
+{
+	struct cpu_info *ci = curcpu();
+	va_list ap;
+
+	atomic_cas_ptr(&panicstr, NULL, ci->ci_panicbuf);
+
+	va_start(ap, fmt);
+	vsnprintf(ci->ci_panicbuf, sizeof(ci->ci_panicbuf), fmt, ap);
+	va_end(ap);
+#ifdef DDB
+	db_printf("%s\n", ci->ci_panicbuf);
+#else
+	printf("%s", ci->ci_panicbuf);
+#endif
 }
 
 static void
@@ -163,8 +185,15 @@ kdata_abort(struct trapframe *frame, uint64_t esr, uint64_t far, int exe)
 		else if (pcb->pcb_onfault != NULL)
 			map = kernel_map;
 		else {
-			panic("attempt to access user address"
-			      " 0x%llx from EL1", far);
+#ifdef DDB
+			fault("attempt to %s user address 0x%llx from EL1",
+			    exe ? "execute" : "access", far);
+			db_ktrap(ESR_ELx_EXCEPTION(esr), frame);
+			map = kernel_map;
+#else
+			panic("attempt to %s user address 0x%llx from EL1",
+			    exe ? "execute" : "access", far);
+#endif			
 		}
 	}
 
@@ -280,24 +309,6 @@ emulate_msr(struct trapframe *frame, uint64_t esr)
 	return 1;
 }
 
-static inline void
-fault(const char *fmt, ...)
-{
-	struct cpu_info *ci = curcpu();
-	va_list ap;
-
-	atomic_cas_ptr(&panicstr, NULL, ci->ci_panicbuf);
-
-	va_start(ap, fmt);
-	vsnprintf(ci->ci_panicbuf, sizeof(ci->ci_panicbuf), fmt, ap);
-	va_end(ap);
-#ifdef DDB
-	db_printf("%s\n", ci->ci_panicbuf);
-#else
-	printf("%s", ci->ci_panicbuf);
-#endif
-}
-
 void
 do_el1h_sync(struct trapframe *frame)
 {
@@ -309,7 +320,7 @@ do_el1h_sync(struct trapframe *frame)
 	far = READ_SPECIALREG(far_el1);
 
 	intr_enable();
-	uvmexp.traps++;
+	atomic_inc_int(&uvmexp.traps);
 
 	exception = ESR_ELx_EXCEPTION(esr);
 	switch (exception) {
@@ -370,7 +381,7 @@ do_el0_sync(struct trapframe *frame)
 	far = READ_SPECIALREG(far_el1);
 
 	intr_enable();
-	uvmexp.traps++;
+	atomic_inc_int(&uvmexp.traps);
 
 	p->p_addr->u_pcb.pcb_tf = frame;
 	refreshcreds(p);

@@ -1,4 +1,4 @@
-/*	$OpenBSD: vmm.c,v 1.132 2025/06/09 18:43:01 dv Exp $	*/
+/*	$OpenBSD: vmm.c,v 1.136 2026/03/14 11:25:40 dv Exp $	*/
 
 /*
  * Copyright (c) 2015 Mike Larkin <mlarkin@openbsd.org>
@@ -49,6 +49,7 @@ int	terminate_vm(struct vm_terminate_params *);
 int	get_info_vm(struct privsep *, struct imsg *, int);
 int	opentap(char *);
 
+int	dev_null = -1;
 extern struct vmd *env;
 
 static struct privsep_proc procs[] = {
@@ -66,6 +67,16 @@ vmm_run(struct privsep *ps, struct privsep_proc *p, void *arg)
 {
 	if (config_init(ps->ps_env) == -1)
 		fatal("failed to initialize configuration");
+
+	/*
+	 * Early-open /dev/null so we can dup2(2) std{in,out,err}
+	 * after forking to create child processes.
+	 */
+	if (!env->vmd_debug) {
+		dev_null = open("/dev/null", O_RDWR|O_CLOEXEC, 0);
+		if (dev_null == -1)
+			fatal("/dev/null");
+	}
 
 	/*
 	 * We aren't root, so we can't chroot(2). Use unveil(2) instead.
@@ -95,7 +106,7 @@ int
 vmm_dispatch_parent(int fd, struct privsep_proc *p, struct imsg *imsg)
 {
 	struct privsep		*ps = p->p_ps;
-	int			 res = 0, cmd = 0, verbose;
+	int			 res = 0, cmd = IMSG_NONE, verbose;
 	struct vmd_vm		*vm = NULL;
 	struct vm_terminate_params vtp;
 	struct vmop_id		 vid;
@@ -298,12 +309,12 @@ vmm_dispatch_parent(int fd, struct privsep_proc *p, struct imsg *imsg)
 		vmr.vmr_result = res;
 		vmr.vmr_id = id;
 		vmr.vmr_pid = vm_pid;
-		if (proc_compose_imsg(ps, PROC_PARENT, -1, cmd, vm_id, -1, &vmr,
+		if (proc_compose_imsg(ps, PROC_PARENT, cmd, vm_id, -1, &vmr,
 		    sizeof(vmr)) == -1)
 			return (-1);
 		break;
 	default:
-		if (proc_compose_imsg(ps, PROC_PARENT, -1, cmd, vm_id, -1, &res,
+		if (proc_compose_imsg(ps, PROC_PARENT, cmd, vm_id, -1, &res,
 		    sizeof(res)) == -1)
 			return (-1);
 		break;
@@ -317,7 +328,6 @@ vmm_sighdlr(int sig, short event, void *arg)
 {
 	struct privsep *ps = arg;
 	int status, ret = 0;
-	uint32_t vmid;
 	pid_t pid;
 	struct vmop_result vmr;
 	struct vmd_vm *vm;
@@ -350,22 +360,21 @@ vmm_sighdlr(int sig, short event, void *arg)
 				    (vm->vm_state & VM_STATE_SHUTDOWN))
 					ret = 0;
 
-				vmid = vm->vm_params.vmc_params.vcp_id;
-				vtp.vtp_vm_id = vmid;
+				/* XXX check this */
+				vtp.vtp_vm_id = vm->vm_vmmid;
 
 				if (terminate_vm(&vtp) == 0)
 					log_debug("%s: terminated vm %s"
 					    " (id %d)", __func__,
-					    vm->vm_params.vmc_params.vcp_name,
+					    vm->vm_params.vmc_name,
 					    vm->vm_vmid);
 
 				memset(&vmr, 0, sizeof(vmr));
 				vmr.vmr_result = ret;
-				vmr.vmr_id = vm_id2vmid(vmid, vm);
+				vmr.vmr_id = vm_id2vmid(vm->vm_vmmid, vm);
 				if (proc_compose_imsg(ps, PROC_PARENT,
-				    -1, IMSG_VMDOP_TERMINATE_VM_EVENT,
-				    vm->vm_peerid, -1,
-				    &vmr, sizeof(vmr)) == -1)
+				    IMSG_VMDOP_TERMINATE_VM_EVENT,
+				    vm->vm_peerid, -1, &vmr, sizeof(vmr)) == -1)
 					log_warnx("could not signal "
 					    "termination of VM %u to "
 					    "parent", vm->vm_vmid);
@@ -498,7 +507,7 @@ vmm_dispatch_vm(int fd, short event, void *arg)
 
 		default:
 			fatalx("%s: got invalid imsg %d from %s", __func__,
-			    type, vm->vm_params.vmc_params.vcp_name);
+			    type, vm->vm_params.vmc_name);
 		}
 		imsg_free(&imsg);
 	}
@@ -589,10 +598,9 @@ opentap(char *ifname)
 int
 vmm_start_vm(struct imsg *imsg, uint32_t *id, pid_t *pid)
 {
-	struct vm_create_params	*vcp;
 	struct vmd_vm		*vm;
 	char			*nargv[10], num[32], vmm_fd[32], psp_fd[32];
-	int			 fd, ret = EINVAL;
+	int			 ret = EINVAL;
 	int			 fds[2];
 	pid_t			 vm_pid;
 	size_t			 i, j, sz;
@@ -603,13 +611,11 @@ vmm_start_vm(struct imsg *imsg, uint32_t *id, pid_t *pid)
 		log_warnx("%s: can't find vm", __func__);
 		return (ENOENT);
 	}
-	vcp = &vm->vm_params.vmc_params;
 
 	if ((vm->vm_tty = imsg_get_fd(imsg)) == -1) {
 		log_warnx("%s: can't get tty", __func__);
 		goto err;
 	}
-
 
 	if (socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK, PF_UNSPEC, fds)
 	    == -1)
@@ -632,7 +638,7 @@ vmm_start_vm(struct imsg *imsg, uint32_t *id, pid_t *pid)
 		sz = atomicio(vwrite, fds[0], vm, sizeof(*vm));
 		if (sz != sizeof(*vm)) {
 			log_warnx("%s: failed to send config for vm '%s'",
-			    __func__, vcp->vcp_name);
+			    __func__, vm->vm_params.vmc_name);
 			ret = EIO;
 			/* Defer error handling until after fd closing. */
 		}
@@ -664,26 +670,27 @@ vmm_start_vm(struct imsg *imsg, uint32_t *id, pid_t *pid)
 		    sizeof(env->vmd_cfg.cfg_localprefix));
 		if (sz != sizeof(env->vmd_cfg.cfg_localprefix)) {
 			log_warnx("%s: failed to send local prefix for vm '%s'",
-			    __func__, vcp->vcp_name);
+			    __func__, vm->vm_params.vmc_name);
 			ret = EIO;
 			goto err;
 		}
 
 		/* Read back the kernel-generated vm id from the child */
-		sz = atomicio(read, fds[0], &vcp->vcp_id, sizeof(vcp->vcp_id));
-		if (sz != sizeof(vcp->vcp_id)) {
+		sz = atomicio(read, fds[0], &vm->vm_vmmid,
+		    sizeof(vm->vm_vmmid));
+		if (sz != sizeof(vm->vm_vmmid)) {
 			log_debug("%s: failed to receive vm id from vm %s",
-			    __func__, vcp->vcp_name);
+			    __func__, vm->vm_params.vmc_name);
 			/* vmd could not allocate memory for the vm. */
 			ret = ENOMEM;
 			goto err;
 		}
 
 		/* Check for an invalid id. This indicates child failure. */
-		if (vcp->vcp_id == 0)
+		if (vm->vm_vmmid == 0)
 			goto err;
 
-		*id = vcp->vcp_id;
+		*id = vm->vm_vmmid;
 		*pid = vm->vm_pid;
 
 		/* Wire up our pipe into the event handling. */
@@ -698,13 +705,12 @@ vmm_start_vm(struct imsg *imsg, uint32_t *id, pid_t *pid)
 		close_fd(PROC_PARENT_SOCK_FILENO);
 
 		/* Detach from terminal. */
-		if (!env->vmd_debug && (fd =
-			open("/dev/null", O_RDWR, 0)) != -1) {
-			dup2(fd, STDIN_FILENO);
-			dup2(fd, STDOUT_FILENO);
-			dup2(fd, STDERR_FILENO);
-			if (fd > 2)
-				close(fd);
+		if (!env->vmd_debug) {
+			dup2(dev_null, STDIN_FILENO);
+			dup2(dev_null, STDOUT_FILENO);
+			dup2(dev_null, STDERR_FILENO);
+			if (dev_null > 2)
+				close(dev_null);
 		}
 
 		if (env->vmd_psp_fd > 0)
@@ -829,11 +835,20 @@ get_info_vm(struct privsep *ps, struct imsg *imsg, int terminate)
 			    info[i].vir_name, info[i].vir_id);
 			continue;
 		}
-		memcpy(&vir.vir_info, &info[i], sizeof(vir.vir_info));
-		vir.vir_info.vir_id = vm_id2vmid(info[i].vir_id, NULL);
+
+		/* XXX */
+		vir.vir_memory_size = info[i].vir_memory_size;
+		vir.vir_used_size = info[i].vir_used_size;
+		vir.vir_ncpus = info[i].vir_ncpus;
+		memcpy(vir.vir_vcpu_state, info[i].vir_vcpu_state,
+		    sizeof(vir.vir_vcpu_state));
+		vir.vir_creator_pid = info[i].vir_creator_pid;
+		vir.vir_id = vm_id2vmid(info[i].vir_id, NULL);
+		memcpy(vir.vir_name, info[i].vir_name, sizeof(vir.vir_name));
+
 		peer_id = imsg_get_id(imsg);
 
-		if (proc_compose_imsg(ps, PROC_PARENT, -1,
+		if (proc_compose_imsg(ps, PROC_PARENT,
 		    IMSG_VMDOP_GET_INFO_VM_DATA, peer_id, -1,
 		    &vir, sizeof(vir)) == -1) {
 			ret = EIO;

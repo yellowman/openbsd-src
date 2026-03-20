@@ -1,4 +1,4 @@
-/*	$OpenBSD: vfs_syscalls.c,v 1.376 2025/07/05 04:25:43 jsg Exp $	*/
+/*	$OpenBSD: vfs_syscalls.c,v 1.380 2026/03/09 02:44:04 deraadt Exp $	*/
 /*	$NetBSD: vfs_syscalls.c,v 1.71 1996/04/23 10:29:02 mycroft Exp $	*/
 
 /*
@@ -67,7 +67,7 @@ void checkdirs(struct vnode *);
 
 int copyout_statfs(struct statfs *, void *, struct proc *);
 
-int doopenat(struct proc *, int, const char *, int, mode_t, register_t *);
+int doopenat(struct proc *, int, const char *, int, mode_t, int, register_t *);
 int domknodat(struct proc *, int, const char *, mode_t, dev_t);
 int dolinkat(struct proc *, int, const char *, int, const char *, int);
 int dosymlinkat(struct proc *, const char *, int, const char *);
@@ -416,7 +416,7 @@ dounmount(struct mount *mp, int flags, struct proc *p)
 	 */
 	while ((mp = TAILQ_NEXT(mp, mnt_list)) != NULL) {
 		SLIST_FOREACH(nmp, &mplist, mnt_dounmount) {
-			if (mp->mnt_vnodecovered == NULLVP ||
+			if (mp->mnt_vnodecovered == NULL ||
 			    mp->mnt_vnodecovered->v_mount != nmp)
 				continue;
 
@@ -501,7 +501,7 @@ dounmount_leaf(struct mount *mp, int flags, struct proc *p)
 	}
 
 	TAILQ_REMOVE(&mountlist, mp, mnt_list);
-	if ((coveredvp = mp->mnt_vnodecovered) != NULLVP) {
+	if ((coveredvp = mp->mnt_vnodecovered) != NULL) {
 		coveredvp->v_mountedhere = NULL;
 		vrele(coveredvp);
 	}
@@ -1061,7 +1061,24 @@ sys_open(struct proc *p, void *v, register_t *retval)
 	} */ *uap = v;
 
 	return (doopenat(p, AT_FDCWD, SCARG(uap, path), SCARG(uap, flags),
-	    SCARG(uap, mode), retval));
+	    SCARG(uap, mode), 0, retval));
+}
+
+/*
+ * Check permissions, allocate an open file structure,
+ * and call the device open routine if any.
+ */
+int
+sys___pledge_open(struct proc *p, void *v, register_t *retval)
+{
+	struct sys___pledge_open_args /* {
+		syscallarg(const char *) path;
+		syscallarg(int) flags;
+		syscallarg(mode_t) mode;
+	} */ *uap = v;
+
+	return (doopenat(p, AT_FDCWD, SCARG(uap, path), SCARG(uap, flags),
+	    SCARG(uap, mode), UNVEIL_PLEDGEOPEN, retval));
 }
 
 int
@@ -1075,23 +1092,23 @@ sys_openat(struct proc *p, void *v, register_t *retval)
 	} */ *uap = v;
 
 	return (doopenat(p, SCARG(uap, fd), SCARG(uap, path),
-	    SCARG(uap, flags), SCARG(uap, mode), retval));
+	    SCARG(uap, flags), SCARG(uap, mode), 0, retval));
 }
 
 int
 doopenat(struct proc *p, int fd, const char *path, int oflags, mode_t mode,
-    register_t *retval)
+    int pledgeopen, register_t *retval)
 {
 	struct filedesc *fdp = p->p_fd;
 	struct file *fp;
 	struct vnode *vp;
 	struct vattr vattr;
-	int flags, cloexec, cmode;
+	int flags, fdflags, cmode;
 	int type, indx, error, localtrunc = 0;
 	struct flock lf;
 	struct nameidata nd;
 	uint64_t ni_pledge = 0;
-	u_char ni_unveil = 0;
+	u_char ni_unveil = pledgeopen;
 
 	if (oflags & (O_EXLOCK | O_SHLOCK)) {
 		error = pledge_flock(p);
@@ -1099,7 +1116,8 @@ doopenat(struct proc *p, int fd, const char *path, int oflags, mode_t mode,
 			return (error);
 	}
 
-	cloexec = (oflags & O_CLOEXEC) ? UF_EXCLOSE : 0;
+	fdflags = ((oflags & O_CLOEXEC) ? UF_EXCLOSE : 0)
+	    | ((oflags & O_CLOFORK) ? UF_FORKCLOSE : 0);
 
 	fdplock(fdp);
 	if ((error = falloc(p, &fp, &indx)) != 0) {
@@ -1150,6 +1168,8 @@ doopenat(struct proc *p, int fd, const char *path, int oflags, mode_t mode,
 	}
 	p->p_dupfd = 0;
 	vp = nd.ni_vp;
+	if (pledgeopen && vp->v_type != VCHR)
+		fdflags |= UF_PLEDGEOPEN;
 	fp->f_flag = flags & FMASK;
 	fp->f_type = DTYPE_VNODE;
 	fp->f_ops = &vnops;
@@ -1200,7 +1220,7 @@ doopenat(struct proc *p, int fd, const char *path, int oflags, mode_t mode,
 	KERNEL_UNLOCK();
 	*retval = indx;
 	fdplock(fdp);
-	fdinsert(fdp, indx, cloexec, fp);
+	fdinsert(fdp, indx, fdflags, fp);
 	fdpunlock(fdp);
 	FRELE(fp, p);
 	return (error);
@@ -1224,7 +1244,7 @@ sys___tmpfd(struct proc *p, void *v, register_t *retval)
 	struct file *fp;
 	struct vnode *vp;
 	int oflags = SCARG(uap, flags);
-	int flags, cloexec, cmode;
+	int flags, fdflags, cmode;
 	int indx, error;
 	unsigned int i;
 	struct nameidata nd;
@@ -1232,9 +1252,11 @@ sys___tmpfd(struct proc *p, void *v, register_t *retval)
 	static const char *letters = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_-";
 
 	/* most flags are hardwired */
-	oflags = O_RDWR | O_CREAT | O_EXCL | O_NOFOLLOW | (oflags & O_CLOEXEC);
+	oflags = O_RDWR | O_CREAT | O_EXCL | O_NOFOLLOW |
+	    (oflags & (O_CLOEXEC | O_CLOFORK));
 
-	cloexec = (oflags & O_CLOEXEC) ? UF_EXCLOSE : 0;
+	fdflags = ((oflags & O_CLOEXEC) ? UF_EXCLOSE : 0)
+	    | ((oflags & O_CLOFORK) ? UF_FORKCLOSE : 0);
 
 	fdplock(fdp);
 	if ((error = falloc(p, &fp, &indx)) != 0) {
@@ -1270,7 +1292,7 @@ sys___tmpfd(struct proc *p, void *v, register_t *retval)
 	VOP_UNLOCK(vp);
 	*retval = indx;
 	fdplock(fdp);
-	fdinsert(fdp, indx, cloexec, fp);
+	fdinsert(fdp, indx, fdflags, fp);
 	fdpunlock(fdp);
 	FRELE(fp, p);
 
@@ -1352,7 +1374,7 @@ sys_fhopen(struct proc *p, void *v, register_t *retval)
 	struct vnode *vp = NULL;
 	struct mount *mp;
 	struct ucred *cred = p->p_ucred;
-	int flags, cloexec;
+	int flags, fdflags;
 	int type, indx, error=0;
 	struct flock lf;
 	struct vattr va;
@@ -1370,7 +1392,8 @@ sys_fhopen(struct proc *p, void *v, register_t *retval)
 	if ((flags & O_CREAT))
 		return (EINVAL);
 
-	cloexec = (flags & O_CLOEXEC) ? UF_EXCLOSE : 0;
+	fdflags = ((flags & O_CLOEXEC) ? UF_EXCLOSE : 0)
+	    | ((flags & O_CLOFORK) ? UF_FORKCLOSE : 0);
 
 	fdplock(fdp);
 	if ((error = falloc(p, &fp, &indx)) != 0) {
@@ -1456,7 +1479,7 @@ sys_fhopen(struct proc *p, void *v, register_t *retval)
 	VOP_UNLOCK(vp);
 	*retval = indx;
 	fdplock(fdp);
-	fdinsert(fdp, indx, cloexec, fp);
+	fdinsert(fdp, indx, fdflags, fp);
 	fdpunlock(fdp);
 	FRELE(fp, p);
 	return (0);
@@ -2293,6 +2316,10 @@ sys_fchflags(struct proc *p, void *v, register_t *retval)
 	if ((error = getvnode(p, SCARG(uap, fd), &fp)) != 0)
 		return (error);
 	vp = fp->f_data;
+	if (p->p_fd->fd_ofileflags[SCARG(uap, fd)] & UF_PLEDGEOPEN) {
+		vput(vp);
+		return (EPERM);
+	}
 	vref(vp);
 	FRELE(fp, p);
 	return (dovchflags(p, vp, SCARG(uap, flags)));
@@ -2417,6 +2444,8 @@ sys_fchmod(struct proc *p, void *v, register_t *retval)
 	vn_lock(vp, LK_EXCLUSIVE | LK_RETRY);
 	if (vp->v_mount && vp->v_mount->mnt_flag & MNT_RDONLY)
 		error = EROFS;
+	else if (p->p_fd->fd_ofileflags[SCARG(uap, fd)] & UF_PLEDGEOPEN)
+		error = EPERM;
 	else {
 		vattr_null(&vattr);
 		vattr.va_mode = mode & ALLPERMS;
@@ -2580,6 +2609,8 @@ sys_fchown(struct proc *p, void *v, register_t *retval)
 	vn_lock(vp, LK_EXCLUSIVE | LK_RETRY);
 	if (vp->v_mount && (vp->v_mount->mnt_flag & MNT_RDONLY))
 		error = EROFS;
+	else if (p->p_fd->fd_ofileflags[SCARG(uap, fd)] & UF_PLEDGEOPEN)
+		error = EPERM;
 	else {
 		if ((error = pledge_chown(p, uid, gid)))
 			goto out;
@@ -2905,6 +2936,9 @@ sys_ftruncate(struct proc *p, void *v, register_t *retval)
 		return (error);
 	if ((fp->f_flag & FWRITE) == 0) {
 		error = EINVAL;
+		goto bad;
+	} else if (p->p_fd->fd_ofileflags[SCARG(uap, fd)] & UF_PLEDGEOPEN) {
+		error = EPERM;
 		goto bad;
 	}
 	vp = fp->f_data;

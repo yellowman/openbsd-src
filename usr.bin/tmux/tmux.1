@@ -1,4 +1,4 @@
-.\" $OpenBSD: tmux.1,v 1.1005 2025/07/02 08:13:09 nicm Exp $
+.\" $OpenBSD: tmux.1,v 1.1040 2026/03/18 08:41:20 nicm Exp $
 .\"
 .\" Copyright (c) 2007 Nicholas Marriott <nicholas.marriott@gmail.com>
 .\"
@@ -14,7 +14,7 @@
 .\" IN AN ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING
 .\" OUT OF OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
 .\"
-.Dd $Mdocdate: July 2 2025 $
+.Dd $Mdocdate: March 18 2026 $
 .Dt TMUX 1
 .Os
 .Sh NAME
@@ -597,7 +597,7 @@ This is called line continuation and applies both inside and outside quoted
 strings and in comments, but not inside braces.
 .Pp
 Command arguments may be specified as strings surrounded by single (\[aq])
-quotes, double quotes (\[dq]) or braces ({}).
+quotes or double quotes (\[dq]), or as command lists surrounded by braces ({}).
 .\" "
 This is required when the argument contains any special character.
 Single and double quoted strings cannot span multiple lines except with line
@@ -839,6 +839,7 @@ Each has a single-character alternative form.
 .It Li "{last}" Ta "!" Ta "The last (previously current) window"
 .It Li "{next}" Ta "+" Ta "The next window by number"
 .It Li "{previous}" Ta "-" Ta "The previous window by number"
+.It Li "{current}" Ta "@" Ta "The current window"
 .El
 .Pp
 .Ar target-pane
@@ -871,6 +872,7 @@ The following special tokens are available for the pane index:
 .It Li "{down-of}" Ta "" Ta "The pane below the active pane"
 .It Li "{left-of}" Ta "" Ta "The pane to the left of the active pane"
 .It Li "{right-of}" Ta "" Ta "The pane to the right of the active pane"
+.It Li "{active}" Ta "@" Ta "The active pane"
 .El
 .Pp
 The tokens
@@ -1181,8 +1183,10 @@ flag clears alerts (bell, activity, or silence) in all windows linked to the
 session.
 .Tg lsc
 .It Xo Ic list-clients
+.Op Fl r
 .Op Fl F Ar format
 .Op Fl f Ar filter
+.Op Fl O Ar sort-order
 .Op Fl t Ar target-session
 .Xc
 .D1 Pq alias: Ic lsc
@@ -1195,6 +1199,16 @@ Only clients for which the filter is true are shown.
 See the
 .Sx FORMATS
 section.
+.Fl O
+specifies the sort order: one of
+.Ql name ,
+.Ql size ,
+.Ql creation
+(time), or
+.Ql activity
+(time).
+.Fl r
+reverses the sort order.
 If
 .Ar target-session
 is specified, list only clients connected to that session.
@@ -1210,8 +1224,10 @@ or - if omitted - of all commands supported by
 .Nm .
 .Tg ls
 .It Xo Ic list-sessions
+.Op Fl r
 .Op Fl F Ar format
 .Op Fl f Ar filter
+.Op Fl O Ar sort-order
 .Xc
 .D1 Pq alias: Ic ls
 List all sessions managed by the server.
@@ -1223,6 +1239,16 @@ Only sessions for which the filter is true are shown.
 See the
 .Sx FORMATS
 section.
+.Fl O
+specifies the sort order: one of
+.Ql index ,
+.Ql name ,
+.Ql creation
+(time), or
+.Ql activity
+(time).
+.Fl r
+reverses the sort order.
 .Tg lockc
 .It Ic lock-client Op Fl t Ar target-client
 .D1 Pq alias: Ic lockc
@@ -1361,12 +1387,11 @@ and sets an environment variable for the newly created session; it may be
 specified multiple times.
 .Tg refresh
 .It Xo Ic refresh-client
-.Op Fl cDLRSU
+.Op Fl cDlLRSU
 .Op Fl A Ar pane:state
 .Op Fl B Ar name:what:format
 .Op Fl C Ar size
 .Op Fl f Ar flags
-.Op Fl l Op Ar target-pane
 .Op Fl r Ar pane:report
 .Op Fl t Ar target-client
 .Op Ar adjustment
@@ -1487,11 +1512,7 @@ a colon, then a report escape sequence.
 .Fl l
 requests the clipboard from the client using the
 .Xr xterm 1
-escape sequence.
-If
-.Ar target-pane
-is given, the clipboard is sent (in encoded form), otherwise it is stored in a
-new paste buffer.
+escape sequence and stores it in a new paste buffer.
 .Pp
 .Fl L ,
 .Fl R ,
@@ -1624,6 +1645,7 @@ Suspend a client by sending
 .It Xo Ic switch-client
 .Op Fl ElnprZ
 .Op Fl c Ar target-client
+.Op Fl O Ar sort-order
 .Op Fl t Ar target-session
 .Op Fl T Ar key-table
 .Xc
@@ -1650,6 +1672,18 @@ or
 .Fl p
 is used, the client is moved to the last, next or previous session
 respectively.
+.Fl O
+may be used with
+.Fl n
+and
+.Fl p
+to specify the field to sort on: one of
+.Ql name ,
+.Ql size ,
+.Ql creation
+(time), or
+.Ql activity
+(time).
 .Fl r
 toggles the client
 .Ic read-only
@@ -1666,9 +1700,10 @@ is used,
 option will not be applied.
 .Pp
 .Fl T
-sets the client's key table; the next key from the client will be interpreted
-from
+sets the client's key table; the next key will be looked up using
 .Ar key-table .
+After that key, the client is returned to its default key table (normally
+.Em root ) .
 This may be used to configure multiple prefix keys, or to bind commands to
 sequences of keys.
 For example, to make typing
@@ -1951,6 +1986,16 @@ Move the cursor right.
 .Xc
 Move the cursor up.
 .It Xo
+.Ic cursor-centre-vertical
+(emacs: C-l)
+.Xc
+Moves the cursor to the vertical centre of the pane.
+.It Xo
+.Ic cursor-centre-horizontal
+(emacs: M-l)
+.Xc
+Moves the cursor to the horizontal centre of the pane.
+.It Xo
 .Ic end-of-line
 (vi: $)
 (emacs: C-e)
@@ -2200,11 +2245,30 @@ Same as
 .Ic scroll-down
 but also exit copy mode if the cursor reaches the bottom.
 .It Xo
+.Ic scroll-exit-on
+.Xc
+Turn on exiting copy mode when scrolling to the end of the buffer.
+.It Xo
+.Ic scroll-exit-off
+.Xc
+Turn off exiting copy mode when scrolling to the end of the buffer.
+.It Xo
+.Ic scroll-exit-toggle
+.Xc
+Toggle exiting copy mode when scrolling to the end of the buffer.
+.It Xo
 .Ic scroll-middle
 (vi: z)
 .Xc
 Scroll so that the current line becomes the middle one while keeping the
 cursor on that line.
+.It Xo
+.Ic scroll-to-mouse
+.Xc
+Scroll pane in copy-mode when bound to a mouse drag event.
+.Fl e
+causes copy mode to exit when at the bottom.
+.Pp
 .It Xo
 .Ic scroll-top
 .Xc
@@ -2282,6 +2346,11 @@ Select the current line.
 .Ic select-word
 .Xc
 Select the current word.
+.It Xo
+.Ic selection-mode
+.Op Ic char | word | line
+.Xc
+Change the selection mode.
 .It Xo
 .Ic set-mark
 (vi: X)
@@ -2437,12 +2506,10 @@ cancels copy mode and any other modes.
 .Fl M
 begins a mouse drag (only valid if bound to a mouse key binding, see
 .Sx MOUSE SUPPORT ) .
+.Pp
 .Fl S
-scrolls when bound to a mouse drag event; for example,
-.Ic copy-mode -Se
-is bound to
-.Ar MouseDrag1ScrollbarSlider
-by default.
+enters copy-mode and scrolls when bound to a mouse drag event; See
+.Ic scroll-to-mouse .
 .Pp
 .Fl s
 copies from
@@ -2631,7 +2698,7 @@ zooms the pane.
 .Fl y
 disables any confirmation prompts.
 The following keys may be used in client mode:
-.Bl -column "Key" "Function" -offset indent
+.Bl -column "KeyXXXXXX" "Function" -offset indent
 .It Sy "Key" Ta Sy "Function"
 .It Li "Enter" Ta "Choose selected client"
 .It Li "Up" Ta "Select previous client"
@@ -2649,9 +2716,10 @@ The following keys may be used in client mode:
 .It Li "z" Ta "Suspend selected client"
 .It Li "Z" Ta "Suspend tagged clients"
 .It Li "f" Ta "Enter a format to filter items"
-.It Li "O" Ta "Change sort field"
+.It Li "O" Ta "Change sort order"
 .It Li "r" Ta "Reverse sort order"
 .It Li "v" Ta "Toggle preview"
+.It Li "F1 or C-h" Ta "Display help"
 .It Li "q" Ta "Exit mode"
 .El
 .Pp
@@ -2665,12 +2733,11 @@ If
 is not given, "detach-client -t \[aq]%%\[aq]" is used.
 .Pp
 .Fl O
-specifies the initial sort field: one of
+specifies the initial sort order: one of
 .Ql name ,
 .Ql size ,
 .Ql creation
-(time),
-or
+(time), or
 .Ql activity
 (time).
 .Fl r
@@ -2711,7 +2778,7 @@ zooms the pane.
 .Fl y
 disables any confirmation prompts.
 The following keys may be used in tree mode:
-.Bl -column "Key" "Function" -offset indent
+.Bl -column "KeyXXXXXX" "Function" -offset indent
 .It Sy "Key" Ta Sy "Function"
 .It Li "Enter" Ta "Choose selected item"
 .It Li "Up" Ta "Select previous item"
@@ -2737,9 +2804,10 @@ The following keys may be used in tree mode:
 .It Li "\&:" Ta "Run a command for each tagged item"
 .It Li "f" Ta "Enter a format to filter items"
 .It Li "H" Ta "Jump to the starting pane"
-.It Li "O" Ta "Change sort field"
+.It Li "O" Ta "Change sort order"
 .It Li "r" Ta "Reverse sort order"
 .It Li "v" Ta "Toggle preview"
+.It Li "F1 or C-h" Ta "Display help"
 .It Li "q" Ta "Exit mode"
 .El
 .Pp
@@ -2755,12 +2823,12 @@ If
 is not given, "switch-client -t \[aq]%%\[aq]" is used.
 .Pp
 .Fl O
-specifies the initial sort field: one of
+specifies the initial sort order: one of
 .Ql index ,
 .Ql name ,
 or
-.Ql time
-(activity).
+.Ql activity
+(time).
 .Fl r
 reverses the sort order.
 .Fl f
@@ -2791,7 +2859,7 @@ Option values in the list are shown for the active pane in the current window.
 .Fl Z
 zooms the pane.
 The following keys may be used in customize mode:
-.Bl -column "Key" "Function" -offset indent
+.Bl -column "KeyXXXXXX" "Function" -offset indent
 .It Sy "Key" Ta Sy "Function"
 .It Li "Enter" Ta "Set pane, window, session or global option value"
 .It Li "Up" Ta "Select previous item"
@@ -2815,6 +2883,7 @@ The following keys may be used in customize mode:
 .It Li "C-t" Ta "Tag all items"
 .It Li "f" Ta "Enter a format to filter items"
 .It Li "v" Ta "Toggle option information"
+.It Li "F1 or C-h" Ta "Display help"
 .It Li "q" Ta "Exit mode"
 .El
 .Pp
@@ -3006,9 +3075,10 @@ If
 is given, the newly linked window is not selected.
 .Tg lsp
 .It Xo Ic list-panes
-.Op Fl as
+.Op Fl ars
 .Op Fl F Ar format
 .Op Fl f Ar filter
+.Op Fl O Ar sort-order
 .Op Fl t Ar target
 .Xc
 .D1 Pq alias: Ic lsp
@@ -3033,11 +3103,25 @@ Only panes for which the filter is true are shown.
 See the
 .Sx FORMATS
 section.
+.Fl O
+specifies the sort order: one of
+.Ql name
+(title),
+.Ql index ,
+.Ql size
+(area),
+.Ql creation
+(time), or
+.Ql activity
+(time).
+.Fl r
+reverses the sort order.
 .Tg lsw
 .It Xo Ic list-windows
-.Op Fl a
+.Op Fl ar
 .Op Fl F Ar format
 .Op Fl f Ar filter
+.Op Fl O Ar sort-order
 .Op Fl t Ar target-session
 .Xc
 .D1 Pq alias: Ic lsw
@@ -3054,6 +3138,19 @@ Only windows for which the filter is true are shown.
 See the
 .Sx FORMATS
 section.
+.Fl O
+specifies the sort order: one of
+.Ql index ,
+.Ql name ,
+.Ql size
+(area),
+.Ql creation
+(time),
+or
+.Ql activity
+(time).
+.Fl r
+reverses the sort order.
 .Tg movep
 .It Xo Ic move-pane
 .Op Fl bdfhv
@@ -3743,24 +3840,45 @@ To view the default bindings and possible commands, see the
 command.
 .Tg lsk
 .It Xo Ic list-keys
-.Op Fl 1aN
+.Op Fl 1aNr
+.Op Fl F Ar format
+.Op Fl O Ar sort-order
 .Op Fl P Ar prefix-string
 .Op Fl T Ar key-table
 .Op Ar key
 .Xc
 .D1 Pq alias: Ic lsk
 List key bindings.
-There are two forms: the default lists keys as
+.Fl F
+specifies the format of each line.
+See the
+.Sx FORMATS
+section.
+.Fl T
+specifies a
+.Ar key-table
+to list from.
+.Fl 1
+lists only the first matching key.
+.Fl O
+specifies the sort order: one of
+.Ql key ,
+.Ql modifier ,
+.Ql name
+(table name).
+.Fl r
+reverses the sort order.
+.Pp
+If no
+.Ar format
+is given, there are two forms: the default lists keys as
 .Ic bind-key
 commands;
 .Fl N
 lists only keys with attached notes and shows only the key and note for each
 key.
 .Pp
-With the default form, all key tables are listed by default.
-.Fl T
-lists only keys in
-.Ar key-table .
+With the default form, all key tables are listed unless specified otherwise.
 .Pp
 With the
 .Fl N
@@ -3773,9 +3891,7 @@ key tables are listed by default;
 also lists only keys in
 .Ar key-table .
 .Fl P
-specifies a prefix to print before each key and
-.Fl 1
-lists only the first matching key.
+specifies a prefix to print before each key.
 .Fl a
 lists the command for keys that do not have a note rather than skipping them.
 .Tg send
@@ -4123,9 +4239,10 @@ An array option allowing widths of Unicode codepoints to be overridden.
 Note the new width applies to all clients.
 Each entry is of the form
 .Em codepoint=width ,
-where codepoint may be a UTF-8 character or an identifier of the form
+where codepoint may be a UTF-8 character, an identifier of the form
 .Ql U+number
-where the number is a hexadecimal number.
+where the number is a hexadecimal number, or a range of the form
+.Ql U+number-U+number .
 .It Ic copy-command Ar shell-command
 Give the command to pipe to if the
 .Ic copy-pipe
@@ -4223,6 +4340,38 @@ When enabled, focus events are requested from the terminal if supported and
 passed through to applications running in
 .Nm .
 Attached clients should be detached and attached again after changing this
+option.
+.It Xo Ic focus-follows-mouse
+.Op Ic on | off
+.Xc
+When enabled and
+.Ic mouse
+is on, moving the mouse into a pane selects it.
+.It Xo Ic get-clipboard
+.Op Ic both | request | buffer | off
+.Xc
+Controls the behaviour when an application requests the clipboard from
+.Nm .
+.Pp
+If
+.Ic off ,
+the request is ignored;
+if
+.Ic buffer ,
+.Nm
+responds with the newest paste buffer;
+.Ic request
+causes
+.Nm
+to request the clipboard from the most recently used client (if possible) and
+send the reply (if any) back to the application;
+.Ic both
+is the same as
+.Ic request
+but also creates a paste buffer.
+.Pp
+See also the
+.Ic set-clipboard
 option.
 .It Ic history-file Ar path
 If not empty, a file to which
@@ -4533,9 +4682,7 @@ If set to 0, messages and indicators are displayed until a key is pressed.
 .Ar time
 is in milliseconds.
 .It Ic history-limit Ar lines
-Set the maximum number of lines held in window history.
-This setting applies only to new windows - existing window histories are not
-resized and retain the limit at the point they were created.
+Set the maximum number of lines held in pane history.
 .It Ic initial-repeat-time Ar time
 Set the time in milliseconds for the initial repeat when a key is bound with the
 .Fl r
@@ -4602,6 +4749,23 @@ For how to specify
 see the
 .Sx STYLES
 section.
+.It Ic message-format Ar string
+Set the format string for the prompt and message area.
+The special placeholder
+.Ql #{message}
+expands to the interactive prompt or message text and
+.Ql #{command_prompt}
+is set to 1 when the prompt is in command mode (vi).
+Style directives like
+.Ic fill ,
+.Ic align ,
+and
+.Ic width
+may be used in the format string.
+The default uses a conditional to select between
+.Ic message-style
+and
+.Ic message-command-style .
 .It Xo Ic message-line
 .Op Ic 0 | 1 | 2 | 3 | 4
 .Xc
@@ -4609,6 +4773,23 @@ Set line on which status line messages and the command prompt are shown.
 .It Ic message-style Ar style
 Set status line message style.
 This is used for messages and for the command prompt.
+The message is drawn on top of the existing status line.
+A
+.Ic width
+attribute (a fixed number of columns or a percentage such as
+.Ql 50% )
+constrains the prompt area width and an
+.Ic align
+attribute
+.Pq Ic left , centre , right
+sets its horizontal position.
+When the width is less than the full terminal width, the normal status
+bar content remains visible around the prompt area.
+The
+.Ic fill
+attribute is used by the default
+.Ic message-format
+to clear the background.
 For how to specify
 .Ar style ,
 see the
@@ -4649,6 +4830,12 @@ Can be set to zero to disable any timeout.
 Set the colour of the cursor in the command prompt.
 .It Ic prompt-cursor-style Ar style
 Set the style of the cursor in the command prompt.
+See the
+.Ic cursor-style
+options for available styles.
+.It Ic prompt-command-cursor-style Ar style
+Set the style of the cursor in the command prompt when vi keys are enabled and
+the prompt is in command mode.
 See the
 .Ic cursor-style
 options for available styles.
@@ -4910,7 +5097,7 @@ option is enabled.
 Set clock colour.
 .Pp
 .It Xo Ic clock-mode-style
-.Op Ic 12 | 24
+.Op Ic 12 | 24 | 12-with-seconds | 24-with-seconds
 .Xc
 Set clock hour format.
 .Pp
@@ -5078,6 +5265,8 @@ heavy lines using UTF-8 characters
 simple ASCII characters
 .It number
 the pane number
+.It spaces
+space characters
 .El
 .Pp
 .Ql double
@@ -5185,6 +5374,46 @@ Other attributes are ignored.
 .Op Ic left | right
 .Xc
 Sets which side of the pane to display pane scrollbars on.
+.Pp
+.It Ic pane-status-current-style Ar style
+Set status line style for the currently active pane.
+For how to specify
+.Ar style ,
+see the
+.Sx STYLES
+section.
+.Pp
+.It Ic pane-status-style Ar style
+Set status line style for a single pane.
+For how to specify
+.Ar style ,
+see the
+.Sx STYLES
+section.
+.Pp
+.It Ic session-status-current-style Ar style
+Set status line style for the currently active session.
+For how to specify
+.Ar style ,
+see the
+.Sx STYLES
+section.
+.Pp
+.It Ic session-status-style Ar style
+Set status line style for a single session.
+For how to specify
+.Ar style ,
+see the
+.Sx STYLES
+section.
+.Pp
+.It Ic tiled-layout-max-columns Ar number
+Set the maximum number of columns in the
+.Ic tiled
+layout.
+A value of 0 (the default) means no limit.
+When a limit is set, panes are arranged to not exceed this number of columns,
+with additional panes stacked in extra rows.
 .Pp
 .It Ic window-status-activity-style Ar style
 Set status line style for windows with an activity alert.
@@ -5934,6 +6163,21 @@ For example, to get a list of windows formatted like the status line:
 #{W:#{E:window-status-format} ,#{E:window-status-current-format} }
 .Ed
 .Pp
+Within the
+.Ql W:\&
+loop, user options
+.Po
+.Ql @name
+.Pc
+from neighboring windows are available with a
+.Ql next_
+or
+.Ql prev_
+prefix, for example a user option
+.Ql @color
+on the next window is available as
+.Ql next_@color .
+.Pp
 .Ql N:\&
 checks if a window (without any suffix or with the
 .Ql w
@@ -6014,6 +6258,7 @@ The following variables are available, where appropriate:
 .It Li "alternate_saved_x" Ta "" Ta "Saved cursor X in alternate screen"
 .It Li "alternate_saved_y" Ta "" Ta "Saved cursor Y in alternate screen"
 .It Li "buffer_created" Ta "" Ta "Time buffer created"
+.It Li "buffer_full" Ta "" Ta "Full buffer content"
 .It Li "buffer_name" Ta "" Ta "Name of buffer"
 .It Li "buffer_sample" Ta "" Ta "Sample of start of buffer"
 .It Li "buffer_size" Ta "" Ta "Size of the specified buffer in bytes"
@@ -6073,9 +6318,17 @@ The following variables are available, where appropriate:
 .It Li "host" Ta "#H" Ta "Hostname of local host"
 .It Li "host_short" Ta "#h" Ta "Hostname of local host (no domain name)"
 .It Li "insert_flag" Ta "" Ta "Pane insert flag"
+.It Li "key_string" Ta "" Ta "String representation of the key binding"
+.It Li "key_repeat" Ta "" Ta "1 if key binding is repeatable"
+.It Li "key_note" Ta "" Ta "Note of the key binding"
+.It Li "key_prefix" Ta "" Ta "Global key prefix"
+.It Li "key_table" Ta "" Ta "Table name of the key binding"
+.It Li "key_command" Ta "" Ta "Command of the key binding"
+.It Li "key_has_repeat" Ta "" Ta "1 if list contain a repeatable key"
+.It Li "key_string_width" Ta "" Ta "Maximum key_string width in list"
+.It Li "key_table_width" Ta "" Ta "Maximum key_table width in list"
 .It Li "keypad_cursor_flag" Ta "" Ta "Pane keypad cursor flag"
 .It Li "keypad_flag" Ta "" Ta "Pane keypad flag"
-.It Li "last_session_index" Ta "" Ta "Index of last session"
 .It Li "last_window_index" Ta "" Ta "Index of last window in session"
 .It Li "line" Ta "" Ta "Line number in the list"
 .It Li "loop_last_flag" Ta "" Ta "1 if last window, pane, session, client in the W:, P:, S:, or L: loop"
@@ -6093,6 +6346,8 @@ The following variables are available, where appropriate:
 .It Li "mouse_x" Ta "" Ta "Mouse X position, if any"
 .It Li "mouse_y" Ta "" Ta "Mouse Y position, if any"
 .It Li "next_session_id" Ta "" Ta "Unique session ID for next new session"
+.It Li "next_window_active" Ta "" Ta "1 if next window in W: loop is active"
+.It Li "next_window_index" Ta "" Ta "Index of next window in W: loop"
 .It Li "origin_flag" Ta "" Ta "Pane origin flag"
 .It Li "pane_active" Ta "" Ta "1 if active pane"
 .It Li "pane_at_bottom" Ta "" Ta "1 if pane is at the bottom of window"
@@ -6123,6 +6378,7 @@ The following variables are available, where appropriate:
 .It Li "pane_path" Ta "" Ta "Path of pane (can be set by application)"
 .It Li "pane_pid" Ta "" Ta "PID of first process in pane"
 .It Li "pane_pipe" Ta "" Ta "1 if pane is being piped"
+.It Li "pane_pipe_pid" Ta "" Ta "PID of pipe process, if any"
 .It Li "pane_right" Ta "" Ta "Right of pane"
 .It Li "pane_search_string" Ta "" Ta "Last search string in copy mode"
 .It Li "pane_start_command" Ta "" Ta "Command pane started with"
@@ -6135,6 +6391,8 @@ The following variables are available, where appropriate:
 .It Li "pane_unseen_changes" Ta "" Ta "1 if there were changes in pane while in mode"
 .It Li "pane_width" Ta "" Ta "Width of pane"
 .It Li "pid" Ta "" Ta "Server PID"
+.It Li "prev_window_active" Ta "" Ta "1 if previous window in W: loop is active"
+.It Li "prev_window_index" Ta "" Ta "Index of previous window in W: loop"
 .It Li "rectangle_toggle" Ta "" Ta "1 if rectangle selection is activated"
 .It Li "scroll_position" Ta "" Ta "Scroll position in copy mode"
 .It Li "scroll_region_lower" Ta "" Ta "Bottom of scroll region in pane"
@@ -6146,6 +6404,7 @@ The following variables are available, where appropriate:
 .It Li "selection_active" Ta "" Ta "1 if selection started and changes with the cursor in copy mode"
 .It Li "selection_end_x" Ta "" Ta "X position of the end of the selection"
 .It Li "selection_end_y" Ta "" Ta "Y position of the end of the selection"
+.It Li "selection_mode" Ta "" Ta "Selection mode"
 .It Li "selection_present" Ta "" Ta "1 if selection started in copy mode"
 .It Li "selection_start_x" Ta "" Ta "X position of the start of the selection"
 .It Li "selection_start_y" Ta "" Ta "Y position of the start of the selection"
@@ -6167,7 +6426,6 @@ The following variables are available, where appropriate:
 .It Li "session_group_size" Ta "" Ta "Size of session group"
 .It Li "session_grouped" Ta "" Ta "1 if session in a group"
 .It Li "session_id" Ta "" Ta "Unique session ID"
-.It Li "session_index" Ta "" Ta "Index of session"
 .It Li "session_last_attached" Ta "" Ta "Time session last attached"
 .It Li "session_many_attached" Ta "" Ta "1 if multiple clients attached"
 .It Li "session_marked" Ta "" Ta "1 if this session contains the marked pane"
@@ -6179,6 +6437,7 @@ The following variables are available, where appropriate:
 .It Li "socket_path" Ta "" Ta "Server socket path"
 .It Li "sixel_support" Ta "" Ta "1 if server has support for SIXEL"
 .It Li "start_time" Ta "" Ta "Server start time"
+.It Li "synchronized_output_flag" Ta "" Ta "1 if pane has synchronized output enabled"
 .It Li "uid" Ta "" Ta "Server UID"
 .It Li "user" Ta "" Ta "Server user"
 .It Li "version" Ta "" Ta "Server version"
@@ -6301,6 +6560,11 @@ is the terminal alternate character set.
 Align text to the left, centre or right of the available space if appropriate.
 .It Ic fill=colour
 Fill the available space with a background colour if appropriate.
+.It Ic width=N
+Set the width of the styled area.
+.Ar N
+may be a column count or a percentage (for example
+.Ql 50% ) .
 .It Xo Ic list=on ,
 .Ic list=focus ,
 .Ic list=left-marker ,
@@ -6617,7 +6881,7 @@ See
 for possible values for
 .Ar prompt-type .
 .It Xo Ic command-prompt
-.Op Fl 1bFikN
+.Op Fl 1beFiklN
 .Op Fl I Ar inputs
 .Op Fl p Ar prompts
 .Op Fl t Ar target-client
@@ -6637,8 +6901,10 @@ With
 .Ar template
 is expanded as a format.
 .Pp
-If present,
+If
 .Fl I
+is present,
+.Ar inputs
 is a comma-separated list of the initial text for each prompt.
 If
 .Fl p
@@ -6650,6 +6916,12 @@ a single prompt is displayed, constructed from
 if it is present, or
 .Ql \&:
 if not.
+.Fl l
+disables splitting of
+.Ar inputs
+and
+.Ar prompts
+at commas and treats them literally.
 .Pp
 Before the command is executed, the first occurrence of the string
 .Ql %%
@@ -6682,6 +6954,10 @@ makes the prompt only accept numeric key presses.
 .Fl i
 executes the command every time the prompt input changes instead of when the
 user exits the command prompt.
+.Fl e
+makes
+.Em BSpace
+cancel an empty prompt.
 .Pp
 .Fl T
 tells
@@ -6933,14 +7209,14 @@ forwards any input read from stdin to the empty pane given by
 .Ar target-pane .
 .Tg popup
 .It Xo Ic display-popup
-.Op Fl BCE
+.Op Fl BCEkN
 .Op Fl b Ar border-lines
 .Op Fl c Ar target-client
 .Op Fl d Ar start-directory
 .Op Fl e Ar environment
 .Op Fl h Ar height
-.Op Fl s Ar border-style
-.Op Fl S Ar style
+.Op Fl s Ar style
+.Op Fl S Ar border-style
 .Op Fl t Ar target-pane
 .Op Fl T Ar title
 .Op Fl w Ar width
@@ -6957,6 +7233,20 @@ when omitted) on
 .Ar target-client .
 A popup is a rectangular box drawn over the top of any panes.
 Panes are not updated while a popup is present.
+If the command is run inside an existing popup, that popup is modified.
+Only the
+.Fl b ,
+.Fl B ,
+.Fl C ,
+.Fl E ,
+.Fl EE ,
+.Fl K ,
+.Fl N ,
+.Fl s ,
+and
+.Fl S
+options are accepted in this case;
+all others are ignored.
 .Pp
 .Fl E
 closes the popup automatically when
@@ -6967,6 +7257,11 @@ Two
 closes the popup only if
 .Ar shell-command
 exited with success.
+.Fl k
+allows any key to dismiss the popup instead of only
+.Ql Escape
+or
+.Ql C-c .
 .Pp
 .Fl x
 and
@@ -7015,6 +7310,9 @@ is a format for the popup title (see
 The
 .Fl C
 flag closes any popup on the client.
+.Pp
+.Fl N
+disables any previously specified -E, -EE, or -k option.
 .Tg showphist
 .It Xo Ic show-prompt-history
 .Op Fl T Ar prompt-type
@@ -7097,7 +7395,7 @@ zooms the pane.
 .Fl y
 disables any confirmation prompts.
 The following keys may be used in buffer mode:
-.Bl -column "Key" "Function" -offset indent
+.Bl -column "KeyXXXXXX" "Function" -offset indent
 .It Sy "Key" Ta Sy "Function"
 .It Li "Enter" Ta "Paste selected buffer"
 .It Li "Up" Ta "Select previous buffer"
@@ -7114,9 +7412,10 @@ The following keys may be used in buffer mode:
 .It Li "D" Ta "Delete tagged buffers"
 .It Li "e" Ta "Open the buffer in an editor"
 .It Li "f" Ta "Enter a format to filter items"
-.It Li "O" Ta "Change sort field"
+.It Li "O" Ta "Change sort order"
 .It Li "r" Ta "Reverse sort order"
 .It Li "v" Ta "Toggle preview"
+.It Li "F1 or C-h" Ta "Display help"
 .It Li "q" Ta "Exit mode"
 .El
 .Pp
@@ -7130,10 +7429,10 @@ If
 is not given, "paste-buffer -p -b \[aq]%%\[aq]" is used.
 .Pp
 .Fl O
-specifies the initial sort field: one of
-.Ql time
-(creation),
-.Ql name
+specifies the initial sort order: one of
+.Ql creation
+(time),
+.Ql name ,
 or
 .Ql size .
 .Fl r
@@ -7166,8 +7465,10 @@ Delete the buffer named
 or the most recently added automatically named buffer if not specified.
 .Tg lsb
 .It Xo Ic list-buffers
+.Op Fl r
 .Op Fl F Ar format
 .Op Fl f Ar filter
+.Op Fl O Ar sort-order
 .Xc
 .D1 Pq alias: Ic lsb
 List the global buffers.
@@ -7179,6 +7480,15 @@ Only buffers for which the filter is true are shown.
 See the
 .Sx FORMATS
 section.
+.Fl O
+specifies the sort order: one of
+.Ql name ,
+.Ql size ,
+or
+.Ql creation
+(time).
+.Fl r
+reverses the sort order.
 .It Xo Ic load-buffer
 .Op Fl w
 .Op Fl b Ar buffer-name
@@ -7203,7 +7513,7 @@ is
 the contents are read from stdin.
 .Tg pasteb
 .It Xo Ic paste-buffer
-.Op Fl dpr
+.Op Fl dprS
 .Op Fl b Ar buffer-name
 .Op Fl s Ar separator
 .Op Fl t Ar target-pane
@@ -7211,9 +7521,14 @@ the contents are read from stdin.
 .D1 Pq alias: Ic pasteb
 Insert the contents of a paste buffer into the specified pane.
 If not specified, paste into the current one.
+By default, control characters are sanitized with
+.Xr vis 3 ;
+.Fl S
+disables this.
 With
 .Fl d ,
 also delete the paste buffer.
+.Pp
 When output, any linefeed (LF) characters in the paste buffer are replaced with
 a separator, by default carriage return (CR).
 A custom separator may be specified using the

@@ -1,4 +1,4 @@
-/*	$OpenBSD: session.h,v 1.191 2025/02/26 19:31:31 claudio Exp $ */
+/*	$OpenBSD: session.h,v 1.194 2026/03/02 12:08:30 claudio Exp $ */
 
 /*
  * Copyright (c) 2003, 2004 Henning Brauer <henning@openbsd.org>
@@ -144,6 +144,9 @@ struct peer_stats {
 	unsigned long long	 prefix_sent_update;
 	unsigned long long	 prefix_sent_withdraw;
 	unsigned long long	 prefix_sent_eor;
+	unsigned long long	 rib_entry_count;
+	unsigned long long	 ibufq_msg_count;
+	unsigned long long	 ibufq_payload_size;
 	monotime_t		 last_updown;
 	monotime_t		 last_read;
 	monotime_t		 last_write;
@@ -183,6 +186,7 @@ enum Timer {
 	Timer_Rtr_Retry,
 	Timer_Rtr_Expire,
 	Timer_Rtr_Active,
+	Timer_Mrt_Reopen,
 	Timer_Max
 };
 
@@ -191,8 +195,6 @@ struct timer {
 	enum Timer		type;
 	monotime_t		val;
 };
-
-TAILQ_HEAD(timer_head, timer);
 
 struct peer {
 	struct peer_config	 conf;
@@ -263,7 +265,7 @@ unsigned int	control_accept(int, int);
 
 /* log.c */
 char	*log_fmt_peer(const struct peer_config *);
-void	 log_statechange(struct peer *, enum session_state,
+void	 log_statechange(struct peer *,  enum session_state,
 	    enum session_events);
 void	 log_notification(const struct peer *, uint8_t, uint8_t,
 	    const struct ibuf *, const char *);
@@ -273,8 +275,7 @@ void	 log_conn_attempt(const struct peer *, struct sockaddr *,
 /* mrt.c */
 void	 mrt_dump_bgp_msg(struct mrt *, struct ibuf *, struct peer *,
 	    enum msg_type);
-void	 mrt_dump_state(struct mrt *, uint16_t, uint16_t,
-	    struct peer *);
+void	 mrt_dump_state(struct mrt *, struct peer *);
 void	 mrt_done(struct mrt *);
 
 /* pfkey.c */
@@ -339,8 +340,7 @@ void		 session_handle_update(struct peer *, struct ibuf *);
 void		 session_handle_rrefresh(struct peer *, struct route_refresh *);
 void		 session_graceful_restart(struct peer *);
 void		 session_graceful_flush(struct peer *, uint8_t, const char *);
-void		 session_mrt_dump_state(struct peer *, enum session_state,
-		    enum session_state);
+void		 session_mrt_dump_state(struct peer *);
 void		 session_mrt_dump_bgp_msg(struct peer *, struct ibuf *,
 		    enum msg_type, enum directions);
 int		 peer_matched(struct peer *, struct ctl_neighbor *);

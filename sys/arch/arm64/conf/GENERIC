@@ -1,4 +1,4 @@
-# $OpenBSD: GENERIC,v 1.297 2025/07/17 15:52:10 kettenis Exp $
+# $OpenBSD: GENERIC,v 1.313 2026/01/29 23:02:35 kettenis Exp $
 #
 # GENERIC machine description file
 #
@@ -64,6 +64,7 @@ ehci*		at acpi?
 ipmi*		at acpi?
 ohci*		at acpi?
 pluart*		at acpi?
+qcuart*		at acpi?
 sdhc*		at acpi?
 ufshci*		at acpi?
 xhci*		at acpi?
@@ -224,7 +225,7 @@ ssdfb*		at spi?
 wsdisplay*	at ssdfb?
 imxtmu*		at fdt?
 
-# Raspberry Pi 3/4
+# Raspberry Pi 3/4/5
 bcmaux*		at fdt? early 1
 bcmbsc*		at fdt?
 iic*		at bcmbsc?
@@ -236,18 +237,28 @@ gpio*		at bcmgpio?
 bcmintc*	at fdt? early 1
 bcmirng*	at fdt?
 bcmmbox*	at fdt? early 1
+bcmmip*		at fdt? early 1
 bcmpcie*	at fdt?
 pci*		at bcmpcie?
 bcmrng*		at fdt?
 bcmsdhost*	at fdt?
 sdmmc*		at bcmsdhost?
+bcmstbgpio*	at fdt? early 1
+bcmstbintc*	at fdt? early 1
+bcmstbpinctrl*	at fdt? early 1
+bcmstbrescal*	at fdt? early 1
+bcmstbreset*	at fdt? early 1
 bcmtemp*	at fdt?
 bcmtmon*	at fdt? early 1
 bse*		at fdt?
 bse*		at acpi?
 dwctwo*		at fdt?
 usb*		at dwctwo?
+rpone*		at pci?
+rpiclock*	at fdt? early 1
 rpigpio*	at fdt? early 1
+rpipwm*		at fdt?
+rpirtc*		at fdt?
 
 # Amlogic SoCs
 amlclock*	at fdt? early 1
@@ -311,6 +322,7 @@ rkpinctrl*	at fdt? early 1
 rkcomphy*	at fdt? early 1
 rkpciephy*	at fdt? early 1
 rktcphy*	at fdt? early 1
+rkusbdpphy*	at fdt? early 1
 rkusbphy*	at fdt? early 1
 rkanxdp*	at fdt?
 rkdrm*		at fdt?
@@ -348,6 +360,7 @@ qcgpio*		at fdt? early 1
 qciic*		at acpi?
 qciic*		at fdt?
 iic*		at qciic?
+qcuart*		at fdt?
 qcipcc*		at fdt?
 qcmtx*		at fdt? early 1
 qcpas*		at fdt?
@@ -401,6 +414,7 @@ em*		at pci?			# Intel Pro/1000 Ethernet
 igc*		at pci?			# Intel I225 Ethernet
 ix*		at pci?			# Intel 82598EB 10Gb Ethernet
 ixl*		at pci?			# Intel Ethernet 700 Series
+ice*		at pci?			# Intel Ethernet 800 Series
 mcx*		at pci?			# Mellanox ConnectX-4/5 Ethernet
 mskc*		at pci?			# Marvell Yukon-2
 msk*		at mskc?		#  each port of above
@@ -425,6 +439,7 @@ mpi*		at pci?			# LSI Logic Fusion MPT Message Passing Interface
 mpii*		at pci?			# LSI Fusion MPT Message Passing Interface II
 mfi*		at pci?			# LSI MegaRAID SAS controllers
 mfii*		at pci?			# LSI MegaRAID SAS Fusion controller
+sdhc*		at pci?			# SD Host Controller
 
 # PCI Audio
 azalia*		at pci?			# High Definition Audio
@@ -592,6 +607,7 @@ wsmouse*	at ims? mux 0
 imt*		at ihidev?		# HID-over-I2C multitouch trackpad
 wsmouse*	at imt? mux 0
 iasuskbd*	at ihidev?		# HID-over-I2C ASUS keyboard
+wskbd*		at iasuskbd? mux 1
 ipmi*		at iic?			# IPMI (SIIF)
 islrtc*		at iic?			# ISL1208 RTC
 maxrtc*		at iic?			# DS1307 RTC

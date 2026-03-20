@@ -1,4 +1,4 @@
-# $OpenBSD: Makefile,v 1.4 2025/06/15 14:37:34 florian Exp $
+# $OpenBSD: Makefile,v 1.6 2026/02/23 10:28:23 sthen Exp $
 
 # Copyright (c) 2017 Alexander Bluhm <bluhm@openbsd.org>
 #
@@ -32,7 +32,19 @@ clean: _SUBDIRUSE
 etc/acme-client.conf: acme-client.conf
 	mkdir -p etc
 	sed 's,$${.OBJDIR},${.OBJDIR},'\
-		${.CURDIR}/acme-client.conf >etc/acme-client.conf
+		${.CURDIR}/acme-client.conf > etc/acme-client.conf
+
+etc/acme-client-profile.conf: acme-client-profile.conf
+	mkdir -p etc
+	sed 's,$${.OBJDIR},${.OBJDIR},'\
+		${.CURDIR}/acme-client-profile.conf \
+		> etc/acme-client-profile.conf
+
+etc/acme-client-ipaddress.conf: acme-client-ipaddress.conf
+	mkdir -p etc
+	sed 's,$${.OBJDIR},${.OBJDIR},'\
+		${.CURDIR}/acme-client-ipaddress.conf \
+		> etc/acme-client-ipaddress.conf
 
 etc/httpd.conf: httpd.conf
 	mkdir -p etc
@@ -69,6 +81,33 @@ run-regress-acme: etc/acme-client.conf httpd-start pebble-start
 	${SUDO} /usr/sbin/acme-client \
 	    -f ${.OBJDIR}/etc/acme-client.conf \
 	    -r -v localhost
+
+REGRESS_TARGETS +=	run-regress-acme-profile
+run-regress-acme-profile: etc/acme-client-profile.conf
+	${SUDO} /usr/sbin/acme-client \
+	    -f ${.OBJDIR}/etc/acme-client-profile.conf \
+	    -v localhost
+	${SUDO} /usr/sbin/acme-client \
+	    -f ${.OBJDIR}/etc/acme-client-profile.conf \
+	    -r -v localhost
+
+REGRESS_TARGETS +=	run-regress-acme-ipaddress
+run-regress-acme-ipaddress: etc/acme-client-ipaddress.conf
+	${SUDO} /usr/sbin/acme-client \
+	    -f ${.OBJDIR}/etc/acme-client-ipaddress.conf \
+	    -v localhost
+	${SUDO} /usr/sbin/acme-client \
+	    -f ${.OBJDIR}/etc/acme-client-ipaddress.conf \
+	    -r -v localhost
+
+REGRESS_TARGETS +=	run-regress-acme-ipaddress2
+run-regress-acme-ipaddress2: etc/acme-client-ipaddress.conf
+	${SUDO} /usr/sbin/acme-client \
+	    -f ${.OBJDIR}/etc/acme-client-ipaddress.conf \
+	    -v ::1
+	${SUDO} /usr/sbin/acme-client \
+	    -f ${.OBJDIR}/etc/acme-client-ipaddress.conf \
+	    -r -v ::1
 
 REGRESS_TARGETS +=	run-regress-cleanup
 run-regress-cleanup:

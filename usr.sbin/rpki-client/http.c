@@ -1,4 +1,4 @@
-/*	$OpenBSD: http.c,v 1.97 2025/06/18 18:13:49 job Exp $ */
+/*	$OpenBSD: http.c,v 1.100 2025/09/18 15:40:22 claudio Exp $ */
 /*
  * Copyright (c) 2020 Nils Fisher <nils_fisher@hotmail.com>
  * Copyright (c) 2020 Claudio Jeker <claudio@openbsd.org>
@@ -220,7 +220,7 @@ static enum res	data_inflate_write(struct http_connection *);
 static const char *
 http_info(const char *uri)
 {
-	static char buf[80];
+	static char buf[200];
 
 	if (strnvis(buf, uri, sizeof buf, VIS_SAFE) >= (int)sizeof buf) {
 		/* overflow, add indicator */
@@ -251,7 +251,7 @@ ip_info(const struct http_connection *conn)
 static const char *
 conn_info(const struct http_connection *conn)
 {
-	static char	 buf[100 + NI_MAXHOST];
+	static char	 buf[220 + NI_MAXHOST];
 	const char	*uri;
 
 	if (conn->req == NULL)
@@ -625,7 +625,7 @@ http_req_done(unsigned int id, enum http_result res, const char *last_modified)
 	b = io_new_buffer();
 	io_simple_buffer(b, &id, sizeof(id));
 	io_simple_buffer(b, &res, sizeof(res));
-	io_str_buffer(b, last_modified);
+	io_opt_str_buffer(b, last_modified);
 	io_close_buffer(msgq, b);
 }
 
@@ -641,7 +641,7 @@ http_req_fail(unsigned int id)
 	b = io_new_buffer();
 	io_simple_buffer(b, &id, sizeof(id));
 	io_simple_buffer(b, &res, sizeof(res));
-	io_str_buffer(b, NULL);
+	io_opt_str_buffer(b, NULL);
 	io_close_buffer(msgq, b);
 }
 
@@ -804,6 +804,12 @@ http_inflate_advance(struct http_connection *conn)
 
 		if (conn->iosz == 0) {
 			if (!conn->chunked) {
+				if (conn->bufpos != 0) {
+					warnx("%s: trailing data after "
+					    "compressed transfer",
+					    conn_info(conn));
+					return http_failed(conn);
+				}
 				return http_done(conn, HTTP_OK);
 			} else {
 				conn->state = STATE_RESPONSE_CHUNKED_CRLF;
@@ -1905,8 +1911,14 @@ data_write(struct http_connection *conn)
 	memmove(conn->buf, conn->buf + s, conn->bufpos);
 
 	/* check if regular file transfer is finished */
-	if (!conn->chunked && conn->iosz == 0)
+	if (!conn->chunked && conn->iosz == 0) {
+		if (conn->bufpos != 0) {
+			warnx("%s: trailing data after transfer",
+			    conn_info(conn));
+			return http_failed(conn);
+		}
 		return http_done(conn, HTTP_OK);
+	}
 
 	/* all data written, switch back to read */
 	if (conn->bufpos == 0 || conn->iosz == 0) {
@@ -2174,7 +2186,7 @@ proc_http(char *bind_addr, int fd)
 
 				io_read_buf(b, &id, sizeof(id));
 				io_read_str(b, &uri);
-				io_read_str(b, &mod);
+				io_read_opt_str(b, &mod);
 
 				/* queue up new requests */
 				http_req_new(id, uri, mod, 0, ibuf_fd_get(b));

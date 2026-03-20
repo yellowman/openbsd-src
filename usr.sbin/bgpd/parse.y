@@ -1,4 +1,4 @@
-/*	$OpenBSD: parse.y,v 1.482 2025/02/27 14:15:35 claudio Exp $ */
+/*	$OpenBSD: parse.y,v 1.488 2026/03/02 09:51:48 claudio Exp $ */
 
 /*
  * Copyright (c) 2002, 2003, 2004 Henning Brauer <henning@openbsd.org>
@@ -51,10 +51,6 @@
 #include "session.h"
 #include "rde.h"
 #include "log.h"
-
-#ifndef nitems
-#define nitems(_a)	(sizeof((_a)) / sizeof((_a)[0]))
-#endif
 
 #define MACRO_NAME_LEN		128
 
@@ -4764,6 +4760,7 @@ add_mrtconfig(enum mrt_type type, char *name, int timeout, struct peer *p,
 		free(n);
 		return (-1);
 	}
+	TAILQ_INIT(&MRT2MC(n)->timer);
 	MRT2MC(n)->ReopenTimerInterval = timeout;
 	if (p != NULL) {
 		if (curgroup == p) {
@@ -4771,7 +4768,7 @@ add_mrtconfig(enum mrt_type type, char *name, int timeout, struct peer *p,
 			n->group_id = p->conf.id;
 		} else {
 			n->peer_id = p->conf.id;
-			n->group_id = p->conf.groupid;
+			n->group_id = 0;
 		}
 	}
 	if (rib) {
@@ -5515,7 +5512,7 @@ insert_rtr(struct rtr_config *new)
 	if (new->id == 0)
 		new->id = ++id;
 
-	SIMPLEQ_INSERT_TAIL(&conf->rtrs, currtr, entry);
+	SIMPLEQ_INSERT_TAIL(&conf->rtrs, new, entry);
 
 	return 0;
 }
@@ -5601,6 +5598,7 @@ map_tos(char *s, int *val)
 		{ "netcontrol",		IPTOS_PREC_NETCONTROL },
 		{ "reliability",	IPTOS_RELIABILITY },
 		{ "throughput",		IPTOS_THROUGHPUT },
+		{ "va",			IPTOS_DSCP_VA },
 	};
 	const struct keywords	*p;
 

@@ -1,4 +1,4 @@
-/*	$OpenBSD: tak.c,v 1.24 2025/07/20 07:48:31 tb Exp $ */
+/*	$OpenBSD: tak.c,v 1.29 2025/12/02 12:47:48 tb Exp $ */
 /*
  * Copyright (c) 2022 Job Snijders <job@fastly.com>
  * Copyright (c) 2022 Theo Buehler <tb@openbsd.org>
@@ -32,35 +32,14 @@
 #include <openssl/x509v3.h>
 
 #include "extern.h"
-
-extern ASN1_OBJECT	*tak_oid;
+#include "rpki-asn1.h"
 
 /*
- * ASN.1 templates for Trust Anchor Keys (draft-ietf-sidrops-signed-tal-12)
+ * TAK eContent definition in RFC 9691, Appendix A.
  */
 
 ASN1_ITEM_EXP TAKey_it;
 ASN1_ITEM_EXP TAK_it;
-
-DECLARE_STACK_OF(ASN1_IA5STRING);
-
-#ifndef DEFINE_STACK_OF
-#define sk_ASN1_IA5STRING_num(st) SKM_sk_num(ASN1_IA5STRING, (st))
-#define sk_ASN1_IA5STRING_value(st, i) SKM_sk_value(ASN1_IA5STRING, (st), (i))
-#endif
-
-typedef struct {
-	STACK_OF(ASN1_UTF8STRING)	*comments;
-	STACK_OF(ASN1_IA5STRING)	*certificateURIs;
-	X509_PUBKEY			*subjectPublicKeyInfo;
-} TAKey;
-
-typedef struct {
-	ASN1_INTEGER			*version;
-	TAKey				*current;
-	TAKey				*predecessor;
-	TAKey				*successor;
-} TAK;
 
 ASN1_SEQUENCE(TAKey) = {
 	ASN1_SEQUENCE_OF(TAKey, comments, ASN1_UTF8STRING),
@@ -75,8 +54,8 @@ ASN1_SEQUENCE(TAK) = {
 	ASN1_EXP_OPT(TAK, successor, TAKey, 1),
 } ASN1_SEQUENCE_END(TAK);
 
-DECLARE_ASN1_FUNCTIONS(TAK);
 IMPLEMENT_ASN1_FUNCTIONS(TAK);
+
 
 /*
  * On success return pointer to allocated & valid takey structure,
@@ -89,9 +68,10 @@ parse_takey(const char *fn, const TAKey *takey)
 	const ASN1_IA5STRING	*certURI;
 	X509_PUBKEY		*pubkey;
 	struct takey		*res = NULL;
+	const unsigned char	*data;
 	unsigned char		*der = NULL;
 	size_t			 i;
-	int			 der_len;
+	int			 der_len, length;
 
 	if ((res = calloc(1, sizeof(struct takey))) == NULL)
 		err(1, NULL);
@@ -104,11 +84,12 @@ parse_takey(const char *fn, const TAKey *takey)
 
 		for (i = 0; i < res->num_comments; i++) {
 			comment = sk_ASN1_UTF8STRING_value(takey->comments, i);
-			res->comments[i] = calloc(comment->length + 1, 4);
+			data = ASN1_STRING_get0_data(comment);
+			length = ASN1_STRING_length(comment);
+			res->comments[i] = calloc(length + 1, 4);
 			if (res->comments[i] == NULL)
 				err(1, NULL);
-			(void)strvisx(res->comments[i], comment->data,
-			    comment->length, VIS_SAFE);
+			(void)strvisx(res->comments[i], data, length, VIS_SAFE);
 		}
 	}
 
@@ -122,14 +103,16 @@ parse_takey(const char *fn, const TAKey *takey)
 
 	for (i = 0; i < res->num_uris; i++) {
 		certURI = sk_ASN1_IA5STRING_value(takey->certificateURIs, i);
-		if (!valid_uri(certURI->data, certURI->length, NULL)) {
+		data = ASN1_STRING_get0_data(certURI);
+		length = ASN1_STRING_length(certURI);
+
+		if (!valid_uri(data, length, HTTPS_PROTO) &&
+		    !valid_uri(data, length, RSYNC_PROTO)) {
 			warnx("%s: invalid TA URI", fn);
 			goto err;
 		}
 
-		/* XXX: enforce that protocol is rsync or https. */
-
-		res->uris[i] = strndup(certURI->data, certURI->length);
+		res->uris[i] = strndup(data, length);
 		if (res->uris[i] == NULL)
 			err(1, NULL);
 	}
@@ -201,7 +184,7 @@ tak_parse_econtent(const char *fn, struct tak *tak, const unsigned char *d,
 }
 
 /*
- * Parse a full draft-ietf-sidrops-signed-tal file.
+ * Parse a full RFC 9691 Trust Anchor Key file.
  * Returns the TAK or NULL if the object was malformed.
  */
 struct tak *

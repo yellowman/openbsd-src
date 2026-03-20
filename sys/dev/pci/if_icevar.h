@@ -1,4 +1,4 @@
-/*	$OpenBSD: if_icevar.h,v 1.7 2025/07/14 23:22:44 jsg Exp $	*/
+/*	$OpenBSD: if_icevar.h,v 1.11 2025/11/18 09:13:55 jan Exp $	*/
 
 /*  Copyright (c) 2024, Intel Corporation
  *  All rights reserved.
@@ -633,7 +633,7 @@ struct ice_dma_mem {
 #define ICE_DMA_KVA(_m)	((void *)(_m)->va)
 #define ICE_DMA_LEN(_m)	((_m)->size)
 
-#define ICE_STR_BUF_LEN 32
+#define ICE_STR_BUF_LEN 64
 
 /**
  * @struct ice_lock
@@ -764,7 +764,7 @@ enum ice_fw_modes {
 #define ICE_MIN_TSO_MSS		64
 
 #define ICE_MAX_TX_SEGS		8
-#define ICE_MAX_TSO_SEGS	128
+#define ICE_MAX_TSO_SEGS	8
 
 #define ICE_MAX_DMA_SEG_SIZE	((16*1024) - 1)
 
@@ -4537,6 +4537,7 @@ struct ice_pf_sw_stats {
 struct ice_tx_map {
 	struct mbuf		*txm_m;
 	bus_dmamap_t		 txm_map;
+	bus_dmamap_t		 txm_map_tso;
 	unsigned int		 txm_eop;
 };
 
@@ -4694,3 +4695,5 @@ struct ice_vsi {
 
 /* Driver always calls main vsi_handle first */
 #define ICE_MAIN_VSI_HANDLE		0
+
+#define ICE_I2C_MAX_RETRIES		10

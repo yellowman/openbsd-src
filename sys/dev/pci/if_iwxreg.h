@@ -1,4 +1,4 @@
-/*	$OpenBSD: if_iwxreg.h,v 1.57 2025/07/15 13:40:02 jsg Exp $	*/
+/*	$OpenBSD: if_iwxreg.h,v 1.73 2026/03/13 11:11:02 stsp Exp $	*/
 
 /*-
  * Based on BSD-licensed source modules in the Linux iwlwifi driver,
@@ -517,6 +517,7 @@ struct iwx_context_info_gen3 {
 #define IWX_CSR_GPIO_IN             (0x018) /* read external chip pins */
 #define IWX_CSR_RESET               (0x020) /* busmaster enable, NMI, etc*/
 #define IWX_CSR_GP_CNTRL            (0x024)
+#define IWX_CSR_FUNC_SCRATCH        (0x02c) /* Scratch register - used for FW dbg */
 
 /* 2nd byte of IWX_CSR_INT_COALESCING, not accessible via iwl_write32()! */
 #define IWX_CSR_INT_PERIODIC_REG	(0x005)
@@ -576,8 +577,18 @@ struct iwx_context_info_gen3 {
 /* GIO Chicken Bits (PCI Express bus link power management) */
 #define IWX_CSR_GIO_CHICKEN_BITS    (0x100)
 
+/* Doorbell NMI since Bz. Connected to UREG_DOORBELL_TO_ISR6 (lower 16 bits only). */
+#define IWX_CSR_DOORBELL_VECTOR		(0x130)
+
 #define IWX_CSR_DBG_HPET_MEM_REG	(0x240)
 #define IWX_CSR_DBG_LINK_PWR_MGMT_REG	(0x250)
+
+/*
+ * Scratch register initial configuration - this is set on init, and read
+ * during a error FW error.
+ */
+#define IWX_CSR_FUNC_SCRATCH_INIT_VALUE		(0x01010101)
+#define IWX_CSR_FUNC_SCRATCH_POWER_OFF_MASK	0xFFFF
 
 /* Bits for IWX_CSR_HW_IF_CONFIG_REG */
 #define IWX_CSR_HW_IF_CONFIG_REG_MSK_MAC_DASH	(0x00000003)
@@ -674,6 +685,18 @@ struct iwx_rx_completion_desc {
 	uint8_t reserved2[25];
 };
 
+/**
+ * struct iwx_rx_completion_desc_bz - Bz completion descriptor
+ * @rbid: unique tag of the received buffer
+ * @flags: flags (0: fragmented, all others: reserved)
+ * @reserved: reserved
+ */
+struct iwx_rx_completion_desc_bz {
+	uint16_t rbid;
+	uint8_t flags;
+	uint8_t reserved[1];
+} __packed;
+
 /* RESET */
 #define IWX_CSR_RESET_REG_FLAG_NEVO_RESET                (0x00000001)
 #define IWX_CSR_RESET_REG_FLAG_FORCE_NMI                 (0x00000002)
@@ -731,6 +754,14 @@ struct iwx_rx_completion_desc {
 #define IWX_CSR_GP_CNTRL_REG_FLAG_RFKILL_WAKE_L1A_EN     (0x04000000)
 #define IWX_CSR_GP_CNTRL_REG_FLAG_HW_RF_KILL_SW          (0x08000000)
 
+/* From Bz we use these instead during init/reset flow */
+#define IWX_CSR_GP_CNTRL_REG_FLAG_MAC_INIT			(1 << 6)
+#define IWX_CSR_GP_CNTRL_REG_FLAG_ROM_START			(1 << 7)
+#define IWX_CSR_GP_CNTRL_REG_FLAG_MAC_STATUS			(1 << 20)
+#define IWX_CSR_GP_CNTRL_REG_FLAG_BZ_MAC_ACCESS_REQ		(1 << 21)
+#define IWX_CSR_GP_CNTRL_REG_FLAG_BUS_MASTER_DISABLE_STATUS	(1 << 28)
+#define IWX_CSR_GP_CNTRL_REG_FLAG_BUS_MASTER_DISABLE_REQ	(1 << 29)
+#define IWX_CSR_GP_CNTRL_REG_FLAG_SW_RESET			(1 << 31)
 
 /* HW REV */
 #define IWX_CSR_HW_REV_DASH(_val)          (((_val) & 0x0000003) >> 0)
@@ -1030,6 +1061,14 @@ struct iwx_rx_completion_desc {
 #define IWX_WFPM_AUX_CTL_AUX_IF_MAC_OWNER_MSK	0x08000000
 #define IWX_ENABLE_WFPM				0x80000000
 
+#define IWX_CNVI_AUX_MISC_CHIP			0xA200B0
+#define IWX_CNVI_AUX_MISC_CHIP_MAC_STEP(_val)	(((_val) & 0xf000000) >> 24)
+#define IWX_CNVI_AUX_MISC_CHIP_PROD_TYPE(_val)	((_val) & 0xfff)
+#define IWX_CNVI_AUX_MISC_CHIP_PROD_TYPE_GL	0x910
+#define IWX_CNVI_AUX_MISC_CHIP_PROD_TYPE_BZ_U	0x930
+#define IWX_CNVI_AUX_MISC_CHIP_PROD_TYPE_BZ_I	0x900
+#define IWX_CNVI_AUX_MISC_CHIP_PROD_TYPE_BZ_W	0x901
+
 #define IWX_AUX_MISC_MASTER1_EN			0xa20818
 #define IWX_AUX_MISC_MASTER1_EN_SBE_MSK		0x1
 #define IWX_AUX_MISC_MASTER1_SMPHR_STATUS	0xa20800
@@ -1047,6 +1086,9 @@ struct iwx_rx_completion_desc {
 #define IWX_UREG_CHICK				0xa05c00
 #define IWX_UREG_CHICK_MSI_ENABLE		(1 << 24)
 #define IWX_UREG_CHICK_MSIX_ENABLE		(1 << 25)
+
+#define IWX_SD_REG_VER		0x00a29600
+#define IWX_SD_REG_VER_GEN2	0x00a2b800
 
 #define IWX_HPM_DEBUG			0xa03440
 #define IWX_PERSISTENCE_BIT		(1 << 12)
@@ -1078,6 +1120,9 @@ struct iwx_rx_completion_desc {
  * 11-8:  queue selector
  */
 #define IWX_HBUS_TARG_WRPTR         (IWX_HBUS_BASE+0x060)
+/* Bz: This register is common for Tx and Rx, Rx queues start from 512 */
+#define IWX_HBUS_TARG_WRPTR_Q_SHIFT (16)
+#define IWX_HBUS_TARG_WRPTR_RX_Q(q) (((q) + 512) << IWX_HBUS_TARG_WRPTR_Q_SHIFT)
 
 /**********************************************************
  * CSR values
@@ -1129,6 +1174,7 @@ enum mix_hw_int_causes {
 	IWX_MSIX_HW_INT_CAUSES_REG_ALIVE	= (1 << 0),
 	IWX_MSIX_HW_INT_CAUSES_REG_WAKEUP	= (1 << 1),
 	IWX_MSIX_HW_INT_CAUSES_REG_RESET_DONE	= (1 << 2),
+	IWX_MSIX_HW_INT_CAUSES_REG_TOP_FATAL_ERR= (1 << 3),
 	IWX_MSIX_HW_INT_CAUSES_REG_SW_ERR_V2	= (1 << 5),
 	IWX_MSIX_HW_INT_CAUSES_REG_CT_KILL	= (1 << 6),
 	IWX_MSIX_HW_INT_CAUSES_REG_RF_KILL	= (1 << 7),
@@ -1151,6 +1197,7 @@ enum msix_ivar_for_cause {
 	IWX_MSIX_IVAR_CAUSE_REG_ALIVE		= 0x10,
 	IWX_MSIX_IVAR_CAUSE_REG_WAKEUP		= 0x11,
 	IWX_MSIX_IVAR_CAUSE_REG_RESET_DONE	= 0x12,
+	IWX_MSIX_IVAR_CAUSE_REG_SW_ERR_V2	= 0x15,
 	IWX_MSIX_IVAR_CAUSE_REG_CT_KILL		= 0x16,
 	IWX_MSIX_IVAR_CAUSE_REG_RF_KILL		= 0x17,
 	IWX_MSIX_IVAR_CAUSE_REG_PERIODIC	= 0x18,
@@ -1279,6 +1326,7 @@ enum msix_ivar_for_cause {
 #define IWX_UCODE_TLV_API_ADWELL_HB_DEF_N_AP	57
 #define IWX_UCODE_TLV_API_SCAN_EXT_CHAN_VER	58
 #define IWX_UCODE_TLV_API_BAND_IN_RX_DATA	59
+#define IWX_UCODE_TLV_API_SMART_FIFO_OFFLOAD	68
 #define IWX_NUM_UCODE_TLV_API			128
 
 #define IWX_UCODE_TLV_API_BITS \
@@ -1421,7 +1469,7 @@ enum msix_ivar_for_cause {
 #define IWX_UCODE_TLV_CAPA_RFIM_SUPPORT			102
 #define IWX_UCODE_TLV_CAPA_MLD_API_SUPPORT		110 
 
-#define IWX_NUM_UCODE_TLV_CAPA 128
+#define IWX_NUM_UCODE_TLV_CAPA 160
 
 /*
  * For 16.0 uCode and above, there is no differentiation between sections,
@@ -1584,6 +1632,7 @@ struct iwx_ucode_header {
 #define IWX_UCODE_TLV_SEC_TABLE_ADDR		66
 #define IWX_UCODE_TLV_D3_KEK_KCK_ADDR		67
 #define IWX_UCODE_TLV_CURRENT_PC		68
+#define IWX_UCODE_TLV_PNVM_DATA			74
 
 #define IWX_UCODE_TLV_CONST_BASE		0x100
 #define IWX_UCODE_TLV_FW_NUM_STATIONS		(IWX_UCODE_TLV_CONST_BASE + 0)
@@ -1801,6 +1850,17 @@ enum iwx_gen2_tx_fifo {
 	IWX_GEN2_TRIG_TX_FIFO_VO,
 };
 
+enum iwx_bz_tx_fifo {
+	IWX_BZ_EDCA_TX_FIFO_BK,
+	IWX_BZ_EDCA_TX_FIFO_BE,
+	IWX_BZ_EDCA_TX_FIFO_VI,
+	IWX_BZ_EDCA_TX_FIFO_VO,
+	IWX_BZ_TRIG_TX_FIFO_BK,
+	IWX_BZ_TRIG_TX_FIFO_BE,
+	IWX_BZ_TRIG_TX_FIFO_VI,
+	IWX_BZ_TRIG_TX_FIFO_VO,
+};
+
 /**
  * TXQ config options
  * @TX_QUEUE_CFG_ENABLE_QUEUE: enable a queue
@@ -1995,8 +2055,12 @@ struct iwx_tx_queue_cfg_rsp {
 #define IWX_MAC_CONF_GROUP	0x3
 #define IWX_PHY_OPS_GROUP	0x4
 #define IWX_DATA_PATH_GROUP	0x5
+#define IWX_BT_COEX_GROUP	0x9
 #define IWX_PROT_OFFLOAD_GROUP	0xb
 #define IWX_REGULATORY_AND_NVM_GROUP	0xc
+#define IWX_XVT_GROUP		0xe
+#define IWX_DEBUG_GROUP		0xf
+#define IWX_STATISTICS_GROUP	0x10
 
 /* SYSTEM_GROUP group subcommand IDs */
 
@@ -2004,6 +2068,8 @@ struct iwx_tx_queue_cfg_rsp {
 #define IWX_SOC_CONFIGURATION_CMD	0x01
 #define IWX_INIT_EXTENDED_CFG_CMD	0x03
 #define IWX_FW_ERROR_RECOVERY_CMD	0x07
+#define IWX_SYSTEM_STATISTICS_CMD	0x0f
+#define IWX_SYSTEM_STATISTICS_END_NOTIF 0xfd
 
 /* MAC_CONF group subcommand IDs */
 #define IWX_SESSION_PROTECTION_CMD	0x05
@@ -2012,6 +2078,7 @@ struct iwx_tx_queue_cfg_rsp {
 #define IWX_STA_CONFIG_CMD		0x0a
 #define IWX_STA_REMOVE_CMD		0x0c
 #define IWX_SESSION_PROTECTION_NOTIF	0xfb
+#define IWX_MISSED_BEACONS_NOTIF	0xf6
 
 /* DATA_PATH group subcommand IDs */
 #define IWX_DQA_ENABLE_CMD	0x00
@@ -2024,10 +2091,20 @@ struct iwx_tx_queue_cfg_rsp {
 #define IWX_THERMAL_DUAL_CHAIN_REQUEST 0xf6
 #define IWX_TLC_MNG_UPDATE_NOTIF 0xf7
 
+/* BT COEX group subcommand IDs */
+#define IWX_PROFILE_NOTIF	0xff
+
 /* REGULATORY_AND_NVM group subcommand IDs */
 #define IWX_NVM_ACCESS_COMPLETE	0x00
 #define IWX_NVM_GET_INFO	0x02
 #define IWX_PNVM_INIT_COMPLETE	0xfe
+
+/* STATISTICS group subcommand IDs */
+#define IWX_STATISTICS_OPER_NOTIF	0x0
+#define IWX_STATISTICS_OPER_PART1_NOTIF	0x1
+#define IWX_STATISTICS_OPER_PART2_NOTIF	0x2
+#define IWX_STATISTICS_OPER_PART3_NOTIF	0x3
+#define IWX_STATISTICS_OPER_PART4_NOTIF	0x4
 
 /*
  * struct iwx_dqa_enable_cmd
@@ -2361,7 +2438,7 @@ struct iwx_alive_resp_v6 {
 	struct iwx_umac_alive umac_data;
 	struct iwx_sku_id sku_id;
 	struct iwx_imr_alive_info imr;
-} __packed; /* UCODE_ALIVE_NTFY_API_S_VER_6 */
+} __packed; /* UCODE_ALIVE_NTFY_API_S_VER_6 / VER_7 */
 
 
 #define IWX_SOC_CONFIG_CMD_FLAGS_DISCRETE	(1 << 0)
@@ -3300,6 +3377,7 @@ struct iwx_time_quota_cmd {
 /* Supported bands */
 #define IWX_PHY_BAND_5  (0)
 #define IWX_PHY_BAND_24 (1)
+#define IWX_PHY_BAND_6  (2)
 
 /* Supported channel width, vary if there is VHT support */
 #define IWX_PHY_VHT_CHANNEL_MODE20	(0x0)
@@ -3381,7 +3459,7 @@ struct iwx_fw_channel_info {
 	(0x1 << IWX_PHY_RX_CHAIN_MIMO_FORCE_POS)
 
 /* TODO: fix the value, make it depend on firmware at runtime? */
-#define IWX_NUM_PHY_CTX	3
+#define IWX_NUM_PHY_CTX	1
 
 /**
  * struct iwl_phy_context_cmd - config of the PHY context
@@ -3619,6 +3697,7 @@ struct iwx_rx_mpdu_res_start {
 #define IWX_RX_MPDU_RES_STATUS_ROBUST_MNG_FRAME		(1 << 15)
 #define IWX_RX_MPDU_RES_STATUS_HASH_INDEX_MSK		(0x3F0000)
 #define IWX_RX_MPDU_RES_STATUS_STA_ID_MSK		(0x1f000000)
+#define IWX_RX_MPDU_RES_STATUS_DUPLICATE		(1 << 22)
 #define IWX_RX_MPDU_RES_STATUS_RRF_KILL			(1 << 29)
 #define IWX_RX_MPDU_RES_STATUS_FILTERING_MSK		(0xc00000)
 #define IWX_RX_MPDU_RES_STATUS2_FILTERING_MSK		(0xc0000000)
@@ -3727,9 +3806,7 @@ struct iwx_rx_mpdu_desc {
 		uint16_t l3l4_flags;
 		uint16_t phy_data4;
 	};
-	uint16_t status;
-	uint8_t hash_filter;
-	uint8_t sta_id_flags;
+	uint32_t status;
 	uint32_t reorder_data;
 	union {
 		struct iwx_rx_mpdu_desc_v1 v1;
@@ -4142,6 +4219,235 @@ struct iwx_statistics_cmd {
 	uint32_t flags;
 } __packed; /* STATISTICS_CMD_API_S_VER_1 */
 
+/**
+ * enum iwx_statistics_notify_type_id - type_id used in system statistics
+ *	command
+ * @IWX_STATS_NTFY_TYPE_ID_OPER: request legacy statistics
+ * @IWX_STATS_NTFY_TYPE_ID_OPER_PART1: request operational part1 statistics
+ * @IWX_STATS_NTFY_TYPE_ID_OPER_PART2: request operational part2 statistics
+ * @IWX_STATS_NTFY_TYPE_ID_OPER_PART3: request operational part3 statistics
+ * @IWX_STATS_NTFY_TYPE_ID_OPER_PART4: request operational part4 statistics
+ */
+enum iwx_statistics_notify_type_id {
+	IWX_STATS_NTFY_TYPE_ID_OPER		= (1 << 0),
+	IWX_STATS_NTFY_TYPE_ID_OPER_PART1	= (1 << 1),
+	IWX_STATS_NTFY_TYPE_ID_OPER_PART2	= (1 << 2),
+	IWX_STATS_NTFY_TYPE_ID_OPER_PART3	= (1 << 3),
+	IWX_STATS_NTFY_TYPE_ID_OPER_PART4	= (1 << 4),
+};
+
+/**
+ * enum iwx_statistics_cfg_flags - cfg_mask used in system statistics command
+ * @IWX_STATS_CFG_FLG_DISABLE_NTFY_MSK: 0 for enable, 1 for disable
+ * @IWX_STATS_CFG_FLG_ON_DEMAND_NTFY_MSK: 0 for periodic, 1 for on-demand
+ * @IWX_STATS_CFG_FLG_RESET_MSK: 0 for reset statistics after
+ *	sending the notification, 1 for do not reset statistics after sending
+ *	the notification
+ */
+enum iwx_statistics_cfg_flags {
+	IWX_STATS_CFG_FLG_DISABLE_NTFY_MSK	= (1 << 0),
+	IWX_STATS_CFG_FLG_ON_DEMAND_NTFY_MSK	= (1 << 1),
+	IWX_STATS_CFG_FLG_RESET_MSK		= (1 << 2),
+};
+
+/**
+ * struct iwx_system_statistics_cmd - system statistics command
+ * @cfg_mask: configuration mask, &enum iwx_statistics_cfg_flags
+ * @config_time_sec: time in sec for periodic notification
+ * @type_id_mask: type_id masks, &enum iwx_statistics_notify_type_id
+ */
+struct iwx_system_statistics_cmd {
+	uint32_t cfg_mask;
+	uint32_t config_time_sec;
+	uint32_t type_id_mask;
+} __packed; /* STATISTICS_FW_CMD_API_S_VER_1 */
+
+/**
+ * enum iwx_fw_statistics_type - statistics type
+ *
+ * @FW_STATISTICS_OPERATIONAL: operational statistics
+ * @FW_STATISTICS_PHY: phy statistics
+ * @FW_STATISTICS_MAC: mac statistics
+ * @FW_STATISTICS_RX: rx statistics
+ * @FW_STATISTICS_TX: tx statistics
+ * @FW_STATISTICS_DURATION: duration statistics
+ * @FW_STATISTICS_HE: he statistics
+ */
+enum iwx_fw_statistics_type {
+	FW_STATISTICS_OPERATIONAL,
+	FW_STATISTICS_PHY,
+	FW_STATISTICS_MAC,
+	FW_STATISTICS_RX,
+	FW_STATISTICS_TX,
+	FW_STATISTICS_DURATION,
+	FW_STATISTICS_HE,
+}; /* FW_STATISTICS_TYPE_API_E_VER_1 */
+
+#define IWX_STATISTICS_TYPE_MSK 0x7f
+
+/**
+ * struct iwx_statistics_ntfy_hdr - statistics notification header
+ *
+ * @type: struct type
+ * @version: version of the struct
+ * @size: size in bytes
+ */
+struct iwx_statistics_ntfy_hdr {
+	uint8_t type;
+	uint8_t version;
+	uint16_t size;
+}; /* STATISTICS_NTFY_HDR_API_S_VER_1 */
+
+/**
+ * struct iwx_stats_ntfy_per_link - per-link statistics
+ *
+ * @beacon_filter_average_energy: Average energy [-dBm] of the 2
+ *	 antennas.
+ * @air_time: air time
+ * @beacon_counter: all beacons (both filtered and not filtered)
+ * @beacon_average_energy: Average energy [-dBm] of all beacons
+ *	(both filtered and not filtered)
+ * @beacon_rssi_a: beacon RSSI on antenna A
+ * @beacon_rssi_b: beacon RSSI on antenna B
+ * @rx_bytes: RX byte count
+ */
+struct iwx_stats_ntfy_per_link {
+	uint32_t beacon_filter_average_energy;
+	uint32_t air_time;
+	uint32_t beacon_counter;
+	uint32_t beacon_average_energy;
+	uint32_t beacon_rssi_a;
+	uint32_t beacon_rssi_b;
+	uint32_t rx_bytes;
+} __packed; /* STATISTICS_NTFY_PER_LINK_API_S_VER_1 */
+
+/**
+ * struct iwl_stats_ntfy_part1_per_link - part1 per link statistics
+ *
+ * @rx_time: rx time
+ * @tx_time: tx time
+ * @rx_action: action frames handled by FW
+ * @tx_action: action frames generated and transmitted by FW
+ * @cca_defers: cca defer count
+ * @beacon_filtered: filtered out beacons
+ */
+struct iwx_stats_ntfy_part1_per_link {
+	uint64_t rx_time;
+	uint64_t tx_time;
+	uint32_t rx_action;
+	uint32_t tx_action;
+	uint32_t cca_defers;
+	uint32_t beacon_filtered;
+} __packed; /* STATISTICS_FW_NTFY_OPERATIONAL_PART1_PER_LINK_API_S_VER_1 */
+
+/**
+ * struct iwx_stats_ntfy_per_mac - per MAC statistics
+ *
+ * @beacon_filter_average_energy: Average energy [-dBm] of the 2
+ *	 antennas.
+ * @air_time: air time
+ * @beacon_counter: all beacons (both filtered and not filtered)
+ * @beacon_average_energy: all beacons (both filtered and not
+ *	 filtered)
+ * @beacon_rssi_a: beacon RSSI on antenna A
+ * @beacon_rssi_b: beacon RSSI on antenna B
+ * @rx_bytes: RX byte count
+ */
+struct iwx_stats_ntfy_per_mac {
+	uint32_t beacon_filter_average_energy;
+	uint32_t air_time;
+	uint32_t beacon_counter;
+	uint32_t beacon_average_energy;
+	uint32_t beacon_rssi_a;
+	uint32_t beacon_rssi_b;
+	uint32_t rx_bytes;
+} __packed; /* STATISTICS_NTFY_PER_MAC_API_S_VER_1 */
+
+#define IWX_STATS_MAX_BW_INDEX 5
+
+/**
+ * struct iwx_stats_ntfy_per_phy - per PHY statistics
+ * @channel_load: channel load
+ * @channel_load_by_us: device contribution to MCLM
+ * @channel_load_not_by_us: other devices' contribution to MCLM
+ * @clt: CLT HW timer (TIM_CH_LOAD2)
+ * @act: active accumulator SW
+ * @elp: elapsed time accumulator SW
+ * @rx_detected_per_ch_width: number of deferred TX per channel width,
+ *	0 - 20, 1/2/3 - 40/80/160
+ * @success_per_ch_width: number of frames that got ACK/BACK/CTS
+ *	per channel BW. note, BACK counted as 1
+ * @fail_per_ch_width: number of frames that didn't get ACK/BACK/CTS
+ *	per channel BW. note BACK counted as 1
+ * @last_tx_ch_width_indx: last txed frame channel width index
+ */
+struct iwx_stats_ntfy_per_phy {
+	uint32_t channel_load;
+	uint32_t channel_load_by_us;
+	uint32_t channel_load_not_by_us;
+	uint32_t clt;
+	uint32_t act;
+	uint32_t elp;
+	uint32_t rx_detected_per_ch_width[IWX_STATS_MAX_BW_INDEX];
+	uint32_t success_per_ch_width[IWX_STATS_MAX_BW_INDEX];
+	uint32_t fail_per_ch_width[IWX_STATS_MAX_BW_INDEX];
+	uint32_t last_tx_ch_width_indx;
+} __packed; /* STATISTICS_NTFY_PER_PHY_API_S_VER_1 */
+
+/* unknown channel load (due to not being active on channel) */
+#define IWX_STATS_UNKNOWN_CHANNEL_LOAD	0xffffffff
+
+/**
+ * struct iwx_stats_ntfy_per_sta - per STA statistics
+ *
+ * @average_energy: in fact it is minus the energy..
+ */
+struct iwx_stats_ntfy_per_sta {
+	uint32_t average_energy;
+} __packed; /* STATISTICS_NTFY_PER_STA_API_S_VER_1 */
+
+
+#define IWX_FW_MAX_ACTIVE_LINKS_NUM 2
+#define IWX_FW_MAX_LINK_ID 3
+#define IWX_STATS_MAX_PHY_OPERATIONAL 3
+#define IWX_STATS_MAX_FW_LINKS	(IWX_FW_MAX_LINK_ID + 1)
+
+/**
+ * struct iwx_system_statistics_notif_oper - statistics notification
+ *
+ * @time_stamp: time when the notification is sent from firmware
+ * @per_link: per link statistics, &struct iwl_stats_ntfy_per_link
+ * @per_phy: per phy statistics, &struct iwl_stats_ntfy_per_phy
+ * @per_sta: per sta statistics, &struct iwl_stats_ntfy_per_sta
+ */
+struct iwx_system_statistics_notif_oper {
+	uint32_t time_stamp;
+	struct iwx_stats_ntfy_per_link per_link[IWX_STATS_MAX_FW_LINKS];
+	struct iwx_stats_ntfy_per_phy per_phy[IWX_STATS_MAX_PHY_OPERATIONAL];
+	struct iwx_stats_ntfy_per_sta per_sta[IWX_STATION_COUNT];
+} __packed; /* STATISTICS_FW_NTFY_OPERATIONAL_API_S_VER_3 */
+
+/**
+ * struct iwx_system_statistics_part1_notif_oper - part1 stats notification
+ *
+ * @time_stamp: time when the notification is sent from firmware
+ * @per_link: per link statistics &struct iwl_stats_ntfy_part1_per_link
+ * @per_phy_crc_error_stats: per phy crc error statistics
+ */
+struct iwx_system_statistics_part1_notif_oper {
+	uint32_t time_stamp;
+	struct iwx_stats_ntfy_part1_per_link per_link[IWX_STATS_MAX_FW_LINKS];
+	uint32_t per_phy_crc_error_stats[IWX_STATS_MAX_PHY_OPERATIONAL];
+} __packed; /* STATISTICS_FW_NTFY_OPERATIONAL_PART1_API_S_VER_4 */
+
+/**
+ * struct iwx_system_statistics_end_notif - statistics end notification
+ *
+ * @time_stamp: time when the notification is sent from firmware
+ */
+struct iwx_system_statistics_end_notif {
+	uint32_t time_stamp;
+} __packed; /* STATISTICS_FW_NTFY_END_API_S_VER_1 */
 
 /***********************************
  * Smart Fifo API
@@ -4907,6 +5213,77 @@ struct iwx_mvm_sta_cfg_cmd {
 } __packed; /* STA_CMD_API_S_VER_1 */
 
 /**
+ * struct iwx_sta_cfg_cmd_v2 - cmd structure to add a peer sta to the uCode's
+ *	station table
+ * ( STA_CONFIG_CMD = 0xA )
+ *
+ * @sta_id: index of station in uCode's station table
+ * @link_id: the id of the link that is used to communicate with this sta
+ * @peer_mld_address: the peers mld address
+ * @reserved_for_peer_mld_address: reserved
+ * @peer_link_address: the address of the link that is used to communicate
+ *	with this sta
+ * @reserved_for_peer_link_address: reserved
+ * @station_type: type of this station. See &enum iwl_fw_sta_type
+ * @assoc_id: for GO only
+ * @beamform_flags: beam forming controls
+ * @mfp: indicates whether the STA uses management frame protection or not.
+ * @mimo: indicates whether the sta uses mimo or not
+ * @mimo_protection: indicates whether the sta uses mimo protection or not
+ * @ack_enabled: indicates that the AP supports receiving ACK-
+ *	enabled AGG, i.e. both BACK and non-BACK frames in a single AGG
+ * @trig_rnd_alloc: indicates that trigger based random allocation
+ *	is enabled according to UORA element existence
+ * @tx_ampdu_spacing: minimum A-MPDU spacing:
+ *	4 - 2us density, 5 - 4us density, 6 - 8us density, 7 - 16us density
+ * @tx_ampdu_max_size: maximum A-MPDU length: 0 - 8K, 1 - 16K, 2 - 32K,
+ *	3 - 64K, 4 - 128K, 5 - 256K, 6 - 512K, 7 - 1024K.
+ * @sp_length: the size of the SP in actual number of frames
+ * @uapsd_acs:  4 LS bits are trigger enabled ACs, 4 MS bits are the deliver
+ *	enabled ACs.
+ * @pkt_ext: optional, exists according to PPE-present bit in the HE/EHT-PHY
+ *	capa
+ * @htc_flags: which features are supported in HTC
+ * @use_ldpc_x2_cw: Indicates whether to use LDPC with double CW
+ * @use_icf: Indicates whether to use ICF instead of RTS
+ * @dps_pad_time: DPS (Dynamic Power Save) padding delay resolution to ensure
+ *	proper timing alignment
+ * @dps_trans_delay: DPS minimal time that takes the peer to return to low power
+ * @mic_prep_pad_delay: MIC prep time padding
+ * @mic_compute_pad_delay: MIC compute time padding
+ * @reserved: Reserved for alignment
+ */
+struct iwx_sta_cfg_cmd_v2 {
+	uint32_t sta_id;
+	uint32_t link_id;
+	uint8_t peer_mld_address[ETHER_ADDR_LEN];
+	uint16_t reserved_for_peer_mld_address;
+	uint8_t peer_link_address[ETHER_ADDR_LEN];
+	uint16_t reserved_for_peer_link_address;
+	uint32_t station_type;
+	uint32_t assoc_id;
+	uint32_t beamform_flags;
+	uint32_t mfp;
+	uint32_t mimo;
+	uint32_t mimo_protection;
+	uint32_t ack_enabled;
+	uint32_t trig_rnd_alloc;
+	uint32_t tx_ampdu_spacing;
+	uint32_t tx_ampdu_max_size;
+	uint32_t sp_length;
+	uint32_t uapsd_acs;
+	struct iwx_he_pkt_ext_v2 pkt_ext;
+	uint32_t htc_flags;
+	uint8_t use_ldpc_x2_cw;
+	uint8_t use_icf;
+	uint8_t dps_pad_time;
+	uint8_t dps_trans_delay;
+	uint8_t mic_prep_pad_delay;
+	uint8_t mic_compute_pad_delay;
+	uint8_t reserved[2];
+} __packed; /* STA_CMD_API_S_VER_2 */
+
+/**
  * struct iwx_mvm_remove_sta_cmd - a cmd structure to remove a sta added by
  *	STA_CONFIG_CMD or AUX_STA_CONFIG_CMD
  * ( STA_REMOVE_CMD = 0xC )
@@ -5095,6 +5472,42 @@ struct iwx_mac_power_cmd {
 
 #define IWX_DEFAULT_PS_TX_DATA_TIMEOUT      (100 * 1000)
 #define IWX_DEFAULT_PS_RX_DATA_TIMEOUT      (100 * 1000)
+
+#define IWX_NDTIMRANGES		3
+#define IWX_NPOWERLEVELS	6
+static const struct iwx_pmgt {
+	uint32_t	rxtimeout;
+	uint32_t	txtimeout;
+	int		skip_dtim;
+} iwx_pmgt[IWX_NDTIMRANGES][IWX_NPOWERLEVELS] = {
+	/* DTIM <= 2 */
+	{
+	{   0,   0, 0 },	/* CAM */
+	{ 200, 500, 0 },	/* PS level 1 */
+	{ 200, 300, 0 },	/* PS level 2 */
+	{  50, 100, 0 },	/* PS level 3 */
+	{  50,  25, 1 },	/* PS level 4 */
+	{  25,  25, 2 }		/* PS level 5 */
+	},
+	/* 3 <= DTIM <= 10 */
+	{
+	{   0,   0, 0 },	/* CAM */
+	{ 200, 500, 0 },	/* PS level 1 */
+	{ 200, 300, 0 },	/* PS level 2 */
+	{  50, 100, 0 },	/* PS level 3 */
+	{  50,  25, 1 },	/* PS level 4 */
+	{  25,  25, 2 }		/* PS level 5 */
+	},
+	/* DTIM >= 11 */
+	{
+	{   0,   0, 0 },	/* CAM */
+	{ 200, 500, 0 },	/* PS level 1 */
+	{ 200, 300, 0 },	/* PS level 2 */
+	{  50, 100, 0 },	/* PS level 3 */
+	{  50,  25, 0 },	/* PS level 4 */
+	{  25,  25, 0 }		/* PS level 5 */
+	}
+};
 
 /*
  * struct iwx_uapsd_misbehaving_ap_notif - FW sends this notification when
@@ -7281,6 +7694,26 @@ struct iwx_scan_channel_cfg_umac {
 } __packed;
 
 /**
+ * struct iwx_scan_channel_cfg_umac_v5
+ * @flags:		bitmap - 0-19:	directed scan to i'th ssid.
+ *			bits 30/31:	band number (IWX_PHY_BAND_*)
+ * @channel_num:	channel number 1-13 etc. 
+ * @psd_20:		highest PSD value for all APs known so far
+ *			on this channel.
+ * @iter_count:		repetition count for the channel.
+ * @iter_interval:	interval between two scan iterations on one channel.
+ */
+struct iwx_scan_channel_cfg_umac_v5 {
+	uint32_t flags;
+	uint8_t channel_num;
+	uint8_t psd_20;
+	uint8_t iter_count;
+	uint8_t iter_interval;
+} __packed; /* SCAN_CHANNEL_CONFIG_API_S_VER_5 */
+
+#define IWX_CHAN_CFG_FLAGS_BAND_POS 30
+
+/**
  * struct iwx_scan_umac_schedule
  * @interval: interval in seconds between scan iterations
  * @iter_count: num of scan iterations for schedule plan, 0xff for infinite loop
@@ -7576,6 +8009,92 @@ struct iwx_scan_req_umac_v14 {
 	uint32_t ooc_priority;
 	struct iwx_scan_req_params_v14 scan_params;
 } __packed; /* SCAN_REQUEST_CMD_UMAC_API_S_VER_14 */
+
+/**
+ * struct iwx_scan_general_params_v11 - channel params
+ * @flags: &enum iwl_umac_scan_general_flags_v2
+ * @reserved: reserved for future
+ * @scan_start_mac_or_link_id: report the scan start TSF time according to this
+ *     mac (up to verion 11) or link (starting with version 12) TSF
+ * @active_dwell: dwell time for active scan per LMAC
+ * @adwell_default_2g: adaptive dwell default number of APs
+ *                        for 2.4GHz channel
+ * @adwell_default_5g: adaptive dwell default number of APs
+ *                        for 5GHz channels
+ * @adwell_default_social_chn: adaptive dwell default number of
+ *                             APs per social channel
+ * @flags2: for version 11 see &enum iwl_umac_scan_general_params_flags2.
+ *     Otherwise reserved.
+ * @adwell_max_budget: the maximal number of TUs that adaptive dwell
+ *                     can add to the total scan time
+ * @max_out_of_time: max out of serving channel time, per LMAC
+ * @suspend_time: max suspend time, per LMAC
+ * @scan_priority: priority of the request
+ * @passive_dwell: continues dwell time for passive channel
+ *                 (without adaptive dwell)
+ * @num_of_fragments: number of fragments needed for full fragmented
+ *                    scan coverage.
+ */
+struct iwx_scan_general_params_v11 {
+	uint16_t flags;
+	uint8_t reserved;
+	uint8_t scan_start_mac_or_link_id;
+	uint8_t active_dwell[IWX_SCAN_TWO_LMACS];
+	uint8_t adwell_default_2g;
+	uint8_t adwell_default_5g;
+	uint8_t adwell_default_social_chn;
+	uint8_t flags2;
+	uint16_t adwell_max_budget;
+	uint32_t max_out_of_time[IWX_SCAN_TWO_LMACS];
+	uint32_t suspend_time[IWX_SCAN_TWO_LMACS];
+	uint32_t scan_priority;
+	uint8_t passive_dwell[IWX_SCAN_TWO_LMACS];
+	uint8_t num_of_fragments[IWX_SCAN_TWO_LMACS];
+} __packed; /* SCAN_GENERAL_PARAMS_API_S_VER_12, *_VER_11  and *_VER_10 */
+
+/**
+ * struct iwx_scan_channel_params_v7 - channel params
+ * @flags: channel flags &enum iwl_scan_channel_flags
+ * @count: num of channels in scan request
+ * @n_aps_override: override the number of APs the FW uses to calculate dwell
+ *	time when adaptive dwell is used.
+ *	Channel k will use n_aps_override[i] when BIT(20 + i) is set in
+ *	channel_config[k].flags
+ * @channel_config: array of explicit channel configurations
+ *                  for 2.4Ghz and 5.2Ghz bands
+ */
+struct iwx_scan_channel_params_v7 {
+	uint8_t flags;
+	uint8_t count;
+	uint8_t n_aps_override[2];
+	struct iwx_scan_channel_cfg_umac_v5 channel_config[67];
+} __packed; /* SCAN_CHANNEL_PARAMS_API_S_VER_7 */
+
+/**
+ * struct iwx_scan_req_params_v17 - scan request parameters (v17)
+ * @general_params: &struct iwx_scan_general_params_v11
+ * @channel_params: &struct iwx_scan_channel_params_v7
+ * @periodic_params: &struct iwx_scan_periodic_parms_v1
+ * @probe_params: &struct iwx_scan_probe_params_v4
+ */
+struct iwx_scan_req_params_v17 {
+	struct iwx_scan_general_params_v11 general_params;
+	struct iwx_scan_channel_params_v7 channel_params;
+	struct iwx_scan_periodic_parms_v1 periodic_params;
+	struct iwx_scan_probe_params_v4 probe_params;
+} __packed; /* SCAN_REQUEST_PARAMS_API_S_VER_17 - 14 */
+
+/*
+ * struct iwx_scan_req_umac_v17 - scan request command (v17)
+ * @uid: scan id, &enum iwl_umac_scan_uid_offsets
+ * @ooc_priority: out of channel priority - &enum iwl_scan_priority
+ * @scan_params: scan parameters
+ */
+struct iwx_scan_req_umac_v17 {
+	uint32_t uid;
+	uint32_t ooc_priority;
+	struct iwx_scan_req_params_v17 scan_params;
+} __packed; /* SCAN_REQUEST_CMD_UMAC_API_S_VER_17 - 14 */
 
 /**
  * struct iwx_umac_scan_abort
@@ -8040,15 +8559,33 @@ struct iwx_rm_sta_cmd {
  * @key_id:
  * @receive_seq_cnt: initial RSC/PN needed for replay check
  */
-struct iwx_mgmt_mcast_key_cmd {
+struct iwx_mgmt_mcast_key_cmd_v1 {
 	uint32_t ctrl_flags;
-	uint8_t IGTK[16];
-	uint8_t K1[16];
-	uint8_t K2[16];
+	uint8_t igtk[16];
+	uint8_t k1[16];
+	uint8_t k2[16];
 	uint32_t key_id;
 	uint32_t sta_id;
 	uint64_t receive_seq_cnt;
 } __packed; /* SEC_MGMT_MULTICAST_KEY_CMD_API_S_VER_1 */
+
+/**
+ * struct iwx_mgmt_mcast_key_cmd - IGTK command
+ * ( MGMT_MCAST_KEY = 0x1f )
+ * @ctrl_flags: &enum iwx_sta_key_flag
+ * @igtk: IGTK master key
+ * @sta_id: station ID that support IGTK
+ * @key_id: key ID
+ * @receive_seq_cnt: initial RSC/PN needed for replay check
+ */
+struct iwx_mgmt_mcast_key_cmd {
+	uint32_t ctrl_flags;
+	uint8_t igtk[32];
+	uint32_t key_id;
+	uint32_t sta_id;
+	uint64_t receive_seq_cnt;
+} __packed; /* SEC_MGMT_MULTICAST_KEY_CMD_API_S_VER_2 */
+
 
 struct iwx_wep_key {
 	uint8_t key_index;
@@ -8149,6 +8686,34 @@ struct iwx_mcc_update_resp_v3 {
 	uint32_t channels[0];
 } __packed; /* LAR_UPDATE_MCC_CMD_RESP_S_VER_3 */
 
+/**
+ * struct iwx_mcc_update_resp_v4 - response to MCC_UPDATE_CMD.
+ * Contains the new channel control profile map, if changed, and the new MCC
+ * (mobile country code).
+ * The new MCC may be different than what was requested in MCC_UPDATE_CMD.
+ * @status: see &enum iwx_mcc_update_status
+ * @mcc: the new applied MCC
+ * @cap: capabilities for all channels which matches the MCC
+ * @time: time elapsed from the MCC test start (in units of 30 seconds)
+ * @geo_info: geographic specific profile information
+ *	see &enum iwl_geo_information.
+ * @source_id: the MCC source, see iwl_mcc_source
+ * @reserved: for four bytes alignment.
+ * @n_channels: number of channels in @channels_data.
+ * @channels: channel control data map, DWORD for each channel. Only the first
+ *	16bits are used.
+ */
+struct iwx_mcc_update_resp_v4 {
+	uint32_t status;
+	uint16_t mcc;
+	uint16_t cap;
+	uint16_t time;
+	uint16_t geo_info;
+	uint8_t source_id;
+	uint8_t reserved[3];
+	uint32_t n_channels;
+	uint32_t channels[];
+} __packed; /* LAR_UPDATE_MCC_CMD_RESP_S_VER_4 */
 /**
  * geographic information.
  * @GEO_NO_INFO: no special info for this geo profile.

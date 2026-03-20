@@ -1,4 +1,4 @@
-/*	$OpenBSD: if_vmx.c,v 1.93 2025/06/19 09:36:21 yasuoka Exp $	*/
+/*	$OpenBSD: if_vmx.c,v 1.95 2026/03/13 17:57:03 bluhm Exp $	*/
 
 /*
  * Copyright (c) 2013 Tsubai Masanari
@@ -317,7 +317,8 @@ vmxnet3_attach(struct device *parent, struct device *self, void *aux)
 
 				isr = vmxnet3_intr_event;
 				sc->sc_intrmap = intrmap_create(&sc->sc_dev,
-				    msix, VMX_MAX_QUEUES, INTRMAP_POWEROF2);
+				    msix, MIN(VMX_MAX_QUEUES, IF_MAX_VECTORS),
+				    INTRMAP_POWEROF2);
 				sc->sc_nqueues = intrmap_count(sc->sc_intrmap);
 			}
 			break;
@@ -614,7 +615,8 @@ vmxnet3_alloc_txring(struct vmxnet3_softc *sc, int queue, int intr)
 
 	for (idx = 0; idx < NTXDESC; idx++) {
 		if (bus_dmamap_create(sc->sc_dmat, MAXMCLBYTES, NTXSEGS,
-		    VMXNET3_TX_LEN_M, 0, BUS_DMA_NOWAIT, &ring->dmap[idx]))
+		    VMXNET3_TX_LEN_M, 0, BUS_DMA_NOWAIT | BUS_DMA_64BIT,
+		    &ring->dmap[idx]))
 			return -1;
 	}
 
@@ -664,7 +666,8 @@ vmxnet3_alloc_rxring(struct vmxnet3_softc *sc, int queue, int intr)
 		timeout_set(&ring->refill, vmxnet3_rxfill_tick, ring);
 		for (idx = 0; idx < NRXDESC; idx++) {
 			if (bus_dmamap_create(sc->sc_dmat, JUMBO_LEN, 1,
-			    JUMBO_LEN, 0, BUS_DMA_NOWAIT, &ring->dmap[idx]))
+			    JUMBO_LEN, 0, BUS_DMA_NOWAIT | BUS_DMA_64BIT,
+			    &ring->dmap[idx]))
 				return -1;
 		}
 
@@ -1808,11 +1811,13 @@ vmxnet3_dma_allocmem(struct vmxnet3_softc *sc, u_int size, u_int align, bus_addr
 	caddr_t va;
 	int n;
 
-	if (bus_dmamem_alloc(t, size, align, 0, segs, 1, &n, BUS_DMA_NOWAIT))
+	if (bus_dmamem_alloc(t, size, align, 0, segs, 1, &n,
+	    BUS_DMA_NOWAIT | BUS_DMA_64BIT))
 		return NULL;
 	if (bus_dmamem_map(t, segs, 1, size, &va, BUS_DMA_NOWAIT))
 		return NULL;
-	if (bus_dmamap_create(t, size, 1, size, 0, BUS_DMA_NOWAIT, &map))
+	if (bus_dmamap_create(t, size, 1, size, 0,
+	    BUS_DMA_NOWAIT | BUS_DMA_64BIT, &map))
 		return NULL;
 	if (bus_dmamap_load(t, map, va, size, NULL, BUS_DMA_NOWAIT))
 		return NULL;
@@ -1836,7 +1841,7 @@ vmx_dmamem_alloc(struct vmxnet3_softc *sc, struct vmx_dmamem *vdm,
 		return (1);
 	if (bus_dmamem_alloc(sc->sc_dmat, vdm->vdm_size,
 	    align, 0, &vdm->vdm_seg, 1, &vdm->vdm_nsegs,
-	    BUS_DMA_WAITOK | BUS_DMA_ZERO) != 0)
+	    BUS_DMA_WAITOK | BUS_DMA_ZERO | BUS_DMA_64BIT) != 0)
 		goto destroy;
 	if (bus_dmamem_map(sc->sc_dmat, &vdm->vdm_seg, vdm->vdm_nsegs,
 	    vdm->vdm_size, &vdm->vdm_kva, BUS_DMA_WAITOK) != 0)

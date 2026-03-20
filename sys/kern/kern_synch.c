@@ -1,4 +1,4 @@
-/*	$OpenBSD: kern_synch.c,v 1.229 2025/07/14 08:47:15 dlg Exp $	*/
+/*	$OpenBSD: kern_synch.c,v 1.233 2025/11/24 12:54:53 jca Exp $	*/
 /*	$NetBSD: kern_synch.c,v 1.37 1996/04/22 01:38:37 christos Exp $	*/
 
 /*
@@ -288,6 +288,8 @@ sleep_setup(const volatile void *ident, int prio, const char *wmesg)
 #ifdef DIAGNOSTIC
 	if (p->p_flag & P_CANTSLEEP)
 		panic("sleep: %s failed insomnia", p->p_p->ps_comm);
+	if (p->p_flag & P_SINTR)
+		panic("sleep: stale P_SINTR");
 	if (ident == NULL)
 		panic("sleep: no ident");
 	if (p->p_stat != SONPROC)
@@ -655,6 +657,8 @@ struct tslpentry {
 	struct proc *volatile	 tslp_p;
 };
 
+TAILQ_HEAD(tslpqueue, tslpentry);
+
 struct tslp_bucket {
 	struct tslpqueue	 tsb_list;
 	struct mutex		 tsb_lock;
@@ -900,9 +904,9 @@ refcnt_init(struct refcnt *r)
 }
 
 void
-refcnt_init_trace(struct refcnt *r, int idx)
+refcnt_init_trace(struct refcnt *r, int trace)
 {
-	r->r_traceidx = idx;
+	r->r_traceidx = trace;
 	atomic_store_int(&r->r_refs, 1);
 	TRACEINDEX(refcnt, r->r_traceidx, r, 0, +1);
 }
@@ -977,8 +981,10 @@ cond_init(struct cond *c)
 }
 
 void
-cond_signal(struct cond *c)
+cond_signal_handler(void *arg)
 {
+	struct cond *c = arg;
+
 	atomic_store_int(&c->c_wait, 0);
 
 	wakeup_one(c);

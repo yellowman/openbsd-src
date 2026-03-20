@@ -1,4 +1,4 @@
-/*	$OpenBSD: trap.c,v 1.127 2024/11/08 08:43:38 miod Exp $	*/
+/*	$OpenBSD: trap.c,v 1.129 2026/03/08 17:07:31 deraadt Exp $	*/
 /*	$NetBSD: trap.c,v 1.73 2001/08/09 01:03:01 eeh Exp $ */
 
 /*
@@ -329,7 +329,7 @@ trap(struct trapframe *tf, unsigned type, vaddr_t pc, long tstate)
 	/* This steps the PC over the trap. */
 #define	ADVANCE (n = tf->tf_npc, tf->tf_pc = n, tf->tf_npc = n + 4)
 
-	uvmexp.traps++;
+	atomic_inc_int(&uvmexp.traps);
 	/*
 	 * Generally, kernel traps cause a panic.  Any exceptions are
 	 * handled early here.
@@ -414,7 +414,7 @@ dopanic:
 
 	case T_AST:
 		p->p_md.md_astpending = 0;
-		uvmexp.softs++;
+		atomic_inc_int(&uvmexp.softs);
 		mi_ast(p, curcpu()->ci_want_resched);
 		break;
 
@@ -488,7 +488,7 @@ dopanic:
 			loadfpstate(fs);
 			fpproc = p;		/* now we do have it */
 			intr_restore(s);
-			uvmexp.fpswtch++;
+			atomic_inc_int(&uvmexp.fpswtch);
 		}
 		tf->tf_tstate |= (PSTATE_PEF<<TSTATE_PSTATE_SHIFT);
 		sparc_wr(fprs, FPRS_FEF, 0);
@@ -594,7 +594,6 @@ dopanic:
 		break;
 
 	case T_CLEANWIN:
-		uprintf("T_CLEANWIN\n");	/* XXX Should not get this */
 		ADVANCE;
 		break;
 
@@ -610,13 +609,11 @@ dopanic:
 		break;
 
 	case T_FIXALIGN:
-		uprintf("T_FIXALIGN\n");
 		ADVANCE;
 		trapsignal(p, SIGILL, 0, ILL_ILLOPN, sv);	/* XXX code? */
 		break;
 
 	case T_INTOF:
-		uprintf("T_INTOF\n");		/* XXX */
 		ADVANCE;
 		trapsignal(p, SIGFPE, FPE_INTOVF_TRAP, FPE_INTOVF, sv);
 		break;
@@ -694,7 +691,7 @@ data_access_fault(struct trapframe *tf, unsigned type, vaddr_t pc,
 	union sigval sv;
 	int signal, sicode, error;
 
-	uvmexp.traps++;
+	atomic_inc_int(&uvmexp.traps);
 	if (p == NULL)		/* safety check */
 		p = &proc0;
 
@@ -812,7 +809,7 @@ data_access_error(struct trapframe *tf, unsigned type, vaddr_t afva,
 	vaddr_t onfault;
 	union sigval sv;
 
-	uvmexp.traps++;
+	atomic_inc_int(&uvmexp.traps);
 	if (p == NULL)		/* safety check */
 		p = &proc0;
 
@@ -880,7 +877,7 @@ text_access_fault(struct trapframe *tf, unsigned type, vaddr_t pc,
 	union sigval sv;
 	int signal, sicode, error;
 
-	uvmexp.traps++;
+	atomic_inc_int(&uvmexp.traps);
 	if (p == NULL)		/* safety check */
 		panic("text_access_fault: no curproc");
 
@@ -936,7 +933,7 @@ text_access_error(struct trapframe *tf, unsigned type, vaddr_t pc,
 	union sigval sv;
 	int signal, sicode, error;
 
-	uvmexp.traps++;
+	atomic_inc_int(&uvmexp.traps);
 	if (p == NULL)		/* safety check */
 		p = &proc0;
 
@@ -1012,7 +1009,7 @@ syscall(struct trapframe *tf, register_t code, register_t pc)
 	if ((tf->tf_out[6] & 1) == 0)
 		sigexit(p, SIGILL);
 
-	uvmexp.syscalls++;
+	atomic_inc_int(&uvmexp.syscalls);
 #ifdef DIAGNOSTIC
 	if (tf->tf_tstate & TSTATE_PRIV)
 		panic("syscall from kernel");

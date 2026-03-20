@@ -1,4 +1,4 @@
-/*	$OpenBSD: sndioctl.c,v 1.21 2024/05/24 15:10:27 ratchov Exp $	*/
+/*	$OpenBSD: sndioctl.c,v 1.23 2026/02/27 08:26:16 ratchov Exp $	*/
 /*
  * Copyright (c) 2014-2020 Alexandre Ratchov <alex@caoua.org>
  *
@@ -340,7 +340,7 @@ print_node(struct sioctl_node *c, int mono)
 void
 print_display(struct info *p)
 {
-	char buf[SIOCTL_NAMEMAX], *s, *d;
+	char buf[SIOCTL_DISPLAYMAX], *s, *d;
 	unsigned int c;
 
 	s = p->desc.display;
@@ -1062,7 +1062,7 @@ main(int argc, char **argv)
 			exit(1);
 		}
 		for (;;) {
-                	fflush(stdout);
+			fflush(stdout);
 			nfds = sioctl_pollfd(hdl, pfds, POLLIN);
 			if (nfds == 0)
 				break;

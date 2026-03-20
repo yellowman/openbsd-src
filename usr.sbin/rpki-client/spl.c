@@ -1,4 +1,4 @@
-/*	$OpenBSD: spl.c,v 1.9 2025/07/20 07:48:31 tb Exp $ */
+/*	$OpenBSD: spl.c,v 1.16 2025/08/24 12:34:39 tb Exp $ */
 /*
  * Copyright (c) 2024 Job Snijders <job@fastly.com>
  * Copyright (c) 2022 Theo Buehler <tb@openbsd.org>
@@ -32,46 +32,14 @@
 #include <openssl/x509v3.h>
 
 #include "extern.h"
-
-extern ASN1_OBJECT	*spl_oid;
+#include "rpki-asn1.h"
 
 /*
- * Types and templates for the SPL eContent.
+ * SPL eContent definition in draft-ietf-sidrops-rpki-prefixlist-04, section 3.
  */
 
-ASN1_ITEM_EXP AddressFamilyPrefixes_it;
 ASN1_ITEM_EXP SignedPrefixList_it;
-
-DECLARE_STACK_OF(ASN1_BIT_STRING);
-
-typedef struct {
-	ASN1_OCTET_STRING		*addressFamily;
-	STACK_OF(ASN1_BIT_STRING)	*addressPrefixes;
-} AddressFamilyPrefixes;
-
-DECLARE_STACK_OF(AddressFamilyPrefixes);
-
-ASN1_SEQUENCE(AddressFamilyPrefixes) = {
-	ASN1_SIMPLE(AddressFamilyPrefixes, addressFamily, ASN1_OCTET_STRING),
-	ASN1_SEQUENCE_OF(AddressFamilyPrefixes, addressPrefixes,
-	    ASN1_BIT_STRING),
-} ASN1_SEQUENCE_END(AddressFamilyPrefixes);
-
-#ifndef DEFINE_STACK_OF
-#define sk_ASN1_BIT_STRING_num(st)	SKM_sk_num(ASN1_BIT_STRING, (st))
-#define sk_ASN1_BIT_STRING_value(st, i)	SKM_sk_value(ASN1_BIT_STRING, (st), (i))
-
-#define sk_AddressFamilyPrefixes_num(st)	\
-    SKM_sk_num(AddressFamilyPrefixes, (st))
-#define sk_AddressFamilyPrefixes_value(st, i)	\
-    SKM_sk_value(AddressFamilyPrefixes, (st), (i))
-#endif
-
-typedef struct {
-	ASN1_INTEGER			*version;
-	ASN1_INTEGER			*asid;
-	STACK_OF(AddressFamilyPrefixes)	*prefixBlocks;
-} SignedPrefixList;
+ASN1_ITEM_EXP AddressFamilyPrefixes_it;
 
 ASN1_SEQUENCE(SignedPrefixList) = {
 	ASN1_EXP_OPT(SignedPrefixList, version, ASN1_INTEGER, 0),
@@ -79,8 +47,13 @@ ASN1_SEQUENCE(SignedPrefixList) = {
 	ASN1_SEQUENCE_OF(SignedPrefixList, prefixBlocks, AddressFamilyPrefixes)
 } ASN1_SEQUENCE_END(SignedPrefixList);
 
-DECLARE_ASN1_FUNCTIONS(SignedPrefixList);
 IMPLEMENT_ASN1_FUNCTIONS(SignedPrefixList);
+
+ASN1_SEQUENCE(AddressFamilyPrefixes) = {
+	ASN1_SIMPLE(AddressFamilyPrefixes, addressFamily, ASN1_OCTET_STRING),
+	ASN1_SEQUENCE_OF(AddressFamilyPrefixes, addressPrefixes,
+	    ASN1_BIT_STRING),
+} ASN1_SEQUENCE_END(AddressFamilyPrefixes);
 
 /*
  * Comparator to help sorting elements in SPL prefixBlocks and VSPs.
@@ -142,8 +115,7 @@ spl_parse_econtent(const char *fn, struct spl *spl, const unsigned char *d,
 
 	oder = d;
 	if ((spl_asn1 = d2i_SignedPrefixList(NULL, &d, dsz)) == NULL) {
-		warnx("%s: RFC 6482 section 3: failed to parse "
-		    "SignedPrefixList", fn);
+		warnx("%s: failed to parse SignedPrefixList", fn);
 		goto out;
 	}
 	if (d != oder + dsz) {
@@ -397,8 +369,7 @@ spl_insert_vsps(struct vsp_tree *tree, struct spl *spl, struct repo *rp)
 	vsp->asid = spl->asid;
 	vsp->talid = spl->talid;
 	vsp->expires = spl->expires;
-	if (rp != NULL)
-		vsp->repoid = repo_id(rp);
+	vsp->repoid = repo_id(rp);
 
 	if ((found = RB_INSERT(vsp_tree, tree, vsp)) != NULL) {
 		/* already exists */

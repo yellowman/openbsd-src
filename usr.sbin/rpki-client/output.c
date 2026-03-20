@@ -1,4 +1,4 @@
-/*	$OpenBSD: output.c,v 1.41 2025/07/08 14:19:21 job Exp $ */
+/*	$OpenBSD: output.c,v 1.45 2025/11/13 15:18:53 job Exp $ */
 /*
  * Copyright (c) 2019 Theo de Raadt <deraadt@openbsd.org>
  *
@@ -70,12 +70,13 @@ static const struct outputs {
 	{ FORMAT_CSV, "csv", output_csv },
 	{ FORMAT_JSON, "json", output_json },
 	{ FORMAT_OMETRIC, "metrics", output_ometric },
+	{ FORMAT_CCR, "rpki.ccr", output_ccr_der },
 	{ 0, NULL, NULL }
 };
 
 static FILE	*output_createtmp(char *);
 static void	 output_cleantmp(void);
-static int	 output_finish(FILE *);
+static int	 output_finish(FILE *, time_t);
 static void	 sig_handler(int);
 static void	 set_signal_handler(void);
 
@@ -151,7 +152,7 @@ outputfiles(struct validation_data *vd, struct stats *st)
 			rc = 1;
 			continue;
 		}
-		if (output_finish(fout) != 0) {
+		if (output_finish(fout, vd->buildtime) != 0) {
 			warn("finish for %s format failed", outputs[i].name);
 			output_cleantmp();
 			rc = 1;
@@ -186,12 +187,23 @@ output_createtmp(char *name)
 }
 
 static int
-output_finish(FILE *out)
+output_finish(FILE *out, time_t buildtime)
 {
+	struct timespec ts[2];
+
 	if (fclose(out) != 0)
 		return -1;
+
+	ts[0].tv_nsec = UTIME_OMIT;
+	ts[1].tv_sec = buildtime;
+	ts[1].tv_nsec = 0;
+
+	if (utimensat(AT_FDCWD, output_tmpname, ts, 0) == -1)
+		return -1;
+
 	if (rename(output_tmpname, output_name) == -1)
 		return -1;
+
 	output_tmpname[0] = '\0';
 	return 0;
 }
@@ -238,15 +250,13 @@ set_signal_handler(void)
 }
 
 int
-outputheader(FILE *out, struct stats *st)
+outputheader(FILE *out, struct validation_data *vd, struct stats *st)
 {
 	char		hn[NI_MAXHOST], tbuf[80];
 	struct tm	*tp;
-	time_t		t;
 	int		i;
 
-	time(&t);
-	tp = gmtime(&t);
+	tp = gmtime(&vd->buildtime);
 	strftime(tbuf, sizeof tbuf, "%a %b %e %H:%M:%S UTC %Y", tp);
 
 	gethostname(hn, sizeof hn);
@@ -254,11 +264,15 @@ outputheader(FILE *out, struct stats *st)
 	if (fprintf(out,
 	    "# Generated on host %s at %s\n"
 	    "# Processing time %lld seconds (%llds user, %llds system)\n"
+	    "# CCR manifest hash: %s\n"
+	    "# CCR validated ROA payloads hash: %s\n"
+	    "# CCR validated ASPA payloads hash: %s\n"
 	    "# Route Origin Authorizations: %u (%u failed parse, %u invalid)\n"
 	    "# BGPsec Router Certificates: %u\n"
 	    "# Certificates: %u (%u invalid, %u non-functional)\n",
 	    hn, tbuf, (long long)st->elapsed_time.tv_sec,
 	    (long long)st->user_time.tv_sec, (long long)st->system_time.tv_sec,
+	    vd->ccr.mfts_hash, vd->ccr.vrps_hash, vd->ccr.vaps_hash,
 	    st->repo_tal_stats.roas, st->repo_tal_stats.roas_fail,
 	    st->repo_tal_stats.roas_invalid, st->repo_tal_stats.brks,
 	    st->repo_tal_stats.certs, st->repo_tal_stats.certs_fail,
@@ -277,12 +291,10 @@ outputheader(FILE *out, struct stats *st)
 	    " ]\n"
 	    "# Manifests: %u (%u failed parse)\n"
 	    "# Certificate revocation lists: %u\n"
-	    "# Ghostbuster records: %u\n"
 	    "# Repositories: %u\n"
 	    "# VRP Entries: %u (%u unique)\n",
 	    st->repo_tal_stats.mfts, st->repo_tal_stats.mfts_fail,
 	    st->repo_tal_stats.crls,
-	    st->repo_tal_stats.gbrs,
 	    st->repos,
 	    st->repo_tal_stats.vrps, st->repo_tal_stats.vrps_uniqs) < 0)
 		return -1;

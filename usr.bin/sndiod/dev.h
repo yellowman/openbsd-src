@@ -1,4 +1,4 @@
-/*	$OpenBSD: dev.h,v 1.49 2025/06/20 07:14:38 ratchov Exp $	*/
+/*	$OpenBSD: dev.h,v 1.53 2026/03/15 14:24:43 ratchov Exp $	*/
 /*
  * Copyright (c) 2008-2012 Alexandre Ratchov <alex@caoua.org>
  *
@@ -40,6 +40,7 @@
 struct slotops
 {
 	void (*onmove)(void *);			/* clock tick */
+	void (*onxrun)(void *);			/* xrun */
 	void (*onvol)(void *);			/* tell client vol changed */
 	void (*fill)(void *);			/* request to fill a play block */
 	void (*flush)(void *);			/* request to flush a rec block */
@@ -77,11 +78,10 @@ struct slot {
 		int prime;			/* initial cycles to skip */
 		int bpf;			/* byte per frame */
 		int nch;			/* number of rec chans */
-		struct cmap cmap;		/* channel mapper state */
+		struct cmap cmap_rec;		/* rec channel mapper state */
+		struct cmap cmap_mon;		/* mon channel mapper state */
 		struct resamp resamp;		/* buffer for resampling */
 		struct conv enc;		/* buffer for encoding */
-		int join;			/* channel join factor */
-		int expand;			/* channel expand factor */
 		void *resampbuf, *encbuf;	/* tmp buffers */
 	} sub;
 	int xrun;				/* underrun policy */
@@ -100,6 +100,7 @@ struct slot {
 #define SLOT_RUN	3			/* buffer attached to device */
 #define SLOT_STOP	4			/* draining */
 	int pstate;
+	int paused;				/* paused because of xrun */
 
 	struct app *app;
 };
@@ -215,11 +216,6 @@ struct dev {
 	char name[CTL_NAMEMAX];
 
 	/*
-	 * next to try if this fails
-	 */
-	struct dev *alt_next;
-
-	/*
 	 * audio device (while opened)
 	 */
 	struct dev_sio sio;
@@ -283,7 +279,7 @@ size_t chans_fmt(char *, size_t, int, int, int, int, int);
 int dev_open(struct dev *);
 void dev_close(struct dev *);
 void dev_abort(struct dev *);
-struct dev *dev_migrate(struct dev *);
+void dev_migrate(struct dev *);
 struct dev *dev_new(char *, struct aparams *, unsigned int, unsigned int,
     unsigned int, unsigned int, unsigned int, unsigned int);
 struct dev *dev_bynum(int);

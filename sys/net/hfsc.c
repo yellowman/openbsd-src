@@ -1,4 +1,4 @@
-/*	$OpenBSD: hfsc.c,v 1.51 2025/07/07 02:28:50 jsg Exp $	*/
+/*	$OpenBSD: hfsc.c,v 1.53 2026/03/19 14:59:05 sthen Exp $	*/
 
 /*
  * Copyright (c) 2012-2013 Henning Brauer <henning@openbsd.org>
@@ -229,10 +229,10 @@ struct hfsc_class	*hfsc_actlist_firstfit(struct hfsc_class *,
 
 static __inline u_int64_t	seg_x2y(u_int64_t, u_int64_t);
 static __inline u_int64_t	seg_y2x(u_int64_t, u_int64_t);
-static __inline u_int64_t	m2sm(u_int);
-static __inline u_int64_t	m2ism(u_int);
+static __inline u_int64_t	m2sm(u_int64_t);
+static __inline u_int64_t	m2ism(u_int64_t);
 static __inline u_int64_t	d2dx(u_int);
-static __inline u_int		sm2m(u_int64_t);
+static __inline u_int64_t	sm2m(u_int64_t);
 static __inline u_int		dx2d(u_int64_t);
 
 void		hfsc_sc2isc(struct hfsc_sc *, struct hfsc_internal_sc *);
@@ -249,8 +249,6 @@ struct hfsc_class	*hfsc_clh2cph(struct hfsc_if *, u_int32_t);
 #define	HFSC_FREQ		1000000000LL
 #define	HFSC_CLK_PER_TICK	tick_nsec
 #define	HFSC_HT_INFINITY	0xffffffffffffffffLL /* infinite time value */
-
-#define hfsc_uptime()		nsecuptime()
 
 struct pool	hfsc_class_pl, hfsc_internal_sc_pl;
 
@@ -834,7 +832,7 @@ hfsc_deq_begin(struct ifqueue *ifq, void **cookiep)
 	struct mbuf *m;
 	u_int64_t cur_time;
 
-	cur_time = hfsc_uptime();
+	cur_time = nsecuptime();
 
 	/*
 	 * if there are eligible classes, use real-time criteria.
@@ -996,7 +994,7 @@ hfsc_init_ed(struct hfsc_if *hif, struct hfsc_class *cl, int next_len)
 {
 	u_int64_t cur_time;
 
-	cur_time = hfsc_uptime();
+	cur_time = nsecuptime();
 
 	/* update the deadline curve */
 	hfsc_rtsc_min(&cl->cl_deadline, cl->cl_rsc, cur_time, cl->cl_cumul);
@@ -1103,7 +1101,7 @@ hfsc_init_vf(struct hfsc_class *cl, int len)
 			if (cl->cl_usc != NULL) {
 				/* class has upper limit curve */
 				if (cur_time == 0)
-					cur_time = hfsc_uptime();
+					cur_time = nsecuptime();
 
 				/* update the ulimit curve */
 				hfsc_rtsc_min(&cl->cl_ulimit, cl->cl_usc, cur_time,
@@ -1453,16 +1451,16 @@ seg_y2x(u_int64_t y, u_int64_t ism)
 }
 
 static __inline u_int64_t
-m2sm(u_int m)
+m2sm(u_int64_t m)
 {
 	u_int64_t sm;
 
-	sm = ((u_int64_t)m << SM_SHIFT) / 8 / HFSC_FREQ;
+	sm = (m << SM_SHIFT) / 8 / HFSC_FREQ;
 	return (sm);
 }
 
 static __inline u_int64_t
-m2ism(u_int m)
+m2ism(u_int64_t m)
 {
 	u_int64_t ism;
 
@@ -1482,13 +1480,13 @@ d2dx(u_int d)
 	return (dx);
 }
 
-static __inline u_int
+static __inline u_int64_t
 sm2m(u_int64_t sm)
 {
 	u_int64_t m;
 
 	m = (sm * 8 * HFSC_FREQ) >> SM_SHIFT;
-	return ((u_int)m);
+	return (m);
 }
 
 static __inline u_int
@@ -1690,7 +1688,7 @@ hfsc_getclstats(struct hfsc_class_stats *sp, struct hfsc_class *cl)
 	sp->myfadj = cl->cl_myfadj;
 	sp->vtadj = cl->cl_vtadj;
 
-	sp->cur_time = hfsc_uptime();
+	sp->cur_time = nsecuptime();
 	sp->machclk_freq = HFSC_FREQ;
 
 	sp->qlength = hfsc_class_qlength(cl);

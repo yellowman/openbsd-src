@@ -1,4 +1,4 @@
-/*	$OpenBSD: uvm_mmap.c,v 1.202 2025/06/13 10:48:56 mpi Exp $	*/
+/*	$OpenBSD: uvm_mmap.c,v 1.204 2026/02/11 22:34:41 deraadt Exp $	*/
 /*	$NetBSD: uvm_mmap.c,v 1.49 2001/02/18 21:19:08 chs Exp $	*/
 
 /*
@@ -180,7 +180,7 @@ uvm_wxcheck(struct proc *p, char *call)
 	int wxallowed = (pr->ps_textvp->v_mount &&
 	    (pr->ps_textvp->v_mount->mnt_flag & MNT_WXALLOWED));
 
-	if (wxallowed && (pr->ps_flags & PS_WXNEEDED))
+	if (wxallowed && (pr->ps_iflags & PSI_WXNEEDED))
 		return 0;
 
 	if (atomic_load_int(&uvm_wxabort)) {
@@ -834,7 +834,7 @@ sys_mlock(struct proc *p, void *v, register_t *retval)
 	if (addr > SIZE_MAX - size)
 		return EINVAL;		/* disallow wrap-around. */
 
-	if (atop(size) + uvmexp.wired > uvmexp.wiredmax)
+	if (atop(size) + atomic_load_sint(&uvmexp.wired) > uvmexp.wiredmax)
 		return EAGAIN;
 
 #ifdef pmap_wired_count
@@ -948,7 +948,7 @@ uvm_mmaplock(vm_map_t map, vaddr_t *addr, vsize_t size, vm_prot_t prot,
 	vm_map_lock(map);
 	if (map->flags & VM_MAP_WIREFUTURE) {
 		KERNEL_LOCK();
-		if ((atop(size) + uvmexp.wired) > uvmexp.wiredmax
+		if ((atop(size) + atomic_load_sint(&uvmexp.wired)) > uvmexp.wiredmax
 #ifdef pmap_wired_count
 		    || (locklimit != 0 && (size +
 			 ptoa(pmap_wired_count(vm_map_pmap(map)))) >

@@ -1,4 +1,4 @@
-/*	$OpenBSD: bgpd.h,v 1.519 2025/03/21 01:06:48 jsg Exp $ */
+/*	$OpenBSD: bgpd.h,v 1.538 2026/03/19 12:44:22 claudio Exp $ */
 
 /*
  * Copyright (c) 2003, 2004 Henning Brauer <henning@openbsd.org>
@@ -106,6 +106,10 @@
 
 #define CTASSERT(x)	extern char  _ctassert[(x) ? 1 : -1 ] \
 			    __attribute__((__unused__))
+
+#ifndef nitems
+#define nitems(_a)	(sizeof((_a)) / sizeof((_a)[0]))
+#endif
 
 /*
  * Note that these numeric assignments differ from the numbers commonly
@@ -244,8 +248,15 @@ struct listen_addr {
 	uint8_t				flags;
 };
 
+TAILQ_HEAD(timer_head, timer);
+
 TAILQ_HEAD(listen_addrs, listen_addr);
 TAILQ_HEAD(filter_set_head, filter_set);
+struct rde_filter_set;
+
+struct bitmap {
+	uint64_t	data[2];
+};
 
 struct peer;
 RB_HEAD(peer_head, peer);
@@ -537,6 +548,9 @@ struct rde_peer_stats {
 	uint64_t			 prefix_sent_update;
 	uint64_t			 prefix_sent_withdraw;
 	uint64_t			 prefix_sent_eor;
+	uint64_t			 rib_entry_count;
+	uint64_t			 ibufq_msg_count;
+	uint64_t			 ibufq_payload_size;
 	uint32_t			 prefix_cnt;
 	uint32_t			 prefix_out_cnt;
 	uint32_t			 pending_update;
@@ -556,6 +570,7 @@ enum network_type {
 struct network_config {
 	struct bgpd_addr	 prefix;
 	struct filter_set_head	 attrset;
+	struct rde_filter_set	*rde_attrset;
 	char			 psname[SET_NAME_LEN];
 	uint64_t		 rd;
 	enum network_type	 type;
@@ -581,6 +596,7 @@ struct flowspec {
 struct flowspec_config {
 	RB_ENTRY(flowspec_config)	 entry;
 	struct filter_set_head		 attrset;
+	struct rde_filter_set		*rde_attrset;
 	struct flowspec			*flow;
 	enum reconf_action		 reconf_action;
 };
@@ -1255,6 +1271,7 @@ struct filter_rule {
 	struct filter_peers		peer;
 	struct filter_match		match;
 	struct filter_set_head		set;
+	struct rde_filter_set		*rde_set;
 #define RDE_FILTER_SKIP_PEERID		0
 #define RDE_FILTER_SKIP_GROUPID		1
 #define RDE_FILTER_SKIP_REMOTE_AS	2
@@ -1276,7 +1293,6 @@ enum action_types {
 	ACTION_SET_PREPEND_PEER,
 	ACTION_SET_AS_OVERRIDE,
 	ACTION_SET_NEXTHOP,
-	ACTION_SET_NEXTHOP_REF,
 	ACTION_SET_NEXTHOP_REJECT,
 	ACTION_SET_NEXTHOP_BLACKHOLE,
 	ACTION_SET_NEXTHOP_NOMODIFY,
@@ -1284,28 +1300,23 @@ enum action_types {
 	ACTION_DEL_COMMUNITY,
 	ACTION_SET_COMMUNITY,
 	ACTION_PFTABLE,
-	ACTION_PFTABLE_ID,
 	ACTION_RTLABEL,
-	ACTION_RTLABEL_ID,
 	ACTION_SET_ORIGIN
 };
 
-struct nexthop;
 struct filter_set {
 	TAILQ_ENTRY(filter_set)		entry;
+	enum action_types		type;
 	union {
 		uint8_t				 prepend;
-		uint16_t			 id;
+		uint8_t				 origin;
 		uint32_t			 metric;
 		int32_t				 relative;
-		struct bgpd_addr		 nexthop;
-		struct nexthop			*nh_ref;
 		struct community		 community;
+		struct bgpd_addr		 nexthop;
 		char				 pftable[PFTABLE_LEN];
 		char				 rtlabel[ROUTELABEL_LEN];
-		uint8_t				 origin;
 	}				action;
-	enum action_types		type;
 };
 
 struct roa_set {
@@ -1353,6 +1364,8 @@ struct l3vpn {
 	char				ifmpe[IFNAMSIZ];
 	struct filter_set_head		import;
 	struct filter_set_head		export;
+	struct rde_filter_set		*rde_import;
+	struct rde_filter_set		*rde_export;
 	struct network_head		net_l;
 	uint64_t			rd;
 	u_int				rtableid;
@@ -1385,6 +1398,10 @@ struct rde_memstats {
 	long long	path_cnt;
 	long long	path_refs;
 	long long	prefix_cnt;
+	long long	adjout_prefix_cnt;
+	long long	adjout_prefix_size;
+	long long	pend_prefix_cnt;
+	long long	pend_attr_cnt;
 	long long	rib_cnt;
 	long long	pt_cnt[AID_MAX];
 	long long	pt_size[AID_MAX];
@@ -1399,11 +1416,37 @@ struct rde_memstats {
 	long long	attr_refs;
 	long long	attr_data;
 	long long	attr_dcnt;
+	long long	adjout_attr_cnt;
+	long long	adjout_attr_refs;
 	long long	aset_cnt;
 	long long	aset_size;
 	long long	aset_nmemb;
 	long long	pset_cnt;
 	long long	pset_size;
+	long long	aspa_cnt;
+	long long	aspa_size;
+	long long	bitmap_cnt;
+	long long	bitmap_size;
+	long long	filter_cnt;
+	long long	filter_size;
+	long long	filter_refs;
+	long long	filter_set_cnt;
+	long long	filter_set_size;
+	long long	filter_set_refs;
+	long long	hash_cnt;
+	long long	hash_size;
+	long long	hash_refs;
+	long long	rde_rib_entry_count;
+	long long	rde_ibufq_msg_count;
+	long long	rde_ibufq_payload_size;
+	long long	rde_event_loop_count;
+	long long	rde_event_loop_usec;
+	long long	rde_event_io_usec;
+	long long	rde_event_peer_usec;
+	long long	rde_event_adjout_usec;
+	long long	rde_event_ribdump_usec;
+	long long	rde_event_nexthop_usec;
+	long long	rde_event_update_usec;
 };
 
 #define	MRT_FILE_LEN	512
@@ -1443,7 +1486,7 @@ struct mrt_config {
 	struct mrt		conf;
 	char			name[MRT_FILE_LEN];	/* base file name */
 	char			file[MRT_FILE_LEN];	/* actual file name */
-	time_t			ReopenTimer;
+	struct timer_head	timer;
 	int			ReopenTimerInterval;
 };
 
@@ -1464,7 +1507,9 @@ int	control_imsg_relay(struct imsg *, struct peer *);
 
 /* config.c */
 struct bgpd_config	*new_config(void);
-void		copy_config(struct bgpd_config *, struct bgpd_config *);
+void		copy_config(struct bgpd_config *, const struct bgpd_config *);
+int		imsg_send_config(struct imsgbuf *, const struct bgpd_config *);
+int		imsg_recv_config(struct imsg *, struct bgpd_config *);
 void		network_free(struct network *);
 struct flowspec_config	*flowspec_alloc(uint8_t, int);
 void		flowspec_free(struct flowspec_config *);
@@ -1525,7 +1570,7 @@ void		 log_peer_warnx(const struct peer_config *, const char *, ...)
 void		 mrt_write(struct mrt *);
 void		 mrt_clean(struct mrt *);
 void		 mrt_init(struct imsgbuf *, struct imsgbuf *);
-time_t		 mrt_timeout(struct mrt_head *);
+monotime_t	 mrt_timeout(struct mrt_head *, monotime_t);
 void		 mrt_reconfigure(struct mrt_head *);
 void		 mrt_handler(struct mrt_head *);
 struct mrt	*mrt_get(struct mrt_head *, struct mrt *);
@@ -1557,10 +1602,26 @@ int	pftable_commit(void);
 
 /* rde_filter.c */
 void	filterset_free(struct filter_set_head *);
+void	rde_filterset_unref(struct rde_filter_set *);
 int	filterset_cmp(struct filter_set *, struct filter_set *);
 void	filterset_move(struct filter_set_head *, struct filter_set_head *);
-void	filterset_copy(struct filter_set_head *, struct filter_set_head *);
+void	filterset_copy(const struct filter_set_head *,
+	    struct filter_set_head *);
 const char	*filterset_name(enum action_types);
+
+/* bitmap.c */
+int		 bitmap_set(struct bitmap *, uint32_t);
+int		 bitmap_test(struct bitmap *, uint32_t);
+void		 bitmap_clear(struct bitmap *, uint32_t);
+int		 bitmap_empty(struct bitmap *);
+
+int		 bitmap_id_get(struct bitmap *, uint32_t *);
+void		 bitmap_id_put(struct bitmap *, uint32_t);
+
+void		 bitmap_init(struct bitmap *);
+void		 bitmap_reset(struct bitmap *);
+
+void		 bitmap_get_stats(long long *, long long *);
 
 /* rde_sets.c */
 struct as_set	*as_sets_lookup(struct as_set_head *, const char *);
@@ -1637,6 +1698,16 @@ int		 af2aid(sa_family_t, uint8_t, uint8_t *);
 struct sockaddr	*addr2sa(const struct bgpd_addr *, uint16_t, socklen_t *);
 void		 sa2addr(struct sockaddr *, struct bgpd_addr *, uint16_t *);
 const char	*get_baudrate(unsigned long long, char *);
+
+unsigned int	 bin_of_attrs(unsigned int);
+unsigned int	 bin_of_communities(unsigned int);
+unsigned int	 bin_of_adjout_prefixes(unsigned int);
+
+/* bgpd_imsg.c */
+int	imsg_send_filterset(struct imsgbuf *, struct filter_set_head *);
+int	ibuf_recv_filterset_count(struct ibuf *, uint16_t *);
+int	ibuf_recv_one_filterset(struct ibuf *, struct filter_set *);
+int	imsg_check_filterset(struct imsg *);
 
 /* flowspec.c */
 int	flowspec_valid(const uint8_t *, int, int);
@@ -1798,6 +1869,7 @@ static const char * const timernames[] = {
 	"RTR RetryTimer",
 	"RTR ExpireTimer",
 	"RTR ActiveTimer",
+	"MRT ReopenTimer",
 	""
 };
 

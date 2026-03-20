@@ -1,4 +1,4 @@
-/*	$OpenBSD: route.c,v 1.447 2025/07/14 08:48:51 dlg Exp $	*/
+/*	$OpenBSD: route.c,v 1.450 2025/09/15 13:51:24 bluhm Exp $	*/
 /*	$NetBSD: route.c,v 1.14 1996/02/13 22:00:46 christos Exp $	*/
 
 /*
@@ -907,7 +907,7 @@ rtrequest_delete(struct rt_addrinfo *info, u_int8_t prio, struct ifnet *ifp,
 		return (ESRCH);
 
 	/* Make sure that's the route the caller want to delete. */
-	if (ifp != NULL && ifp->if_index != rt->rt_ifidx) {
+	if (ifp->if_index != rt->rt_ifidx) {
 		rtfree(rt);
 		return (ESRCH);
 	}

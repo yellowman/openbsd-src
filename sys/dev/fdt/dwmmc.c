@@ -1,4 +1,4 @@
-/*	$OpenBSD: dwmmc.c,v 1.31 2024/12/19 18:02:47 patrick Exp $	*/
+/*	$OpenBSD: dwmmc.c,v 1.33 2026/03/11 16:22:34 kettenis Exp $	*/
 /*
  * Copyright (c) 2017 Mark Kettenis
  *
@@ -278,6 +278,7 @@ dwmmc_match(struct device *parent, void *match, void *aux)
 	return (OF_is_compatible(faa->fa_node, "hisilicon,hi3660-dw-mshc") ||
 	    OF_is_compatible(faa->fa_node, "hisilicon,hi3670-dw-mshc") ||
 	    OF_is_compatible(faa->fa_node, "rockchip,rk3288-dw-mshc") ||
+	    OF_is_compatible(faa->fa_node, "rockchip,rk3576-dw-mshc") ||
 	    OF_is_compatible(faa->fa_node, "samsung,exynos5420-dw-mshc") ||
 	    OF_is_compatible(faa->fa_node, "snps,dw-mshc") ||
 	    OF_is_compatible(faa->fa_node, "starfive,jh7110-mmc"));
@@ -311,6 +312,7 @@ dwmmc_attach(struct device *parent, struct device *self, void *aux)
 
 	pinctrl_byname(faa->fa_node, "default");
 
+	clock_set_assigned(faa->fa_node);
 	clock_enable_all(faa->fa_node);
 	reset_deassert_all(faa->fa_node);
 

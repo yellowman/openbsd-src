@@ -1,4 +1,4 @@
-/*	$OpenBSD: acpivar.h,v 1.137 2025/07/07 00:55:15 jsg Exp $	*/
+/*	$OpenBSD: acpivar.h,v 1.141 2026/03/11 16:18:42 kettenis Exp $	*/
 /*
  * Copyright (c) 2005 Thorsten Lockert <tholo@sigmasoft.com>
  *
@@ -42,6 +42,11 @@ extern int acpi_debug;
 #define dprintf(x...)
 #define dnprintf(n,x...)
 #endif
+
+#define ACPI_UUID(a, b, c, d, e) \
+    { (a), (a) >> 8, (a) >> 16, (a) >> 24, \
+      (b), (b) >> 8, (c), (c) >> 8, (d) >> 8, (d), \
+      (e) >> 40, (e) >> 32, (e) >> 24, (e) >> 16, (e) >> 8, (e) }
 
 extern int acpi_hasprocfvs;
 extern int acpi_haspci;
@@ -249,6 +254,7 @@ struct acpi_softc {
 	}			sc_sleeptype[6];
 	int			sc_lastgpe;
 	int			sc_wakegpe;
+	int			sc_wakegpio;
 
 	struct gpe_block	*gpe_table;
 
@@ -290,6 +296,12 @@ struct acpi_softc {
 	void			*sc_pmc_cookie;
 };
 
+#define WAKEGPE_NONE	-1
+#define WAKEGPE_PWRBTN	-2
+#define WAKEGPE_SLPBTN	-3
+#define WAKEGPE_RTC	-4
+#define WAKEGPE_GPIO	-5
+
 extern struct acpi_softc *acpi_softc;
 
 #define	SCFLAG_OREAD	0x0000001
@@ -312,6 +324,8 @@ void	 acpi_unmap(struct acpi_mem_map *);
 int	 acpi_bus_space_map(bus_space_tag_t, bus_addr_t, bus_size_t, int,
 	     bus_space_handle_t *);
 void	 acpi_bus_space_unmap(bus_space_tag_t, bus_space_handle_t, bus_size_t);
+
+struct aml_node *acpi_pci_match(struct device *, struct pci_attach_args *);
 
 struct	 bios_attach_args;
 int	 acpi_probe(struct device *, struct cfdata *, struct bios_attach_args *);

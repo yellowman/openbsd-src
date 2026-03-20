@@ -1,4 +1,4 @@
-/* $OpenBSD: ssh-keygen.c,v 1.481 2025/05/24 03:37:40 dtucker Exp $ */
+/* $OpenBSD: ssh-keygen.c,v 1.490 2026/03/03 09:57:25 dtucker Exp $ */
 /*
  * Author: Tatu Ylonen <ylo@cs.hut.fi>
  * Copyright (c) 1994 Tatu Ylonen <ylo@cs.hut.fi>, Espoo, Finland
@@ -17,6 +17,7 @@
 #include <sys/stat.h>
 
 #ifdef WITH_OPENSSL
+#include <openssl/bn.h>
 #include <openssl/evp.h>
 #include <openssl/pem.h>
 #endif
@@ -25,6 +26,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <netdb.h>
+#include <paths.h>
 #include <pwd.h>
 #include <stdarg.h>
 #include <stdio.h>
@@ -33,6 +35,7 @@
 #include <unistd.h>
 #include <limits.h>
 #include <locale.h>
+#include <time.h>
 
 #include "xmalloc.h"
 #include "sshkey.h"
@@ -103,8 +106,8 @@ static char *cert_key_id = NULL;
 static char *cert_principals = NULL;
 
 /* Validity period for certificates */
-static u_int64_t cert_valid_from = 0;
-static u_int64_t cert_valid_to = ~0ULL;
+static uint64_t cert_valid_from = 0;
+static uint64_t cert_valid_to = ~0ULL;
 
 /* Certificate options */
 #define CERTOPT_X_FWD				(1)
@@ -116,7 +119,7 @@ static u_int64_t cert_valid_to = ~0ULL;
 #define CERTOPT_REQUIRE_VERIFY			(1<<6)
 #define CERTOPT_DEFAULT	(CERTOPT_X_FWD|CERTOPT_AGENT_FWD| \
 			 CERTOPT_PORT_FWD|CERTOPT_PTY|CERTOPT_USER_RC)
-static u_int32_t certflags_flags = CERTOPT_DEFAULT;
+static uint32_t certflags_flags = CERTOPT_DEFAULT;
 static char *certflags_command = NULL;
 static char *certflags_src_addr = NULL;
 
@@ -160,13 +163,13 @@ static char hostname[NI_MAXHOST];
 
 #ifdef WITH_OPENSSL
 /* moduli.c */
-int gen_candidates(FILE *, u_int32_t, BIGNUM *);
-int prime_test(FILE *, FILE *, u_int32_t, u_int32_t, char *, unsigned long,
+int gen_candidates(FILE *, uint32_t, BIGNUM *);
+int prime_test(FILE *, FILE *, uint32_t, uint32_t, char *, unsigned long,
     unsigned long);
 #endif
 
 static void
-type_bits_valid(int type, const char *name, u_int32_t *bitsp)
+type_bits_valid(int type, const char *name, uint32_t *bitsp)
 {
 	if (type == KEY_UNSPEC)
 		fatal("unknown key type %s", key_type_name);
@@ -260,10 +263,6 @@ ask_filename(struct passwd *pw, const char *prompt)
 		case KEY_ED25519_SK_CERT:
 			name = _PATH_SSH_CLIENT_ID_ED25519_SK;
 			break;
-		case KEY_XMSS:
-		case KEY_XMSS_CERT:
-			name = _PATH_SSH_CLIENT_ID_XMSS;
-			break;
 		default:
 			fatal("bad key type");
 		}
@@ -340,7 +339,6 @@ do_convert_to_ssh2(struct passwd *pw, struct sshkey *k)
 	fprintf(stdout, "Comment: \"%s\"\n%s", comment, b64);
 	fprintf(stdout, "%s\n", SSH_COM_PUBLIC_END);
 	free(b64);
-	exit(0);
 }
 
 static void
@@ -360,7 +358,6 @@ do_convert_to_pkcs8(struct sshkey *k)
 	default:
 		fatal_f("unsupported key type %s", sshkey_type(k));
 	}
-	exit(0);
 }
 
 static void
@@ -380,7 +377,6 @@ do_convert_to_pem(struct sshkey *k)
 	default:
 		fatal_f("unsupported key type %s", sshkey_type(k));
 	}
-	exit(0);
 }
 
 static void
@@ -409,7 +405,6 @@ do_convert_to(struct passwd *pw)
 	default:
 		fatal_f("unknown key format %d", convert_format);
 	}
-	exit(0);
 }
 
 /*
@@ -521,6 +516,7 @@ do_convert_private_ssh2(struct sshbuf *b)
 		if ((r = ssh_rsa_complete_crt_parameters(rsa_d, rsa_p, rsa_q,
 		    rsa_iqmp, &rsa_dmp1, &rsa_dmq1)) != 0)
 			fatal_fr(r, "generate RSA CRT parameters");
+		EVP_PKEY_free(key->pkey);
 		if ((key->pkey = EVP_PKEY_new()) == NULL)
 			fatal_f("EVP_PKEY_new failed");
 		if ((rsa = RSA_new()) == NULL)
@@ -673,7 +669,6 @@ do_convert_from_pkcs8(struct sshkey **k, int *private)
 		    EVP_PKEY_base_id(pubkey));
 	}
 	EVP_PKEY_free(pubkey);
-	return;
 }
 
 static void
@@ -750,7 +745,6 @@ do_convert_from(struct passwd *pw)
 	if (!ok)
 		fatal("key write failed");
 	sshkey_free(k);
-	exit(0);
 }
 #endif
 
@@ -1001,13 +995,10 @@ do_gen_all_hostkeys(struct passwd *pw)
 		{ "ecdsa", "ECDSA",_PATH_HOST_ECDSA_KEY_FILE },
 #endif /* WITH_OPENSSL */
 		{ "ed25519", "ED25519",_PATH_HOST_ED25519_KEY_FILE },
-#ifdef WITH_XMSS
-		{ "xmss", "XMSS",_PATH_HOST_XMSS_KEY_FILE },
-#endif /* WITH_XMSS */
 		{ NULL, NULL, NULL }
 	};
 
-	u_int32_t bits = 0;
+	uint32_t bits = 0;
 	int first = 0;
 	struct stat st;
 	struct sshkey *private, *public;
@@ -1498,7 +1489,7 @@ do_change_comment(struct passwd *pw, const char *identity_comment)
 		}
 	}
 
-	if (private->type != KEY_ED25519 && private->type != KEY_XMSS &&
+	if (private->type != KEY_ED25519 &&
 	    private_key_format != SSHKEY_PRIVATE_OPENSSH) {
 		error("Comments are only supported for keys stored in "
 		    "the new format (-o).");
@@ -1702,7 +1693,7 @@ do_ca_sign(struct passwd *pw, const char *ca_key_path, int prefer_agent,
     unsigned long long cert_serial, int cert_serial_autoinc,
     int argc, char **argv)
 {
-	int r, i, found, agent_fd = -1;
+	int r, i, key_in_agent = 0, agent_fd = -1;
 	u_int n;
 	struct sshkey *ca, *public;
 	char valid[64], *otmp, *tmp, *cp, *out, *comment;
@@ -1731,17 +1722,19 @@ do_ca_sign(struct passwd *pw, const char *ca_key_path, int prefer_agent,
 			fatal_r(r, "Cannot use public key for CA signature");
 		if ((r = ssh_fetch_identitylist(agent_fd, &agent_ids)) != 0)
 			fatal_r(r, "Retrieve agent key list");
-		found = 0;
 		for (j = 0; j < agent_ids->nkeys; j++) {
 			if (sshkey_equal(ca, agent_ids->keys[j])) {
-				found = 1;
+				key_in_agent = 1;
+				/* Replace the CA key with the agent one */
+				sshkey_free(ca);
+				ca = agent_ids->keys[j];
+				agent_ids->keys[j] = NULL;
 				break;
 			}
 		}
-		if (!found)
+		if (!key_in_agent)
 			fatal("CA key %s not found in agent", tmp);
 		ssh_free_identitylist(agent_ids);
-		ca->flags |= SSHKEY_FLAG_EXT;
 	} else {
 		/* CA key is assumed to be a private key on the filesystem */
 		ca = load_identity(tmp, NULL);
@@ -1793,7 +1786,7 @@ do_ca_sign(struct passwd *pw, const char *ca_key_path, int prefer_agent,
 		if ((r = sshkey_to_certified(public)) != 0)
 			fatal_r(r, "Could not upgrade key %s to certificate", tmp);
 		public->cert->type = cert_key_type;
-		public->cert->serial = (u_int64_t)cert_serial;
+		public->cert->serial = (uint64_t)cert_serial;
 		public->cert->key_id = xstrdup(cert_key_id);
 		public->cert->nprincipals = n;
 		public->cert->principals = plist;
@@ -1806,7 +1799,7 @@ do_ca_sign(struct passwd *pw, const char *ca_key_path, int prefer_agent,
 		    &public->cert->signature_key)) != 0)
 			fatal_r(r, "sshkey_from_private (ca key)");
 
-		if (agent_fd != -1 && (ca->flags & SSHKEY_FLAG_EXT) != 0) {
+		if (key_in_agent) {
 			if ((r = sshkey_certify_custom(public, ca,
 			    key_type_name, sk_provider, NULL, agent_signer,
 			    &agent_fd)) != 0)
@@ -1849,19 +1842,20 @@ do_ca_sign(struct passwd *pw, const char *ca_key_path, int prefer_agent,
 
 		sshkey_free(public);
 		free(out);
+		free(comment);
 		if (cert_serial_autoinc)
 			cert_serial++;
 	}
 	if (pin != NULL)
 		freezero(pin, strlen(pin));
+	sshkey_free(ca);
 	free(ca_fp);
 #ifdef ENABLE_PKCS11
 	pkcs11_terminate();
 #endif
-	exit(0);
 }
 
-static u_int64_t
+static uint64_t
 parse_relative_time(const char *s, time_t now)
 {
 	int64_t mul, secs;
@@ -1872,7 +1866,7 @@ parse_relative_time(const char *s, time_t now)
 		fatal("Invalid relative certificate time %s", s);
 	if (mul == -1 && secs > now)
 		fatal("Certificate time %s cannot be represented", s);
-	return now + (u_int64_t)(secs * mul);
+	return now + (uint64_t)(secs * mul);
 }
 
 static void
@@ -1933,7 +1927,7 @@ parse_cert_times(char *timespec)
 	if (*to == '-' || *to == '+')
 		cert_valid_to = parse_relative_time(to, now);
 	else if (strcmp(to, "forever") == 0)
-		cert_valid_to = ~(u_int64_t)0;
+		cert_valid_to = ~(uint64_t)0;
 	else if (strncmp(to, "0x", 2) == 0)
 		parse_hex_u64(to, &cert_valid_to);
 	else if (parse_absolute_time(to, &cert_valid_to) != 0)
@@ -2306,9 +2300,12 @@ update_krl_from_file(struct passwd *pw, const char *file, int wild_ca,
 			cp += 5;
 			cp = cp + strspn(cp, " \t");
 			hash_to_blob(cp, &blob, &blen, file, lnum);
-			r = ssh_krl_revoke_key_sha256(krl, blob, blen);
-			if (r != 0)
+			if ((r = ssh_krl_revoke_key_sha256(krl,
+			    blob, blen)) != 0)
 				fatal_fr(r, "revoke key failed");
+			free(blob);
+			blob = NULL;
+			blen = 0;
 		} else {
 			if (strncasecmp(cp, "key:", 4) == 0) {
 				cp += 4;
@@ -2946,7 +2943,7 @@ do_moduli_screen(const char *out_file, char **opts, size_t nopts)
 #ifdef WITH_OPENSSL
 	/* Moduli generation/screening */
 	char *checkpoint = NULL;
-	u_int32_t generator_wanted = 0;
+	uint32_t generator_wanted = 0;
 	unsigned long start_lineno = 0, lines_to_process = 0;
 	int prime_tests = 0;
 	FILE *out, *in = stdin;
@@ -2963,7 +2960,7 @@ do_moduli_screen(const char *out_file, char **opts, size_t nopts)
 			free(checkpoint);
 			checkpoint = xstrdup(p);
 		} else if ((p = strprefix(opts[i], "generator=", 0)) != NULL) {
-			generator_wanted = (u_int32_t)strtonum(p, 1, UINT_MAX,
+			generator_wanted = (uint32_t)strtonum(p, 1, UINT_MAX,
 			    &errstr);
 			if (errstr != NULL) {
 				fatal("Generator invalid: %s (%s)", p, errstr);
@@ -3273,9 +3270,9 @@ main(int argc, char **argv)
 {
 	char comment[1024], *passphrase = NULL;
 	char *rr_hostname = NULL, *ep, *fp, *ra;
-	struct sshkey *private, *public;
+	struct sshkey *private = NULL, *public = NULL;
 	struct passwd *pw;
-	int r, opt, type;
+	int ret = 0, r, opt, type;
 	int change_passphrase = 0, change_comment = 0, show_cert = 0;
 	int find_host = 0, delete_host = 0, hash_hosts = 0;
 	int gen_all_hostkeys = 0, gen_krl = 0, update_krl = 0, check_krl = 0;
@@ -3288,7 +3285,7 @@ main(int argc, char **argv)
 	char *sk_attestation_path = NULL;
 	struct sshbuf *challenge = NULL, *attest = NULL;
 	size_t i, nopts = 0;
-	u_int32_t bits = 0;
+	uint32_t bits = 0;
 	uint8_t sk_flags = SSH_SK_USER_PRESENCE_REQD;
 	const char *errstr, *p;
 	int log_level = SYSLOG_LEVEL_INFO;
@@ -3300,9 +3297,6 @@ main(int argc, char **argv)
 	/* Ensure that fds 0, 1 and 2 are open or directed to /dev/null */
 	sanitise_stdfd();
 
-#ifdef WITH_OPENSSL
-	OpenSSL_add_all_algorithms();
-#endif
 	log_init(argv[0], SYSLOG_LEVEL_INFO, SYSLOG_FACILITY_USER, 1);
 
 	setlocale(LC_CTYPE, "");
@@ -3326,7 +3320,7 @@ main(int argc, char **argv)
 			gen_all_hostkeys = 1;
 			break;
 		case 'b':
-			bits = (u_int32_t)strtonum(optarg, 1, UINT32_MAX,
+			bits = (uint32_t)strtonum(optarg, 1, UINT32_MAX,
 			    &errstr);
 			if (errstr)
 				fatal("Bits has bad value %s (%s)",
@@ -3533,8 +3527,9 @@ main(int argc, char **argv)
 				    "missing allowed keys file");
 				exit(1);
 			}
-			return sig_find_principals(ca_key_path, identity_file,
+			ret = sig_find_principals(ca_key_path, identity_file,
 			    opts, nopts);
+			goto done;
 		} else if (strprefix(sign_op, "match-principals", 0) != NULL) {
 			if (!have_identity) {
 				error("Too few arguments for match-principals:"
@@ -3546,8 +3541,9 @@ main(int argc, char **argv)
 				    "missing principal ID");
 				exit(1);
 			}
-			return sig_match_principals(identity_file, cert_key_id,
+			ret = sig_match_principals(identity_file, cert_key_id,
 			    opts, nopts);
+			goto done;
 		} else if (strprefix(sign_op, "sign", 0) != NULL) {
 			/* NB. cert_principals is actually namespace, via -n */
 			if (cert_principals == NULL ||
@@ -3561,8 +3557,9 @@ main(int argc, char **argv)
 				    "missing key");
 				exit(1);
 			}
-			return sig_sign(identity_file, cert_principals,
+			ret = sig_sign(identity_file, cert_principals,
 			    prefer_agent, argc, argv, opts, nopts);
+			goto done;
 		} else if (strprefix(sign_op, "check-novalidate", 0) != NULL) {
 			/* NB. cert_principals is actually namespace, via -n */
 			if (cert_principals == NULL ||
@@ -3576,8 +3573,9 @@ main(int argc, char **argv)
 				    "missing signature file");
 				exit(1);
 			}
-			return sig_verify(ca_key_path, cert_principals,
+			ret = sig_verify(ca_key_path, cert_principals,
 			    NULL, NULL, NULL, opts, nopts);
+			goto done;
 		} else if (strprefix(sign_op, "verify", 0) != NULL) {
 			/* NB. cert_principals is actually namespace, via -n */
 			if (cert_principals == NULL ||
@@ -3601,9 +3599,10 @@ main(int argc, char **argv)
 				    "missing principal identity");
 				exit(1);
 			}
-			return sig_verify(ca_key_path, cert_principals,
+			ret = sig_verify(ca_key_path, cert_principals,
 			    cert_key_id, identity_file, rr_hostname,
 			    opts, nopts);
+			goto done;
 		}
 		error("Unsupported operation for -Y: \"%s\"", sign_op);
 		usage();
@@ -3631,19 +3630,29 @@ main(int argc, char **argv)
 	if (gen_krl) {
 		do_gen_krl(pw, update_krl, ca_key_path,
 		    cert_serial, identity_comment, argc, argv);
-		return (0);
+		goto done;
 	}
 	if (check_krl) {
 		do_check_krl(pw, print_fingerprint, argc, argv);
-		return (0);
+		goto done;
 	}
 	if (ca_key_path != NULL) {
 		if (cert_key_id == NULL)
 			fatal("Must specify key id (-I) when certifying");
+		if (cert_principals == NULL) {
+			/*
+			 * Ideally this would be a fatal(), but we need to
+			 * be able to generate such certificates for testing
+			 * even though they will be rejected.
+			 */
+			error("Warning: certificate will contain no "
+			    "principals (-n)");
+		}
 		for (i = 0; i < nopts; i++)
 			add_cert_option(opts[i]);
 		do_ca_sign(pw, ca_key_path, prefer_agent,
 		    cert_serial, cert_serial_autoinc, argc, argv);
+		goto done;
 	}
 	if (show_cert)
 		do_show_cert(pw);
@@ -3662,7 +3671,8 @@ main(int argc, char **argv)
 				    "FIDO authenticator download", opts[i]);
 			}
 		}
-		return do_download_sk(sk_provider, sk_device);
+		ret = do_download_sk(sk_provider, sk_device);
+		goto done;
 	}
 	if (print_fingerprint || print_bubblebabble)
 		do_fingerprint(pw);
@@ -3671,10 +3681,14 @@ main(int argc, char **argv)
 	if (change_comment)
 		do_change_comment(pw, identity_comment);
 #ifdef WITH_OPENSSL
-	if (convert_to)
+	if (convert_to) {
 		do_convert_to(pw);
-	if (convert_from)
+		goto done;
+	}
+	if (convert_from) {
 		do_convert_from(pw);
+		goto done;
+	}
 #else /* WITH_OPENSSL */
 	if (convert_to || convert_from)
 		fatal("key conversion disabled at compile time");
@@ -3701,9 +3715,6 @@ main(int argc, char **argv)
 			n += do_print_resource_record(pw,
 			    _PATH_HOST_ED25519_KEY_FILE, rr_hostname,
 			    print_generic, opts, nopts);
-			n += do_print_resource_record(pw,
-			    _PATH_HOST_XMSS_KEY_FILE, rr_hostname,
-			    print_generic, opts, nopts);
 			if (n == 0)
 				fatal("no keys found.");
 			exit(0);
@@ -3718,16 +3729,16 @@ main(int argc, char **argv)
 	}
 	if (do_gen_candidates) {
 		do_moduli_gen(argv[0], opts, nopts);
-		return 0;
+		goto done;
 	}
 	if (do_screen_candidates) {
 		do_moduli_screen(argv[0], opts, nopts);
-		return 0;
+		goto done;
 	}
 
 	if (gen_all_hostkeys) {
 		do_gen_all_hostkeys(pw);
-		return (0);
+		goto done;
 	}
 
 	if (key_type_name == NULL)
@@ -3884,8 +3895,9 @@ main(int argc, char **argv)
 	if (sk_attestation_path != NULL)
 		save_attestation(attest, sk_attestation_path);
 
+ done:
 	sshbuf_free(attest);
 	sshkey_free(public);
-
-	exit(0);
+	pwfree(pw);
+	exit(ret);
 }

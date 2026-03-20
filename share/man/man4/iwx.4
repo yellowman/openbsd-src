@@ -1,4 +1,4 @@
-.\" $OpenBSD: iwx.4,v 1.21 2025/03/27 15:12:14 jmc Exp $
+.\" $OpenBSD: iwx.4,v 1.23 2026/03/03 17:46:54 kirill Exp $
 .\"
 .\" Copyright (c) 2020 Stefan Sperling <stsp@openbsd.org>
 .\"
@@ -14,7 +14,7 @@
 .\" ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
 .\" OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
 .\"
-.Dd $Mdocdate: March 27 2025 $
+.Dd $Mdocdate: March 3 2026 $
 .Dt IWX 4
 .Os
 .Sh NAME
@@ -70,7 +70,13 @@ The
 driver offloads both encryption and decryption of unicast data frames to the
 hardware for the CCMP cipher.
 .Pp
-In BSS mode the driver supports background scanning;
+The
+.Nm
+driver supports protected management frames (PMF) which prevents spoofing
+of management frames such as deauthentication, disassociation, and block-ack
+negotiation, on networks using WPA.
+.Pp
+In BSS mode the driver supports powersave mode and background scanning;
 see
 .Xr ifconfig 8 .
 .Pp

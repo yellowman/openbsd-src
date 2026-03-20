@@ -1,4 +1,4 @@
-/*	$OpenBSD: aspa.c,v 1.35 2025/07/20 12:21:28 tb Exp $ */
+/*	$OpenBSD: aspa.c,v 1.42 2026/02/08 12:35:07 job Exp $ */
 /*
  * Copyright (c) 2022 Job Snijders <job@fastly.com>
  * Copyright (c) 2022 Theo Buehler <tb@openbsd.org>
@@ -31,20 +31,13 @@
 #include <openssl/x509.h>
 
 #include "extern.h"
-
-extern ASN1_OBJECT	*aspa_oid;
+#include "rpki-asn1.h"
 
 /*
- * Types and templates for ASPA eContent draft-ietf-sidrops-aspa-profile-15
+ * ASPA eContent definition in draft-ietf-sidrops-aspa-profile-20, section 3.
  */
 
 ASN1_ITEM_EXP ASProviderAttestation_it;
-
-typedef struct {
-	ASN1_INTEGER		*version;
-	ASN1_INTEGER		*customerASID;
-	STACK_OF(ASN1_INTEGER)	*providers;
-} ASProviderAttestation;
 
 ASN1_SEQUENCE(ASProviderAttestation) = {
 	ASN1_EXP_OPT(ASProviderAttestation, version, ASN1_INTEGER, 0),
@@ -52,7 +45,6 @@ ASN1_SEQUENCE(ASProviderAttestation) = {
 	ASN1_SEQUENCE_OF(ASProviderAttestation, providers, ASN1_INTEGER),
 } ASN1_SEQUENCE_END(ASProviderAttestation);
 
-DECLARE_ASN1_FUNCTIONS(ASProviderAttestation);
 IMPLEMENT_ASN1_FUNCTIONS(ASProviderAttestation);
 
 /*
@@ -64,7 +56,6 @@ aspa_parse_providers(const char *fn, struct aspa *aspa,
     const STACK_OF(ASN1_INTEGER) *providers)
 {
 	const ASN1_INTEGER	*pa;
-	uint32_t		 provider;
 	size_t			 providersz, i;
 
 	if ((providersz = sk_ASN1_INTEGER_num(providers)) == 0) {
@@ -78,14 +69,14 @@ aspa_parse_providers(const char *fn, struct aspa *aspa,
 		return 0;
 	}
 
-	aspa->providers = calloc(providersz, sizeof(provider));
+	aspa->providers = calloc(providersz, sizeof(aspa->providers[0]));
 	if (aspa->providers == NULL)
 		err(1, NULL);
 
 	for (i = 0; i < providersz; i++) {
-		pa = sk_ASN1_INTEGER_value(providers, i);
+		uint32_t provider = 0;
 
-		memset(&provider, 0, sizeof(provider));
+		pa = sk_ASN1_INTEGER_value(providers, i);
 
 		if (!as_id_parse(pa, &provider)) {
 			warnx("%s: ASPA: malformed ProviderAS", fn);
@@ -111,6 +102,11 @@ aspa_parse_providers(const char *fn, struct aspa *aspa,
 		}
 
 		aspa->providers[aspa->num_providers++] = provider;
+	}
+
+	if (aspa->num_providers > 1 && aspa->providers[0] == 0) {
+		warnx("%s: ASPA: invalid ProviderASSet", fn);
+		return 0;
 	}
 
 	return 1;
@@ -303,10 +299,7 @@ aspa_insert_vaps(char *fn, struct vap_tree *tree, struct aspa *aspa,
 		err(1, NULL);
 	v->custasid = aspa->custasid;
 	v->talid = aspa->talid;
-	if (rp != NULL)
-		v->repoid = repo_id(rp);
-	else
-		v->repoid = 0;
+	v->repoid = repo_id(rp);
 	v->expires = aspa->expires;
 
 	if ((found = RB_INSERT(vap_tree, tree, v)) != NULL) {

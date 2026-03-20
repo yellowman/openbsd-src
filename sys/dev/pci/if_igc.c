@@ -1,4 +1,4 @@
-/*	$OpenBSD: if_igc.c,v 1.28 2025/06/24 11:00:27 stsp Exp $	*/
+/*	$OpenBSD: if_igc.c,v 1.31 2026/02/24 23:01:10 bluhm Exp $	*/
 /*-
  * SPDX-License-Identifier: BSD-2-Clause
  *
@@ -81,6 +81,7 @@ const struct pci_matchid igc_devices[] = {
 	{ PCI_VENDOR_INTEL, PCI_PRODUCT_INTEL_I226_BLANK_NVM },
 	{ PCI_VENDOR_INTEL, PCI_PRODUCT_INTEL_I226_IT },
 	{ PCI_VENDOR_INTEL, PCI_PRODUCT_INTEL_I226_LM },
+	{ PCI_VENDOR_INTEL, PCI_PRODUCT_INTEL_I226_LMVP },
 	{ PCI_VENDOR_INTEL, PCI_PRODUCT_INTEL_I226_K },
 	{ PCI_VENDOR_INTEL, PCI_PRODUCT_INTEL_I226_V }
 };
@@ -724,8 +725,8 @@ igc_setup_msix(struct igc_softc *sc)
 	/* Give one vector to events. */
 	nmsix--;
 
-	sc->sc_intrmap = intrmap_create(&sc->sc_dev, nmsix, IGC_MAX_VECTORS,
-	    INTRMAP_POWEROF2);
+	sc->sc_intrmap = intrmap_create(&sc->sc_dev, nmsix,
+	    MIN(IGC_MAX_VECTORS, IF_MAX_VECTORS), INTRMAP_POWEROF2);
 	sc->sc_nqueues = intrmap_count(sc->sc_intrmap);
 }
 
@@ -736,11 +737,11 @@ igc_dma_malloc(struct igc_softc *sc, bus_size_t size, struct igc_dma_alloc *dma)
 
 	dma->dma_tag = os->os_pa.pa_dmat;
 
-	if (bus_dmamap_create(dma->dma_tag, size, 1, size, 0, BUS_DMA_NOWAIT,
-	    &dma->dma_map))
+	if (bus_dmamap_create(dma->dma_tag, size, 1, size, 0,
+	    BUS_DMA_NOWAIT | BUS_DMA_64BIT, &dma->dma_map))
 		return 1;
 	if (bus_dmamem_alloc(dma->dma_tag, size, PAGE_SIZE, 0, &dma->dma_seg,
-	    1, &dma->dma_nseg, BUS_DMA_NOWAIT))
+	    1, &dma->dma_nseg, BUS_DMA_NOWAIT | BUS_DMA_64BIT))
 		goto destroy;
 	if (bus_dmamem_map(dma->dma_tag, &dma->dma_seg, dma->dma_nseg, size,
 	    &dma->dma_vaddr, BUS_DMA_NOWAIT | BUS_DMA_COHERENT))
@@ -1854,10 +1855,11 @@ igc_allocate_transmit_buffers(struct igc_txring *txr)
 	for (i = 0; i < sc->num_tx_desc; i++) {
 		txbuf = &txr->tx_buffers[i];
 		error = bus_dmamap_create(txr->txdma.dma_tag, IGC_TSO_SIZE,
-		    IGC_MAX_SCATTER, PAGE_SIZE, 0, BUS_DMA_NOWAIT, &txbuf->map);
+		    IGC_MAX_SCATTER, PAGE_SIZE, 0,
+		    BUS_DMA_NOWAIT | BUS_DMA_64BIT, &txbuf->map);
 		if (error != 0) {
-			printf("%s: Unable to create TX DMA map\n",
-			    DEVNAME(sc));
+			printf("%s: Unable to create TX DMA map, error %d\n",
+			    DEVNAME(sc), error);
 			goto fail;
 		}
 	}
@@ -2160,10 +2162,10 @@ igc_allocate_receive_buffers(struct igc_rxring *rxr)
 	for (i = 0; i < sc->num_rx_desc; i++, rxbuf++) {
 		error = bus_dmamap_create(rxr->rxdma.dma_tag,
 		    sc->rx_mbuf_sz, 1, sc->rx_mbuf_sz, 0,
-		    BUS_DMA_NOWAIT, &rxbuf->map);
+		    BUS_DMA_NOWAIT | BUS_DMA_64BIT, &rxbuf->map);
 		if (error) {
-			printf("%s: Unable to create RX DMA map\n",
-			    DEVNAME(sc));
+			printf("%s: Unable to create RX DMA map, error %d\n",
+			    DEVNAME(sc), error);
 			goto fail;
 		}
 	}

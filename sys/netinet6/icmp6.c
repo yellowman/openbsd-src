@@ -1,4 +1,4 @@
-/*	$OpenBSD: icmp6.c,v 1.270 2025/07/18 08:39:14 mvs Exp $	*/
+/*	$OpenBSD: icmp6.c,v 1.281 2025/11/12 19:11:10 bluhm Exp $	*/
 /*	$KAME: icmp6.c,v 1.217 2001/06/20 15:03:29 jinmei Exp $	*/
 
 /*
@@ -97,6 +97,11 @@
 #include <net/pfvar.h>
 #endif
 
+/*
+ * Locks used to protect data:
+ *	a	atomic
+ */
+
 struct cpumem *icmp6counters;
 
 extern int icmp6errppslim;
@@ -117,8 +122,8 @@ LIST_HEAD(, icmp6_mtudisc_callback) icmp6_mtudisc_callbacks =
 struct rttimer_queue icmp6_mtudisc_timeout_q;
 
 /* XXX do these values make any sense? */
-static int icmp6_mtudisc_hiwat = 1280;
-static int icmp6_mtudisc_lowat = 256;
+static int icmp6_mtudisc_hiwat = 1280;	/* [a] */
+static int icmp6_mtudisc_lowat = 256;	/* [a] */
 
 /*
  * keep track of # of redirect routes.
@@ -962,16 +967,15 @@ icmp6_mtudisc_update(struct ip6ctlparam *ip6cp, int validated)
 	 */
 	rtcount = rt_timer_queue_count(&icmp6_mtudisc_timeout_q);
 	if (validated) {
-		if (0 <= icmp6_mtudisc_hiwat && rtcount > icmp6_mtudisc_hiwat)
+		if (rtcount > atomic_load_int(&icmp6_mtudisc_hiwat))
 			return;
-		else if (0 <= icmp6_mtudisc_lowat &&
-		    rtcount > icmp6_mtudisc_lowat) {
+		else if (rtcount > atomic_load_int(&icmp6_mtudisc_lowat)) {
 			/*
 			 * XXX nuke a victim, install the new one.
 			 */
 		}
 	} else {
-		if (0 <= icmp6_mtudisc_lowat && rtcount > icmp6_mtudisc_lowat)
+		if (rtcount > atomic_load_int(&icmp6_mtudisc_lowat))
 			return;
 	}
 
@@ -1178,7 +1182,7 @@ icmp6_reflect(struct mbuf **mp, size_t off, struct sockaddr *sa)
 void
 icmp6_fasttimo(void)
 {
-	mld6_fasttimeo();
+	mld6_fasttimo();
 }
 
 void
@@ -1300,7 +1304,7 @@ icmp6_redirect_input(struct mbuf *m, int off)
 		 * (there will be additional hops, though).
 		 */
 		rtcount = rt_timer_queue_count(&icmp6_redirect_timeout_q);
-		if (0 <= ip6_maxdynroutes && rtcount >= ip6_maxdynroutes)
+		if (rtcount >= atomic_load_int(&ip6_maxdynroutes))
 			goto freeit;
 
 		bzero(&sdst, sizeof(sdst));
@@ -1689,7 +1693,7 @@ icmp6_ratelimit(const struct in6_addr *dst, const int type, const int code)
 {
 	/* PPS limit */
 	if (!ppsratecheck(&icmp6errppslim_last, &icmp6errpps_count,
-	    icmp6errppslim))
+	    atomic_load_int(&icmp6errppslim)))
 		return 1;	/* The packet is subject to rate limit */
 	return 0;		/* okay to send */
 }
@@ -1776,10 +1780,9 @@ const struct sysctl_bounded_args icmpv6ctl_vars[] = {
 	{ ICMPV6CTL_ND6_DELAY, &nd6_delay, 0, INT_MAX },
 	{ ICMPV6CTL_ND6_UMAXTRIES, &nd6_umaxtries, 0, INT_MAX },
 	{ ICMPV6CTL_ND6_MMAXTRIES, &nd6_mmaxtries, 0, INT_MAX },
+	{ ICMPV6CTL_MTUDISC_HIWAT, &icmp6_mtudisc_hiwat, 0, INT_MAX },
+	{ ICMPV6CTL_MTUDISC_LOWAT, &icmp6_mtudisc_lowat, 0, INT_MAX },
 	{ ICMPV6CTL_ERRPPSLIMIT, &icmp6errppslim, -1, 1000 },
-	{ ICMPV6CTL_ND6_MAXNUDHINT, &nd6_maxnudhint, 0, INT_MAX },
-	{ ICMPV6CTL_MTUDISC_HIWAT, &icmp6_mtudisc_hiwat, -1, INT_MAX },
-	{ ICMPV6CTL_MTUDISC_LOWAT, &icmp6_mtudisc_lowat, -1, INT_MAX },
 };
 
 int
@@ -1810,15 +1813,22 @@ icmp6_sysctl(int *name, u_int namelen, void *oldp, size_t *oldlenp,
 		return (ENOTDIR);
 
 	switch (name[0]) {
-	case ICMPV6CTL_REDIRTIMEOUT:
-		NET_LOCK();
-		error = sysctl_int_bounded(oldp, oldlenp, newp, newlen,
-		    &icmp6_redirtimeout, 0, INT_MAX);
-		rt_timer_queue_change(&icmp6_redirect_timeout_q,
-		    icmp6_redirtimeout);
-		NET_UNLOCK();
-		break;
+	case ICMPV6CTL_REDIRTIMEOUT: {
+		int oldval, newval, error;
 
+		oldval = newval = atomic_load_int(&icmp6_redirtimeout);
+		error = sysctl_int_bounded(oldp, oldlenp, newp, newlen,
+		    &newval, 0, INT_MAX);
+		if (error == 0 && oldval != newval) {
+			rw_enter_write(&sysctl_lock);
+			atomic_store_int(&icmp6_redirtimeout, newval);
+			rt_timer_queue_change(&icmp6_redirect_timeout_q,
+			    newval);
+			rw_exit_write(&sysctl_lock);
+		}
+
+		return (error);
+	}
 	case ICMPV6CTL_STATS:
 		error = icmp6_sysctl_icmp6stat(oldp, oldlenp, newp);
 		break;
@@ -1829,11 +1839,9 @@ icmp6_sysctl(int *name, u_int namelen, void *oldp, size_t *oldlenp,
 		break;
 
 	default:
-		NET_LOCK();
 		error = sysctl_bounded_arr(icmpv6ctl_vars,
 		    nitems(icmpv6ctl_vars), name, namelen, oldp, oldlenp, newp,
 		    newlen);
-		NET_UNLOCK();
 		break;
 	}
 

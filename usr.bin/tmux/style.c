@@ -1,4 +1,4 @@
-/* $OpenBSD: style.c,v 1.38 2025/06/20 14:54:33 nicm Exp $ */
+/* $OpenBSD: style.c,v 1.40 2026/03/12 07:25:13 nicm Exp $ */
 
 /*
  * Copyright (c) 2007 Nicholas Marriott <nicholas.marriott@gmail.com>
@@ -39,7 +39,7 @@ static struct style style_default = {
 
 	STYLE_RANGE_NONE, 0, "",
 
-	STYLE_WIDTH_DEFAULT, STYLE_PAD_DEFAULT,
+	STYLE_WIDTH_DEFAULT, 0, STYLE_PAD_DEFAULT,
 
 	STYLE_DEFAULT_BASE
 };
@@ -218,20 +218,33 @@ style_parse(struct style *sy, const struct grid_cell *base, const char *in)
 			sy->gc.attr = 0;
 		else if (end > 2 && strncasecmp(tmp, "no", 2) == 0) {
 			if (strcmp(tmp + 2, "attr") == 0)
-				value = 0xffff & ~GRID_ATTR_CHARSET;
-			else if ((value = attributes_fromstring(tmp + 2)) == -1)
-				goto error;
-			sy->gc.attr &= ~value;
+				sy->gc.attr |= GRID_ATTR_NOATTR;
+			else {
+				value = attributes_fromstring(tmp + 2);
+				if (value == -1)
+					goto error;
+				sy->gc.attr &= ~value;
+			}
 		} else if (end > 6 && strncasecmp(tmp, "width=", 6) == 0) {
-                        n = strtonum(tmp + 6, 0, UINT_MAX, &errstr);
-                        if (errstr != NULL)
-                                goto error;
-                        sy->width = (int)n;
+			if (end > 7 && tmp[end - 1] == '%') {
+				tmp[end - 1] = '\0';
+				n = strtonum(tmp + 6, 0, 100, &errstr);
+				if (errstr != NULL)
+					goto error;
+				sy->width = (int)n;
+				sy->width_percentage = 1;
+			} else {
+				n = strtonum(tmp + 6, 0, UINT_MAX, &errstr);
+				if (errstr != NULL)
+					goto error;
+				sy->width = (int)n;
+				sy->width_percentage = 0;
+			}
 		} else if (end > 4 && strncasecmp(tmp, "pad=", 4) == 0) {
-                        n = strtonum(tmp + 4, 0, UINT_MAX, &errstr);
-                        if (errstr != NULL)
-                                goto error;
-                        sy->pad = (int)n;
+			n = strtonum(tmp + 4, 0, UINT_MAX, &errstr);
+			if (errstr != NULL)
+				goto error;
+			sy->pad = (int)n;
 		} else {
 			if ((value = attributes_fromstring(tmp)) == -1)
 				goto error;
@@ -340,17 +353,21 @@ style_tostring(struct style *sy)
 		comma = ",";
 	}
 	if (gc->attr != 0) {
-		xsnprintf(s + off, sizeof s - off, "%s%s", comma,
+		off += xsnprintf(s + off, sizeof s - off, "%s%s", comma,
 		    attributes_tostring(gc->attr));
 		comma = ",";
 	}
-        if (sy->width >= 0) {
-                xsnprintf(s + off, sizeof s - off, "%swidth=%u", comma,
-		    sy->width);
+	if (sy->width >= 0) {
+		if (sy->width_percentage)
+			off += xsnprintf(s + off, sizeof s - off,
+			    "%swidth=%u%%", comma, sy->width);
+		else
+			off += xsnprintf(s + off, sizeof s - off,
+			    "%swidth=%u", comma, sy->width);
 		comma = ",";
 	}
-        if (sy->pad >= 0) {
-                xsnprintf(s + off, sizeof s - off, "%spad=%u", comma,
+	if (sy->pad >= 0) {
+		xsnprintf(s + off, sizeof s - off, "%spad=%u", comma,
 		    sy->pad);
 		comma = ",";
 	}

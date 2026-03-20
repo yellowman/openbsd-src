@@ -1,4 +1,4 @@
-/* $OpenBSD: netcat.c,v 1.234 2025/06/24 13:37:11 tb Exp $ */
+/* $OpenBSD: netcat.c,v 1.238 2026/02/23 16:47:07 deraadt Exp $ */
 /*
  * Copyright (c) 2001 Eric Jackson <ericj@monkey.org>
  * Copyright (c) 2015 Bob Beck.  All rights reserved.
@@ -381,6 +381,8 @@ main(int argc, char *argv[])
 		 */
 	} else {
 		if (family == AF_UNIX) {
+			if (unveil("/tmp", "rwc") == -1)
+				err(1, "unveil /tmp");
 			if (unveil(host, "rwc") == -1)
 				err(1, "unveil %s", host);
 			if (uflag && !kflag) {
@@ -400,7 +402,7 @@ main(int argc, char *argv[])
 	}
 
 	if (family == AF_UNIX) {
-		if (pledge("stdio rpath wpath cpath tmppath unix", NULL) == -1)
+		if (pledge("stdio rpath wpath cpath unix", NULL) == -1)
 			err(1, "pledge");
 	} else if (Fflag && Pflag) {
 		if (pledge("stdio inet dns sendfd tty", NULL) == -1)
@@ -1542,7 +1544,12 @@ connection_info(const char *host, const char *port, const char *proto,
 
 	/* Look up service name unless -n. */
 	if (!nflag) {
-		sv = getservbyport(ntohs(atoi(port)), proto);
+		const char *errstr;
+
+		int p = strtonum(port, 1, PORT_MAX, &errstr);
+		if (errstr)
+			errx(1, "port number %s: %s", errstr, port);
+		sv = getservbyport(htons(p), proto);
 		if (sv != NULL)
 			service = sv->s_name;
 	}
@@ -1650,6 +1657,7 @@ process_tos_opt(char *s, int *val)
 		{ "netcontrol",		IPTOS_PREC_NETCONTROL },
 		{ "reliability",	IPTOS_RELIABILITY },
 		{ "throughput",		IPTOS_THROUGHPUT },
+		{ "va",			IPTOS_DSCP_VA },
 		{ NULL,			-1 },
 	};
 

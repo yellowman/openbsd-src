@@ -1,4 +1,4 @@
-/*	$OpenBSD: x509.c,v 1.116 2025/07/21 11:00:49 tb Exp $ */
+/*	$OpenBSD: x509.c,v 1.128 2026/02/11 14:41:34 tb Exp $ */
 /*
  * Copyright (c) 2022 Theo Buehler <tb@openbsd.org>
  * Copyright (c) 2021 Claudio Jeker <claudio@openbsd.org>
@@ -28,6 +28,8 @@
 
 #include "extern.h"
 
+#define GENTIME_LENGTH 15
+
 ASN1_OBJECT	*certpol_oid;	/* id-cp-ipAddr-asNumber cert policy */
 ASN1_OBJECT	*caissuers_oid;	/* 1.3.6.1.5.5.7.48.2 (caIssuers) */
 ASN1_OBJECT	*carepo_oid;	/* 1.3.6.1.5.5.7.48.5 (caRepository) */
@@ -36,7 +38,6 @@ ASN1_OBJECT	*signedobj_oid;	/* 1.3.6.1.5.5.7.48.11 (signedObject) */
 ASN1_OBJECT	*notify_oid;	/* 1.3.6.1.5.5.7.48.13 (rpkiNotify) */
 ASN1_OBJECT	*roa_oid;	/* id-ct-routeOriginAuthz CMS content type */
 ASN1_OBJECT	*mft_oid;	/* id-ct-rpkiManifest CMS content type */
-ASN1_OBJECT	*gbr_oid;	/* id-ct-rpkiGhostbusters CMS content type */
 ASN1_OBJECT	*bgpsec_oid;	/* id-kp-bgpsec-router Key Purpose */
 ASN1_OBJECT	*cnt_type_oid;	/* pkcs-9 id-contentType */
 ASN1_OBJECT	*msg_dgst_oid;	/* pkcs-9 id-messageDigest */
@@ -44,8 +45,8 @@ ASN1_OBJECT	*sign_time_oid;	/* pkcs-9 id-signingTime */
 ASN1_OBJECT	*rsc_oid;	/* id-ct-signedChecklist */
 ASN1_OBJECT	*aspa_oid;	/* id-ct-ASPA */
 ASN1_OBJECT	*tak_oid;	/* id-ct-SignedTAL */
-ASN1_OBJECT	*geofeed_oid;	/* id-ct-geofeedCSVwithCRLF */
 ASN1_OBJECT	*spl_oid;	/* id-ct-signedPrefixList */
+ASN1_OBJECT	*ccr_oid;	/* CanonicalCacheRepresentation PEN OID */
 
 static const struct {
 	const char	 *oid;
@@ -84,10 +85,6 @@ static const struct {
 		.ptr = &mft_oid,
 	},
 	{
-		.oid = "1.2.840.113549.1.9.16.1.35",
-		.ptr = &gbr_oid,
-	},
-	{
 		.oid = "1.3.6.1.5.5.7.3.30",
 		.ptr = &bgpsec_oid,
 	},
@@ -104,10 +101,6 @@ static const struct {
 		.ptr = &sign_time_oid,
 	},
 	{
-		.oid = "1.2.840.113549.1.9.16.1.47",
-		.ptr = &geofeed_oid,
-	},
-	{
 		.oid = "1.2.840.113549.1.9.16.1.48",
 		.ptr = &rsc_oid,
 	},
@@ -122,6 +115,10 @@ static const struct {
 	{
 		.oid = "1.2.840.113549.1.9.16.1.51",
 		.ptr = &spl_oid,
+	},
+	{
+		.oid = "1.2.840.113549.1.9.16.1.54",
+		.ptr = &ccr_oid,
 	},
 };
 
@@ -144,24 +141,58 @@ x509_init_oid(void)
 char *
 x509_pubkey_get_ski(X509_PUBKEY *pubkey, const char *fn)
 {
-	ASN1_OBJECT		*obj;
+	X509_ALGOR		*alg = NULL;
+	const ASN1_OBJECT	*aobj = NULL;
+	int			 ptype = 0;
+	const void		*pval = NULL;
 	const unsigned char	*der;
-	int			 der_len, nid;
+	int			 der_len;
 	unsigned char		 md[EVP_MAX_MD_SIZE];
 	unsigned int		 md_len = EVP_MAX_MD_SIZE;
+	unsigned char		 buf[80];
 
-	if (!X509_PUBKEY_get0_param(&obj, &der, &der_len, NULL, pubkey)) {
+	/* XXX - dedup with cert_check_spki(), add more validity checks? */
+
+	if (!X509_PUBKEY_get0_param(NULL, &der, &der_len, &alg, pubkey)) {
 		warnx("%s: X509_PUBKEY_get0_param failed", fn);
 		return NULL;
 	}
+	X509_ALGOR_get0(&aobj, &ptype, &pval, alg);
 
-	/* XXX - should allow other keys as well. */
-	if ((nid = OBJ_obj2nid(obj)) != NID_rsaEncryption) {
-		warnx("%s: RFC 7935: wrong signature algorithm %s, want %s",
-		    fn, nid2str(nid), LN_rsaEncryption);
+	if (OBJ_obj2nid(aobj) == NID_rsaEncryption) {
+		if (ptype != V_ASN1_NULL || pval != NULL) {
+			warnx("%s: RFC 4055, 1.2, rsaEncryption "
+			    "parameters not NULL", fn);
+			return NULL;
+		}
+
+		goto done;
+	}
+
+	if (!experimental) {
+		warnx("%s: RFC 7935, 3.1 SPKI not RSAPublicKey", fn);
 		return NULL;
 	}
 
+	if (OBJ_obj2nid(aobj) == NID_X9_62_id_ecPublicKey) {
+		if (ptype != V_ASN1_OBJECT) {
+			warnx("%s: RFC 5480, 2.1.1, ecPublicKey "
+			    "parameters not namedCurve", fn);
+			return NULL;
+		}
+		if (OBJ_obj2nid(pval) != NID_X9_62_prime256v1) {
+			warnx("%s: RFC 8608, 3.1, named curve not P-256", fn);
+			return NULL;
+		}
+
+		goto done;
+	}
+
+	OBJ_obj2txt(buf, sizeof(buf), aobj, 0);
+	warnx("%s: unsupported public key type %s", fn, buf);
+	return NULL;
+
+ done:
 	if (!EVP_Digest(der, der_len, md, &md_len, EVP_sha1(), NULL)) {
 		warnx("%s: EVP_Digest failed", fn);
 		return NULL;
@@ -272,6 +303,21 @@ x509_get_time(const ASN1_TIME *at, time_t *t)
 	return 1;
 }
 
+int
+x509_get_generalized_time(const char *fn, const char *descr,
+    const ASN1_TIME *at, time_t *t)
+{
+	if (ASN1_STRING_length(at) != GENTIME_LENGTH) {
+		warnx("%s: %s time format invalid", fn, descr);
+		return 0;
+	}
+	if (!x509_get_time(at, t)) {
+		warnx("%s: parsing %s failed", fn, descr);
+		return 0;
+	}
+	return 1;
+}
+
 /*
  * Extract and validate an accessLocation, RFC 6487, 4.8 and RFC 8182, 3.2.
  * Returns 0 on failure and 1 on success.
@@ -280,7 +326,8 @@ int
 x509_location(const char *fn, const char *descr, GENERAL_NAME *location,
     char **out)
 {
-	ASN1_IA5STRING	*uri;
+	const unsigned char *data;
+	int length;
 
 	assert(*out == NULL);
 
@@ -289,15 +336,67 @@ x509_location(const char *fn, const char *descr, GENERAL_NAME *location,
 		return 0;
 	}
 
-	uri = location->d.uniformResourceIdentifier;
+	data = ASN1_STRING_get0_data(location->d.uniformResourceIdentifier);
+	length = ASN1_STRING_length(location->d.uniformResourceIdentifier);
 
-	if (!valid_uri(uri->data, uri->length, NULL)) {
+	if (!valid_uri(data, length, NULL)) {
 		warnx("%s: RFC 6487 section 4.8: %s bad location", fn, descr);
 		return 0;
 	}
 
-	if ((*out = strndup(uri->data, uri->length)) == NULL)
+	if ((*out = strndup(data, length)) == NULL)
 		err(1, NULL);
+
+	return 1;
+}
+
+static int
+valid_printable_octet(const uint8_t u8)
+{
+	/*
+	 * X.680, 41.4, Table 10 lists the allowed characters in this order.
+	 */
+
+	if ('A' <= u8 && u8 <= 'Z')
+		return 1;
+	if ('a' <= u8 && u8 <= 'z')
+		return 1;
+	if ('0' <= u8 && u8 <= '9')
+		return 1;
+
+	return u8 == ' ' || u8 == '\'' || u8 == '(' || u8 == ')' || u8 == '+' ||
+	    u8 == ',' || u8 == '-' || u8 == '.' || u8 == '/' || u8 == ':' ||
+	    u8 == '=' || u8 == '?';
+}
+
+static int
+valid_printable_string(const char *fn, const char *descr, const ASN1_STRING *as)
+{
+	const unsigned char *data;
+	int i, length;
+
+	/*
+	 * This warning should be an error by default (not gated behind -vv).
+	 * https://lists.afrinic.net/pipermail/dbwg/2023-March/000436.html
+	 * https://lists.afrinic.net/pipermail/dbwg/2025-November/000546.html
+	 */
+	if (verbose > 1 && ASN1_STRING_type(as) != V_ASN1_PRINTABLESTRING) {
+		warnx("%s: RFC 6487 section 4.5: %s commonName is"
+		    " not PrintableString", fn, descr);
+#if 0
+		return 0;
+#endif
+	}
+
+	data = ASN1_STRING_get0_data(as);
+	length = ASN1_STRING_length(as);
+	for (i = 0; i < length; i++) {
+		if (!valid_printable_octet(data[i])) {
+			warnx("%s: invalid %s: PrintableString contains 0x%02x",
+			    fn, descr, data[i]);
+			return 0;
+		}
+	}
 
 	return 1;
 }
@@ -306,8 +405,8 @@ x509_location(const char *fn, const char *descr, GENERAL_NAME *location,
  * Check that subject or issuer only contain commonName and serialNumber.
  * Return 0 on failure.
  */
-int
-x509_valid_name(const char *fn, const char *descr, const X509_NAME *xn)
+static int
+x509_valid_name_internal(const char *fn, const char *descr, const X509_NAME *xn)
 {
 	const X509_NAME_ENTRY *ne;
 	const ASN1_OBJECT *ao;
@@ -338,21 +437,14 @@ x509_valid_name(const char *fn, const char *descr, const X509_NAME *xn)
 				    fn);
 				return 0;
 			}
-/*
- * The following check can be enabled after AFRINIC re-issues CA certs.
- * https://lists.afrinic.net/pipermail/dbwg/2023-March/000436.html
- */
-#if 0
 			/*
 			 * XXX - For some reason RFC 8209, section 3.1.1 decided
-			 * to allow UTF8String for BGPsec Router Certificates.
+			 * to allow UTF8String for the subject of BGPsec Router
+			 * Certificates, although RECOMMENDED contents fit in
+			 * a PrintableString.
 			 */
-			if (ASN1_STRING_type(as) != V_ASN1_PRINTABLESTRING) {
-				warnx("%s: RFC 6487 section 4.5: commonName is"
-				    " not PrintableString", fn);
+			if (!valid_printable_string(fn, descr, as))
 				return 0;
-			}
-#endif
 			break;
 		case NID_serialNumber:
 			if (sn++ > 0) {
@@ -378,6 +470,18 @@ x509_valid_name(const char *fn, const char *descr, const X509_NAME *xn)
 	}
 
 	return 1;
+}
+
+int
+x509_valid_subject_name(const char *fn, const X509_NAME *xn)
+{
+	return x509_valid_name_internal(fn, "subject", xn);
+}
+
+int
+x509_valid_issuer_name(const char *fn, const X509_NAME *xn)
+{
+	return x509_valid_name_internal(fn, "issuer", xn);
 }
 
 /*

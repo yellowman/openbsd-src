@@ -1,4 +1,4 @@
-/*	$OpenBSD: output.c,v 1.61 2025/03/10 14:08:25 claudio Exp $ */
+/*	$OpenBSD: output.c,v 1.73 2026/03/17 09:30:11 claudio Exp $ */
 
 /*
  * Copyright (c) 2003 Henning Brauer <henning@openbsd.org>
@@ -227,6 +227,7 @@ show_neighbor_msgstats(struct peer *p)
 	    p->stats.msg_rcvd_open + p->stats.msg_rcvd_notification +
 	    p->stats.msg_rcvd_update + p->stats.msg_rcvd_keepalive +
 	    p->stats.msg_rcvd_rrefresh);
+
 	printf("  Update statistics:\n");
 	printf("  %-15s %-10s %-10s %-10s\n", "", "Sent", "Received",
 	    "Pending");
@@ -247,6 +248,13 @@ show_neighbor_msgstats(struct peer *p)
 	    p->stats.refresh_sent_borr, p->stats.refresh_rcvd_borr);
 	printf("  %-15s %10llu %10llu\n", "End-of-RR",
 	    p->stats.refresh_sent_eorr, p->stats.refresh_rcvd_eorr);
+
+	printf("  Queue statistics:\n");
+	printf("  %-15s %-10s %-10s\n", "", "Count", "Size");
+	printf("  %-15s %10llu %10llu\n", "ibuf queue",
+	    p->stats.ibufq_msg_count, p->stats.ibufq_payload_size);
+	printf("  %-15s %10llu %-10s\n", "rib queue",
+	    p->stats.rib_entry_count, "-");
 }
 
 static void
@@ -1069,6 +1077,15 @@ show_rib_mem(struct rde_memstats *stats)
 	printf("%10lld prefix entries using %s of memory\n",
 	    stats->prefix_cnt, fmt_mem(stats->prefix_cnt *
 	    sizeof(struct prefix)));
+	printf("%10lld adjout_prefix entries using %s out of",
+	    stats->adjout_prefix_cnt,
+	    fmt_mem(stats->adjout_prefix_cnt * sizeof(struct adjout_prefix)));
+	printf(" %s memory\n", fmt_mem(stats->adjout_prefix_size));
+	printf("%10lld adjout attribute entries using %s of memory\n",
+	    stats->adjout_attr_cnt, fmt_mem(stats->adjout_attr_cnt *
+	    sizeof(struct adjout_attr)));
+	printf("\t   and holding %lld references\n",
+	    stats->adjout_attr_refs);
 	printf("%10lld BGP path attribute entries using %s of memory\n",
 	    stats->path_cnt, fmt_mem(stats->path_cnt *
 	    sizeof(struct rde_aspath)));
@@ -1089,19 +1106,63 @@ show_rib_mem(struct rde_memstats *stats)
 	    stats->attr_refs);
 	printf("%10lld BGP attributes using %s of memory\n",
 	    stats->attr_dcnt, fmt_mem(stats->attr_data));
+	printf("%10lld pending attribute entries using %s of memory\n",
+	    stats->pend_attr_cnt, fmt_mem(stats->pend_attr_cnt *
+	    sizeof(struct pend_attr)));
+	printf("%10lld pending prefix entries using %s of memory\n",
+	    stats->pend_prefix_cnt, fmt_mem(stats->pend_prefix_cnt *
+	    sizeof(struct pend_prefix)));
+	printf("%10lld extended bitmaps using %s of memory\n",
+	    stats->bitmap_cnt, fmt_mem(stats->bitmap_size));
+	printf("%10lld hash tables using %s of memory\n",
+	    stats->hash_cnt, fmt_mem(stats->hash_size));
+	printf("\t   and holding %lld references\n",
+	    stats->hash_refs);
+	printf("%10lld filters using %s of memory\n",
+	    stats->filter_cnt, fmt_mem(stats->filter_size));
+	printf("\t   and holding %lld references\n",
+	    stats->filter_refs);
+	printf("%10lld filter-sets using %s of memory\n",
+	    stats->filter_set_cnt, fmt_mem(stats->filter_set_size));
+	printf("\t   and holding %lld references\n",
+	    stats->filter_set_refs);
 	printf("%10lld as-set elements in %lld tables using "
 	    "%s of memory\n", stats->aset_nmemb, stats->aset_cnt,
 	    fmt_mem(stats->aset_size));
 	printf("%10lld prefix-set elements using %s of memory\n",
 	    stats->pset_cnt, fmt_mem(stats->pset_size));
+	printf("%10lld aspa-set elements using %s of memory\n",
+	    stats->aspa_cnt, fmt_mem(stats->aspa_size));
 	printf("RIB using %s of memory\n", fmt_mem(pts +
 	    stats->prefix_cnt * sizeof(struct prefix) +
+	    stats->adjout_prefix_cnt * sizeof(struct adjout_prefix) +
+	    stats->adjout_attr_cnt * sizeof(struct adjout_attr) +
+	    stats->pend_prefix_cnt * sizeof(struct pend_prefix) +
+	    stats->pend_attr_cnt * sizeof(struct pend_attr) +
 	    stats->rib_cnt * sizeof(struct rib_entry) +
 	    stats->path_cnt * sizeof(struct rde_aspath) +
 	    stats->aspath_size + stats->attr_cnt * sizeof(struct attr) +
-	    stats->attr_data));
-	printf("Sets using %s of memory\n", fmt_mem(stats->aset_size +
-	    stats->pset_size));
+	    stats->attr_data + stats->bitmap_size + stats->hash_size));
+	printf("Sets and filters using %s of memory\n",
+	    fmt_mem(stats->aset_size + stats->pset_size + stats->aspa_size +
+	    stats->filter_set_size));
+
+	printf("\nRDE queue statistics\n");
+	printf("%10lld messages queued holding %s of data\n",
+	    stats->rde_ibufq_msg_count, fmt_mem(stats->rde_ibufq_payload_size));
+	printf("%10lld rib entries queued\n", stats->rde_rib_entry_count);
+
+	printf("\nRDE timing statistics\n");
+	printf("%10lld usec spent in the event loop for %llu rounds\n",
+	    stats->rde_event_loop_usec, stats->rde_event_loop_count);
+	printf("%10lld usec spent on io\n", stats->rde_event_io_usec);
+	printf("%10lld usec spent on peers\n", stats->rde_event_peer_usec);
+	printf("%10lld usec spent on adj-out\n", stats->rde_event_adjout_usec);
+	printf("%10lld usec spent on rib dumps\n",
+	    stats->rde_event_ribdump_usec);
+	printf("%10lld usec spent on nexthops\n",
+	    stats->rde_event_nexthop_usec);
+	printf("%10lld usec spent on updates\n", stats->rde_event_update_usec);
 }
 
 static void

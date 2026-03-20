@@ -1,4 +1,4 @@
-# $OpenBSD: Makefile,v 1.111 2023/09/01 14:29:11 nicm Exp $
+# $OpenBSD: Makefile,v 1.114 2026/02/24 08:20:52 nicm Exp $
 
 PROG=	tmux
 SRCS=	alerts.c \
@@ -28,6 +28,7 @@ SRCS=	alerts.c \
 	cmd-kill-window.c \
 	cmd-list-buffers.c \
 	cmd-list-clients.c \
+	cmd-list-commands.c \
 	cmd-list-keys.c \
 	cmd-list-panes.c \
 	cmd-list-sessions.c \
@@ -114,8 +115,10 @@ SRCS=	alerts.c \
 	spawn.c \
 	status.c \
 	style.c \
+	sort.c \
 	tmux.c \
 	tty-acs.c \
+	tty-draw.c \
 	tty-features.c \
 	tty-keys.c \
 	tty-term.c \

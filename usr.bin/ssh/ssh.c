@@ -1,4 +1,4 @@
-/* $OpenBSD: ssh.c,v 1.614 2025/06/19 05:49:05 djm Exp $ */
+/* $OpenBSD: ssh.c,v 1.628 2026/03/05 05:40:36 djm Exp $ */
 /*
  * Author: Tatu Ylonen <ylo@cs.hut.fi>
  * Copyright (c) 1995 Tatu Ylonen <ylo@cs.hut.fi>, Espoo, Finland
@@ -41,12 +41,8 @@
  */
 
 #include <sys/types.h>
-#include <sys/ioctl.h>
-#include <sys/queue.h>
-#include <sys/resource.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
-#include <sys/time.h>
 #include <sys/wait.h>
 #include <sys/utsname.h>
 
@@ -57,11 +53,11 @@
 #include <paths.h>
 #include <pwd.h>
 #include <signal.h>
+#include <stdarg.h>
 #include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <stdarg.h>
 #include <unistd.h>
 #include <limits.h>
 #include <locale.h>
@@ -74,7 +70,6 @@
 #include "xmalloc.h"
 #include "ssh.h"
 #include "ssh2.h"
-#include "canohost.h"
 #include "compat.h"
 #include "cipher.h"
 #include "packet.h"
@@ -84,7 +79,6 @@
 #include "authfd.h"
 #include "authfile.h"
 #include "pathnames.h"
-#include "dispatch.h"
 #include "clientloop.h"
 #include "log.h"
 #include "misc.h"
@@ -92,12 +86,9 @@
 #include "sshconnect.h"
 #include "kex.h"
 #include "mac.h"
-#include "sshpty.h"
 #include "match.h"
-#include "msg.h"
 #include "version.h"
 #include "ssherr.h"
-#include "myproposal.h"
 
 #ifdef ENABLE_PKCS11
 #include "ssh-pkcs11.h"
@@ -652,6 +643,8 @@ valid_ruser(const char *s)
 	if (*s == '-')
 		return 0;
 	for (i = 0; s[i] != 0; i++) {
+		if (iscntrl((u_char)s[i]))
+			return 0;
 		if (strchr("'`\";&<>|(){}", s[i]) != NULL)
 			return 0;
 		/* Disallow '-' after whitespace */
@@ -673,6 +666,7 @@ main(int ac, char **av)
 	struct ssh *ssh = NULL;
 	int i, r, opt, exit_status, use_syslog, direct, timeout_ms;
 	int was_addr, config_test = 0, opt_terminated = 0, want_final_pass = 0;
+	int user_on_commandline = 0, user_was_default = 0, user_expanded = 0;
 	char *p, *cp, *line, *argv0, *logfile, *args;
 	char cname[NI_MAXHOST], thishost[NI_MAXHOST];
 	struct stat st;
@@ -731,7 +725,6 @@ main(int ac, char **av)
 	if ((ssh = ssh_alloc_session_state()) == NULL)
 		fatal("Couldn't allocate session state");
 	channel_init_channels(ssh);
-
 
 	/* Parse command-line arguments. */
 	args = argv_assemble(ac, av); /* logged later */
@@ -793,6 +786,10 @@ main(int ac, char **av)
 				fatal("Multiplexing command already specified");
 			if (strcmp(optarg, "check") == 0)
 				muxclient_command = SSHMUX_COMMAND_ALIVE_CHECK;
+			else if (strcmp(optarg, "conninfo") == 0)
+				muxclient_command = SSHMUX_COMMAND_CONNINFO;
+			else if (strcmp(optarg, "channels") == 0)
+				muxclient_command = SSHMUX_COMMAND_CHANINFO;
 			else if (strcmp(optarg, "forward") == 0)
 				muxclient_command = SSHMUX_COMMAND_FORWARD;
 			else if (strcmp(optarg, "exit") == 0)
@@ -1012,8 +1009,10 @@ main(int ac, char **av)
 			}
 			break;
 		case 'l':
-			if (options.user == NULL)
+			if (options.user == NULL) {
 				options.user = xstrdup(optarg);
+				user_on_commandline = 1;
+			}
 			break;
 
 		case 'L':
@@ -1116,6 +1115,7 @@ main(int ac, char **av)
 			if (options.user == NULL) {
 				options.user = tuser;
 				tuser = NULL;
+				user_on_commandline = 1;
 			}
 			free(tuser);
 			if (options.port == -1 && tport != -1)
@@ -1130,6 +1130,7 @@ main(int ac, char **av)
 				if (options.user == NULL) {
 					options.user = p;
 					p = NULL;
+					user_on_commandline = 1;
 				}
 				*cp++ = '\0';
 				host = xstrdup(cp);
@@ -1152,11 +1153,6 @@ main(int ac, char **av)
 	if (!valid_hostname(host))
 		fatal("hostname contains invalid characters");
 	options.host_arg = xstrdup(host);
-
-#ifdef WITH_OPENSSL
-	OpenSSL_add_all_algorithms();
-	ERR_load_crypto_strings();
-#endif
 
 	/* Initialize the command to execute on remote host. */
 	if ((command = sshbuf_new()) == NULL)
@@ -1294,8 +1290,10 @@ main(int ac, char **av)
 	if (fill_default_options(&options) != 0)
 		cleanup_exit(255);
 
-	if (options.user == NULL)
+	if (options.user == NULL) {
+		user_was_default = 1;
 		options.user = xstrdup(pw->pw_name);
+	}
 
 	/*
 	 * If ProxyJump option specified, then construct a ProxyCommand now.
@@ -1355,6 +1353,8 @@ main(int ac, char **av)
 	if (options.port == 0)
 		options.port = default_ssh_port();
 	channel_set_af(ssh, options.address_family);
+	ssh_packet_set_qos(ssh, options.ip_qos_interactive,
+	    options.ip_qos_bulk);
 
 	/* Tidy and check options */
 	if (options.host_key_alias != NULL)
@@ -1442,19 +1442,29 @@ main(int ac, char **av)
 	    "" : options.jump_host);
 
 	/*
-	 * Expand User. It cannot contain %r (itself) or %C since User is
+	 * If the user was specified via a configuration directive then attempt
+	 * to expand it. It cannot contain %r (itself) or %C since User is
 	 * a component of the hash.
 	 */
-	if (options.user != NULL) {
+	if (!user_on_commandline && !user_was_default) {
 		if ((p = percent_dollar_expand(options.user,
 		    DEFAULT_CLIENT_PERCENT_EXPAND_ARGS_NOUSER(cinfo),
 		    (char *)NULL)) == NULL)
 			fatal("invalid environment variable expansion");
+		user_expanded = strcmp(p, options.user) != 0;
 		free(options.user);
 		options.user = p;
-		if (!valid_ruser(options.user))
-			fatal("remote username contains invalid characters");
 	}
+
+	/*
+	 * Usernames specified on the commandline or expanded from the
+	 * configuration file must be validated.
+	 * Conversely, usernames from getpwnam(3) or specified as literals
+	 * via configuration (i.e. not expanded) are not subject to validation.
+	 */
+	if ((user_on_commandline || user_expanded) &&
+	    !valid_ruser(options.user))
+		fatal("remote username contains invalid characters");
 
 	/* Now User is expanded, store it and calculate hash. */
 	cinfo->remuser = xstrdup(options.user);
@@ -1494,12 +1504,13 @@ main(int ac, char **av)
 		options.identity_agent = cp;
 	}
 
-	if (options.revoked_host_keys != NULL) {
-		p = tilde_expand_filename(options.revoked_host_keys, getuid());
+	for (j = 0; j < options.num_revoked_host_keys; j++) {
+		p = tilde_expand_filename(options.revoked_host_keys[j],
+		    getuid());
 		cp = default_client_percent_dollar_expand(p, cinfo);
 		free(p);
-		free(options.revoked_host_keys);
-		options.revoked_host_keys = cp;
+		free(options.revoked_host_keys[j]);
+		options.revoked_host_keys[j] = cp;
 	}
 
 	if (options.forward_agent_sock_path != NULL) {
@@ -1688,8 +1699,6 @@ main(int ac, char **av)
 	    &timeout_ms, options.tcp_keep_alive) != 0)
 		exit(255);
 
-	if (addrs != NULL)
-		freeaddrinfo(addrs);
 
 	ssh_packet_set_timeout(ssh, options.server_alive_interval,
 	    options.server_alive_count_max);
@@ -1740,8 +1749,6 @@ main(int ac, char **av)
 			L_PUBKEY(_PATH_HOST_ECDSA_KEY_FILE, 4);
 			L_PUBKEY(_PATH_HOST_ED25519_KEY_FILE, 5);
 			L_PUBKEY(_PATH_HOST_RSA_KEY_FILE, 6);
-			L_CERT(_PATH_HOST_XMSS_KEY_FILE, 8);
-			L_PUBKEY(_PATH_HOST_XMSS_KEY_FILE, 9);
 			if (loaded == 0)
 				debug("HostbasedAuthentication enabled but no "
 				   "local public host keys could be loaded.");
@@ -1832,9 +1839,13 @@ main(int ac, char **av)
 #endif
 
  skip_connect:
+	if (addrs != NULL)
+		freeaddrinfo(addrs);
 	exit_status = ssh_session2(ssh, cinfo);
 	ssh_conn_info_free(cinfo);
-	ssh_packet_close(ssh);
+	channel_free_channels(ssh);
+	ssh_packet_free(ssh);
+	pwfree(pw);
 
 	if (options.control_path != NULL && muxserver_sock != -1)
 		unlink(options.control_path);
@@ -1917,7 +1928,7 @@ forwarding_success(void)
 
 /* Callback for remote forward global requests */
 static void
-ssh_confirm_remote_forward(struct ssh *ssh, int type, u_int32_t seq, void *ctxt)
+ssh_confirm_remote_forward(struct ssh *ssh, int type, uint32_t seq, void *ctxt)
 {
 	struct Forward *rfwd = (struct Forward *)ctxt;
 	u_int port;
@@ -2161,7 +2172,6 @@ ssh_session2_setup(struct ssh *ssh, int id, int success, void *arg)
 {
 	extern char **environ;
 	const char *display, *term;
-	int r, interactive = tty_flag;
 	char *proto = NULL, *data = NULL;
 
 	if (!success)
@@ -2180,20 +2190,11 @@ ssh_session2_setup(struct ssh *ssh, int id, int success, void *arg)
 		    data, 1);
 		client_expect_confirm(ssh, id, "X11 forwarding", CONFIRM_WARN);
 		/* XXX exit_on_forward_failure */
-		interactive = 1;
 	}
 
 	check_agent_present();
-	if (options.forward_agent) {
-		debug("Requesting authentication agent forwarding.");
-		channel_request_start(ssh, id, "auth-agent-req@openssh.com", 0);
-		if ((r = sshpkt_send(ssh)) != 0)
-			fatal_fr(r, "send packet");
-	}
-
-	/* Tell the packet module whether this is an interactive session. */
-	ssh_packet_set_interactive(ssh, interactive,
-	    options.ip_qos_interactive, options.ip_qos_bulk);
+	if (options.forward_agent)
+		client_channel_reqest_agent_forwarding(ssh, id);
 
 	if ((term = lookup_env_in_list("TERM", options.setenv,
 	    options.num_setenv)) == NULL || *term == '\0')
@@ -2231,8 +2232,9 @@ ssh_session2_open(struct ssh *ssh)
 	    "session", SSH_CHANNEL_OPENING, in, out, err,
 	    window, packetmax, CHAN_EXTENDED_WRITE,
 	    "client-session", CHANNEL_NONBLOCK_STDIO);
-
-	debug3_f("channel_new: %d", c->self);
+	if (tty_flag)
+		channel_set_tty(ssh, c);
+	debug3_f("channel_new: %d%s", c->self, tty_flag ? " (tty)" : "");
 
 	channel_send_open(ssh, c->self);
 	if (options.session_type != SESSION_TYPE_NONE)
@@ -2245,7 +2247,7 @@ ssh_session2_open(struct ssh *ssh)
 static int
 ssh_session2(struct ssh *ssh, const struct ssh_conn_info *cinfo)
 {
-	int r, interactive, id = -1;
+	int r, id = -1;
 	char *cp, *tun_fwd_ifname = NULL;
 
 	/* XXX should be pre-session */
@@ -2301,14 +2303,6 @@ ssh_session2(struct ssh *ssh, const struct ssh_conn_info *cinfo)
 
 	if (options.session_type != SESSION_TYPE_NONE)
 		id = ssh_session2_open(ssh);
-	else {
-		interactive = options.control_master == SSHCTL_MASTER_NO;
-		/* ControlPersist may have clobbered ControlMaster, so check */
-		if (need_controlpersist_detach)
-			interactive = otty_flag != 0;
-		ssh_packet_set_interactive(ssh, interactive,
-		    options.ip_qos_interactive, options.ip_qos_bulk);
-	}
 
 	/* If we don't expect to open a new session, then disallow it */
 	if (options.control_master == SSHCTL_MASTER_NO &&
@@ -2445,6 +2439,7 @@ load_public_identity_files(const struct ssh_conn_info *cinfo)
 			free(cp);
 			continue;
 		}
+		free(cp);
 		/* NB. leave filename pointing to private key */
 		identity_files[n_ids] = xstrdup(filename);
 		identity_keys[n_ids] = public;

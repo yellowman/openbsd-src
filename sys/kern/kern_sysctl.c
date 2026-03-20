@@ -1,4 +1,4 @@
-/*	$OpenBSD: kern_sysctl.c,v 1.481 2025/07/24 19:42:41 miod Exp $	*/
+/*	$OpenBSD: kern_sysctl.c,v 1.485 2026/02/11 22:34:41 deraadt Exp $	*/
 /*	$NetBSD: kern_sysctl.c,v 1.17 1996/05/20 17:49:05 mrg Exp $	*/
 
 /*-
@@ -100,6 +100,7 @@
 #include <netinet/tcp_var.h>
 #include <netinet/udp.h>
 #include <netinet/udp_var.h>
+#include <netinet/ip_divert.h>
 #include <netinet6/ip6_var.h>
 
 #ifdef DDB
@@ -194,7 +195,7 @@ sysctl_vslock(void *addr, size_t len)
 	KERNEL_LOCK();
 
 	if (addr) {
-		if (atop(len) > uvmexp.wiredmax - uvmexp.wired) {
+		if (atop(len) > uvmexp.wiredmax - atomic_load_sint(&uvmexp.wired)) {
 			error = ENOMEM;
 			goto out;
 		}
@@ -610,6 +611,20 @@ kern_sysctl(int *name, u_int namelen, void *oldp, size_t *oldlenp, void *newp,
 		microboottime(&bt);
 		return (sysctl_rdstruct(oldp, oldlenp, newp, &bt, sizeof bt));
 	}
+	case KERN_MAXCLUSTERS: {
+		int oldval, newval;
+
+		oldval = newval = atomic_load_long(&nmbclust);
+		error = sysctl_int(oldp, oldlenp, newp, newlen, &newval);
+
+		if (error == 0 && oldval != newval) {
+			rw_enter_write(&sysctl_lock);
+			error = nmbclust_update(newval);
+			rw_exit_write(&sysctl_lock);
+		}
+
+		return (error);
+	}
 	case KERN_MBSTAT: {
 		uint64_t counters[mbs_ncounters];
 		struct mbstat mbs;
@@ -765,13 +780,6 @@ kern_sysctl_locked(int *name, u_int namelen, void *oldp, size_t *oldlenp,
 		stackgap_random = stackgap;
 		return (0);
 	    }
-	case KERN_MAXCLUSTERS: {
-		int val = nmbclust;
-		error = sysctl_int(oldp, oldlenp, newp, newlen, &val);
-		if (error == 0 && val != nmbclust)
-			error = nmbclust_update(val);
-		return (error);
-	}
 	case KERN_CACHEPCT: {
 		u_int64_t dmapages;
 		int opct, pgs;
@@ -857,7 +865,7 @@ hw_sysctl(int *name, u_int namelen, void *oldp, size_t *oldlenp, void *newp,
 		return (sysctl_rdint(oldp, oldlenp, newp, ptoa(physmem)));
 	case HW_USERMEM:
 		return (sysctl_rdint(oldp, oldlenp, newp,
-		    ptoa(physmem - uvmexp.wired)));
+		    ptoa(physmem - atomic_load_sint(&uvmexp.wired))));
 #ifndef SMALL_KERNEL
 	case HW_SENSORS:
 		return (sysctl_sensors(name + 1, namelen - 1, oldp, oldlenp,
@@ -917,7 +925,7 @@ hw_sysctl(int *name, u_int namelen, void *oldp, size_t *oldlenp, void *newp,
 		    ptoa((psize_t)physmem)));
 	case HW_USERMEM64:
 		return (sysctl_rdquad(oldp, oldlenp, newp,
-		    ptoa((psize_t)physmem - uvmexp.wired)));
+		    ptoa((psize_t)physmem - atomic_load_sint(&uvmexp.wired))));
 	default:
 		return sysctl_bounded_arr(hw_vars, nitems(hw_vars), name,
 		    namelen, oldp, oldlenp, newp, newlen);
@@ -1762,6 +1770,12 @@ do {									\
 #ifdef INET6
 			FILLINPTABLE(&rawin6pcbtable);
 #endif
+#if NPF > 0
+			FILLINPTABLE(&divbtable);
+#ifdef INET6
+			FILLINPTABLE(&divb6table);
+#endif
+#endif
 		}
 		fp = NULL;
 		while ((fp = fd_iterfile(fp, p)) != NULL) {
@@ -2044,10 +2058,16 @@ fill_kproc(struct process *pr, struct kinfo_proc *ki, struct proc *p,
 {
 	struct session *s = pr->ps_session;
 	struct tty *tp;
-	struct vmspace *vm = pr->ps_vmspace;
+	struct vmspace *vm = NULL;
 	struct timespec booted, st, ut, utc;
 	struct tusage tu;
 	int isthread;
+
+	/* exiting/zombie process might no longer have VM space. */
+	if ((pr->ps_flags & PS_EXITING) == 0) {
+		vm = pr->ps_vmspace;
+		uvmspace_addref(vm);
+	}
 
 	isthread = p != NULL;
 	if (!isthread) {
@@ -2075,7 +2095,7 @@ fill_kproc(struct process *pr, struct kinfo_proc *ki, struct proc *p,
 	}
 
 	/* fixups that can only be done in the kernel */
-	if ((pr->ps_flags & PS_ZOMBIE) == 0) {
+	if ((pr->ps_flags & PS_EXITING) == 0) {
 		if ((pr->ps_flags & PS_EMBRYO) == 0 && vm != NULL)
 			ki->p_vm_rssize = vm_resident_count(vm);
 		calctsru(&tu, &ut, &st, NULL);
@@ -2096,13 +2116,15 @@ fill_kproc(struct process *pr, struct kinfo_proc *ki, struct proc *p,
 #endif
 	}
 
+	uvmspace_free(vm);
+
 	/* get %cpu and schedule state: just one thread or sum of all? */
 	if (isthread) {
 		ki->p_pctcpu = p->p_pctcpu;
 		ki->p_stat   = p->p_stat;
 	} else {
 		ki->p_pctcpu = 0;
-		ki->p_stat = (pr->ps_flags & PS_ZOMBIE) ? SDEAD : SIDL;
+		ki->p_stat = (pr->ps_flags & PS_EXITING) ? SDEAD : SIDL;
 		TAILQ_FOREACH(p, &pr->ps_threads, p_thr_link) {
 			ki->p_pctcpu += p->p_pctcpu;
 			/* find best state: ONPROC > RUN > STOP > SLEEP > .. */

@@ -1,4 +1,4 @@
-/*	$OpenBSD: priv.c,v 1.28 2025/05/12 17:17:42 dv Exp $	*/
+/*	$OpenBSD: priv.c,v 1.30 2026/01/14 03:09:05 dv Exp $	*/
 
 /*
  * Copyright (c) 2016 Reyk Floeter <reyk@openbsd.org>
@@ -239,7 +239,7 @@ priv_dispatch_parent(int fd, struct privsep_proc *p, struct imsg *imsg)
 		if (ioctl(ifd, SIOCGIFADDR, &varesult.var_addr) != 0)
 			log_warn("SIOCGIFADDR");
 		else
-			proc_compose_imsg(ps, PROC_PARENT, -1,
+			proc_compose_imsg(ps, PROC_PARENT,
 			    IMSG_VMDOP_PRIV_GET_ADDR_RESPONSE, peer_id,
 			    -1, &varesult, sizeof(varesult));
 		close(ifd);
@@ -326,7 +326,6 @@ vm_priv_ifconfig(struct privsep *ps, struct vmd_vm *vm)
 {
 	char			 name[64];
 	struct vmd		*env = ps->ps_env;
-	struct vm_create_params	*vcp = &vm->vm_params.vmc_params;
 	struct vmd_if		*vif;
 	struct vmd_switch	*vsw;
 	unsigned int		 i;
@@ -347,7 +346,7 @@ vm_priv_ifconfig(struct privsep *ps, struct vmd_vm *vm)
 
 		/* Description can be truncated */
 		(void)snprintf(vfr.vfr_value, sizeof(vfr.vfr_value),
-		    "vm%u-if%u-%s", vm->vm_vmid, i, vcp->vcp_name);
+		    "vm%u-if%u-%s", vm->vm_vmid, i, vm->vm_params.vmc_name);
 
 		log_debug("%s: interface %s description %s", __func__,
 		    vfr.vfr_name, vfr.vfr_value);

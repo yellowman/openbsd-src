@@ -1,4 +1,4 @@
-/*	$OpenBSD: trap.c,v 1.139 2025/07/25 16:55:00 miod Exp $	*/
+/*	$OpenBSD: trap.c,v 1.141 2026/03/08 17:07:31 deraadt Exp $	*/
 /*
  * Copyright (c) 2004, Miodrag Vallat.
  * Copyright (c) 1998 Steve Murphree, Jr.
@@ -206,7 +206,7 @@ ast(struct trapframe *frame)
 
 	p->p_md.md_astpending = 0;
 
-	uvmexp.softs++;
+	atomic_inc_int(&uvmexp.softs);
 	mi_ast(p, ci->ci_want_resched);
 	userret(p);
 }
@@ -231,7 +231,7 @@ m88100_trap(u_int type, struct trapframe *frame)
 #endif
 	int sig = 0;
 
-	uvmexp.traps++;
+	atomic_inc_int(&uvmexp.traps);
 	if ((p = curproc) == NULL)
 		p = &proc0;
 
@@ -631,7 +631,7 @@ m88110_trap(u_int type, struct trapframe *frame)
 #endif
 	int sig = 0;
 
-	uvmexp.traps++;
+	atomic_inc_int(&uvmexp.traps);
 	if ((p = curproc) == NULL)
 		p = &proc0;
 
@@ -680,7 +680,7 @@ m88110_trap(u_int type, struct trapframe *frame)
 			if (copyinsn(p, (u_int32_t *)frame->tf_exip,
 			    (u_int32_t *)&instr) == 0 &&
 			    instr == 0xf400cc01) {
-				uprintf("mc88110 errata #16, exip 0x%lx enip 0x%lx",
+				printf("mc88110 errata #16, exip 0x%lx enip 0x%lx",
 				    (frame->tf_exip + 4) | 1, frame->tf_enip);
 				sig = SIGILL;
 			}
@@ -1167,7 +1167,7 @@ m88100_syscall(register_t code, struct trapframe *tf)
 	register_t *args;
 	register_t rval[2] __aligned(8);
 
-	uvmexp.syscalls++;
+	atomic_inc_int(&uvmexp.syscalls);
 
 	p->p_md.md_tf = tf;
 
@@ -1253,7 +1253,7 @@ m88110_syscall(register_t code, struct trapframe *tf)
 	register_t rval[2] __aligned(8);
 	register_t *args;
 
-	uvmexp.syscalls++;
+	atomic_inc_int(&uvmexp.syscalls);
 
 	p->p_md.md_tf = tf;
 

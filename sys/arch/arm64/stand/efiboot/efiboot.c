@@ -1,4 +1,4 @@
-/*	$OpenBSD: efiboot.c,v 1.65 2025/07/10 13:37:14 patrick Exp $	*/
+/*	$OpenBSD: efiboot.c,v 1.70 2026/03/11 16:21:20 kettenis Exp $	*/
 
 /*
  * Copyright (c) 2015 YASUOKA Masahiko <yasuoka@yasuoka.net>
@@ -43,6 +43,8 @@
 #include "efiboot.h"
 #include "efidt.h"
 #include "fdt.h"
+
+#define EFI_OS_INDICATIONS_BOOT_TO_FW_UI	1ULL
 
 EFI_SYSTEM_TABLE	*ST;
 EFI_BOOT_SERVICES	*BS;
@@ -599,8 +601,10 @@ efi_dma_constraint(void)
 	node = fdt_find_node("/");
 	if (fdt_node_is_compatible(node, "brcm,bcm2711"))
 		dma_constraint[1] = htobe64(0x3bffffff);
-	if (fdt_node_is_compatible(node, "rockchip,rk3566") ||
+	if (fdt_node_is_compatible(node, "rockchip,rk3528") ||
+	    fdt_node_is_compatible(node, "rockchip,rk3566") ||
 	    fdt_node_is_compatible(node, "rockchip,rk3568") ||
+	    fdt_node_is_compatible(node, "rockchip,rk3576") ||
 	    fdt_node_is_compatible(node, "rockchip,rk3588") ||
 	    fdt_node_is_compatible(node, "rockchip,rk3588s"))
 		dma_constraint[1] = htobe64(0xffffffff);
@@ -1132,12 +1136,26 @@ struct smbios_dtb {
 	const char *dtb;
 } smbios_dtb[] = {
 	/* Keep the list below sorted by vendor */
-	{ "ASUS", "ASUS Vivobook S 15 S5507",
+	{ "ASUS", "ASUS Vivobook S 15 S5507QA",
 	  "qcom/x1e80100-asus-vivobook-s15.dtb" },
+	{ "ASUS", "ASUS Zenbook A14 UX3407QA",
+	  "qcom/x1p42100-asus-zenbook-a14.dtb" },
+	{ "ASUS", "ASUS Zenbook A14 UX3407RA",
+	  "qcom/x1e80100-asus-zenbook-a14.dtb" },
+	{ "Dell", "Inspiron 14 Plus 7441",
+	  "qcom/x1e80100-dell-inspiron-14-plus-7441.dtb" },
+	{ "Dell", "Latitude 7455",
+	  "qcom/x1e80100-dell-latitude-7455.dtb" },
+	{ "Dell", "XPS 13 9345",
+	  "qcom/x1e80100-dell-xps13-9345.dtb" },
 	{ "HONOR", "MRO-XXX",
 	  "qcom/x1e80100-honor-magicbook-art-14.dtb" },
+	{ "HP", "HP EliteBook Ultra G1q",
+	  "qcom/x1e80100-hp-elitebook-ultra-g1q.dtb" },
 	{ "HP", "HP OmniBook X Laptop 14-fe0xxx",
 	  "qcom/x1e80100-hp-omnibook-x14.dtb" },
+	{ "HP", "HP OmniBook X Laptop 14-fe1xxx",
+	  "qcom/x1p42100-hp-omnibook-x14.dtb" },
 	{ "LENOVO", "21BX",
 	  "qcom/sc8280xp-lenovo-thinkpad-x13s.dtb" },
 	{ "LENOVO", "21BY",
@@ -1146,6 +1164,8 @@ struct smbios_dtb {
 	  "qcom/x1e78100-lenovo-thinkpad-t14s.dtb" },
 	{ "LENOVO", "21N2",
 	  "qcom/x1e78100-lenovo-thinkpad-t14s.dtb" },
+	{ "LENOVO", "21NH",
+	  "qcom/x1p42100-lenovo-thinkbook-16.dtb" },
 	{ "LENOVO", "83ED",
 	  "qcom/x1e80100-lenovo-yoga-slim7x.dtb" },
 	{ "Microsoft Corporation", "Windows Dev Kit 2023",
@@ -1266,12 +1286,14 @@ retry:
 int Xacpi_efi(void);
 int Xdtb_efi(void);
 int Xexit_efi(void);
+int Xfwsetup_efi(void);
 int Xpoweroff_efi(void);
 
 const struct cmd_table cmd_machine[] = {
 	{ "acpi",	CMDT_CMD, Xacpi_efi },
 	{ "dtb",	CMDT_CMD, Xdtb_efi },
 	{ "exit",	CMDT_CMD, Xexit_efi },
+	{ "fwsetup",	CMDT_CMD, Xfwsetup_efi },
 	{ "poweroff",	CMDT_CMD, Xpoweroff_efi },
 	{ NULL, 0 }
 };
@@ -1303,6 +1325,44 @@ int
 Xexit_efi(void)
 {
 	BS->Exit(IH, 0, 0, NULL);
+	for (;;)
+		continue;
+	return (0);
+}
+
+int
+Xfwsetup_efi(void)
+{
+	UINT64 osind;
+	UINTN osind_size = sizeof(osind);
+	UINT32 osind_attrs = 0x1 | 0x2 | 0x4;
+	EFI_GUID global = EFI_GLOBAL_VARIABLE;
+	EFI_STATUS status;
+
+	status = RS->GetVariable(L"OsIndicationsSupported", &global, NULL,
+	    &osind_size, &osind);
+	if (status == EFI_NOT_FOUND) {
+		printf("not supported on this machine.\n");
+		return (-1);
+	} else if (status != EFI_SUCCESS) {
+		printf("%s: %d\n", __func__, status);
+		return (-1);
+	}
+
+	if ((osind & EFI_OS_INDICATIONS_BOOT_TO_FW_UI) == 0) {
+		printf("not supported on this machine.\n");
+		return (-1);
+	}
+
+	osind = EFI_OS_INDICATIONS_BOOT_TO_FW_UI;
+	status = RS->SetVariable(L"OsIndications", &global, osind_attrs,
+	    sizeof(osind), &osind);
+	if (status != EFI_SUCCESS) {
+		printf("%s: %d\n", __func__, status);
+		return (-1);
+	}
+
+	RS->ResetSystem(EfiResetCold, EFI_SUCCESS, 0, NULL);
 	for (;;)
 		continue;
 	return (0);

@@ -1,4 +1,4 @@
-/*	$OpenBSD: uipc_mbuf.c,v 1.301 2025/07/17 17:30:47 mvs Exp $	*/
+/*	$OpenBSD: uipc_mbuf.c,v 1.304 2026/02/05 03:26:00 dlg Exp $	*/
 /*	$NetBSD: uipc_mbuf.c,v 1.15.4.1 1996/06/13 17:11:44 cgd Exp $	*/
 
 /*
@@ -217,8 +217,8 @@ nmbclust_update(long newval)
 	if (newval <= 0 || newval > LONG_MAX / MCLBYTES)
 		return ERANGE;
 	/* update the global mbuf memory limit */
-	nmbclust = newval;
-	atomic_store_long(&mbuf_mem_limit, nmbclust * MCLBYTES);
+	atomic_store_long(&nmbclust, newval);
+	atomic_store_long(&mbuf_mem_limit, newval * MCLBYTES);
 
 	pool_wakeup(&mbpool);
 	for (i = 0; i < nitems(mclsizes); i++)

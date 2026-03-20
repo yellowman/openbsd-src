@@ -1,4 +1,4 @@
-/* $OpenBSD: window-copy.c,v 1.372 2025/04/03 11:51:27 nicm Exp $ */
+/* $OpenBSD: window-copy.c,v 1.391 2026/03/03 12:26:14 nicm Exp $ */
 
 /*
  * Copyright (c) 2007 Nicholas Marriott <nicholas.marriott@gmail.com>
@@ -51,6 +51,7 @@ static void	window_copy_redraw_selection(struct window_mode_entry *, u_int);
 static void	window_copy_redraw_lines(struct window_mode_entry *, u_int,
 		    u_int);
 static void	window_copy_redraw_screen(struct window_mode_entry *);
+static void	window_copy_style_changed(struct window_mode_entry *);
 static void	window_copy_write_line(struct window_mode_entry *,
 		    struct screen_write_ctx *, u_int);
 static void	window_copy_write_lines(struct window_mode_entry *,
@@ -158,6 +159,7 @@ const struct window_mode window_copy_mode = {
 	.init = window_copy_init,
 	.free = window_copy_free,
 	.resize = window_copy_resize,
+	.style_changed = window_copy_style_changed,
 	.key_table = window_copy_key_table,
 	.command = window_copy_command,
 	.formats = window_copy_formats,
@@ -170,6 +172,7 @@ const struct window_mode window_view_mode = {
 	.init = window_copy_view_init,
 	.free = window_copy_free,
 	.resize = window_copy_resize,
+	.style_changed = window_copy_style_changed,
 	.key_table = window_copy_key_table,
 	.command = window_copy_command,
 	.formats = window_copy_formats,
@@ -234,7 +237,6 @@ struct window_copy_mode_data {
 
 	struct screen	*backing;
 	int		 backing_written; /* backing display started */
-	struct screen	*writing;
 	struct input_ctx *ictx;
 
 	int		 viewmode;	/* view mode entered */
@@ -353,7 +355,7 @@ window_copy_clone_screen(struct screen *src, struct screen *hint, u_int *cx,
 	if (trim) {
 		while (sy > screen_hsize(src)) {
 			gl = grid_peek_line(src->grid, sy - 1);
-			if (gl->cellused != 0)
+			if (gl == NULL || gl->cellused != 0)
 				break;
 			sy--;
 		}
@@ -492,9 +494,7 @@ window_copy_view_init(struct window_mode_entry *wme,
 
 	data->backing = xmalloc(sizeof *data->backing);
 	screen_init(data->backing, sx, screen_size_y(base), UINT_MAX);
-	data->writing = xmalloc(sizeof *data->writing);
-	screen_init(data->writing, sx, screen_size_y(base), 0);
-	data->ictx = input_init(NULL, NULL, NULL);
+	data->ictx = input_init(NULL, NULL, NULL, NULL);
 	data->mx = data->cx;
 	data->my = screen_hsize(data->backing) + data->cy - data->oy;
 	data->showmark = 0;
@@ -513,10 +513,6 @@ window_copy_free(struct window_mode_entry *wme)
 	free(data->searchstr);
 	free(data->jumpchar);
 
-	if (data->writing != NULL) {
-		screen_free(data->writing);
-		free(data->writing);
-	}
 	if (data->ictx != NULL)
 		input_free(data->ictx);
 	screen_free(data->backing);
@@ -553,21 +549,10 @@ window_copy_vadd(struct window_pane *wp, int parse, const char *fmt, va_list ap)
 	struct window_mode_entry	*wme = TAILQ_FIRST(&wp->modes);
 	struct window_copy_mode_data	*data = wme->data;
 	struct screen			*backing = data->backing;
-	struct screen			*writing = data->writing;
-	struct screen_write_ctx	 	 writing_ctx, backing_ctx, ctx;
+	struct screen_write_ctx	 	 backing_ctx, ctx;
 	struct grid_cell		 gc;
 	u_int				 old_hsize, old_cy;
-	u_int				 sx = screen_size_x(backing);
 	char				*text;
-
-	if (parse) {
-		vasprintf(&text, fmt, ap);
-		screen_write_start(&writing_ctx, writing);
-		screen_write_reset(&writing_ctx);
-		input_parse_screen(data->ictx, writing, window_copy_init_ctx_cb,
-		    data, text, strlen(text));
-		free(text);
-	}
 
 	old_hsize = screen_hsize(data->backing);
 	screen_write_start(&backing_ctx, backing);
@@ -581,9 +566,12 @@ window_copy_vadd(struct window_pane *wp, int parse, const char *fmt, va_list ap)
 	} else
 		data->backing_written = 1;
 	old_cy = backing->cy;
-	if (parse)
-		screen_write_fast_copy(&backing_ctx, writing, 0, 0, sx, 1);
-	else {
+	if (parse) {
+		vasprintf(&text, fmt, ap);
+		input_parse_screen(data->ictx, backing, window_copy_init_ctx_cb,
+		    data, text, strlen(text));
+		free(text);
+	} else {
 		memcpy(&gc, &grid_default_cell, sizeof gc);
 		screen_write_vnputs(&backing_ctx, 0, &gc, fmt, ap);
 	}
@@ -642,7 +630,7 @@ window_copy_scroll1(struct window_mode_entry *wme, struct window_pane *wp,
 		new_slider_y = sb_top - wp->yoff + (sb_height - slider_height);
 	} else {
 		/* Slider is somewhere in the middle. */
-		new_slider_y = my - wp->yoff - sl_mpos + 1;
+		new_slider_y = my - wp->yoff - sl_mpos;
 	}
 
 	if (TAILQ_FIRST(&wp->modes) == NULL ||
@@ -969,6 +957,18 @@ window_copy_formats(struct window_mode_entry *wme, struct format_tree *ft)
 	} else {
 		format_add(ft, "selection_active", "0");
 		format_add(ft, "selection_present", "0");
+	}
+
+	switch (data->selflag) {
+	case SEL_CHAR:
+		format_add(ft, "selection_mode", "char");
+		break;
+	case SEL_WORD:
+		format_add(ft, "selection_mode", "word");
+		break;
+	case SEL_LINE:
+		format_add(ft, "selection_mode", "line");
+		break;
 	}
 
 	format_add(ft, "search_present", "%d", data->searchmark != NULL);
@@ -1494,6 +1494,20 @@ window_copy_cmd_scroll_middle(struct window_copy_cmd_state *cs)
 	return (window_copy_cmd_scroll_to(cs, mid_value));
 }
 
+/* Scroll the pane to the mouse in the scrollbar. */
+static enum window_copy_cmd_action
+window_copy_cmd_scroll_to_mouse(struct window_copy_cmd_state *cs)
+{
+	struct window_mode_entry	*wme = cs->wme;
+	struct window_pane		*wp = wme->wp;
+	struct client			*c = cs->c;
+	struct mouse_event		*m = cs->m;
+	int				 scroll_exit = args_has(cs->wargs, 'e');
+
+	window_copy_scroll(wp, c->tty.mouse_slider_mpos, m->y, scroll_exit);
+	return (WINDOW_COPY_CMD_NOTHING);
+}
+
 /* Scroll line containing the cursor to the top. */
 static enum window_copy_cmd_action
 window_copy_cmd_scroll_top(struct window_copy_cmd_state *cs)
@@ -1510,6 +1524,28 @@ window_copy_cmd_cursor_up(struct window_copy_cmd_state *cs)
 	for (; np != 0; np--)
 		window_copy_cursor_up(wme, 0);
 	return (WINDOW_COPY_CMD_NOTHING);
+}
+
+static enum window_copy_cmd_action
+window_copy_cmd_centre_vertical(struct window_copy_cmd_state *cs)
+{
+	struct window_mode_entry	*wme = cs->wme;
+	struct window_copy_mode_data	*data = wme->data;
+
+	window_copy_update_cursor(wme, data->cx,  wme->wp->sy / 2);
+	window_copy_update_selection(wme, 1, 0);
+	return (WINDOW_COPY_CMD_REDRAW);
+}
+
+static enum window_copy_cmd_action
+window_copy_cmd_centre_horizontal(struct window_copy_cmd_state *cs)
+{
+	struct window_mode_entry	*wme = cs->wme;
+	struct window_copy_mode_data	*data = wme->data;
+
+	window_copy_update_cursor(wme, wme->wp->sx / 2, data->cy);
+	window_copy_update_selection(wme, 1, 0);
+	return (WINDOW_COPY_CMD_REDRAW);
 }
 
 static enum window_copy_cmd_action
@@ -1964,6 +2000,24 @@ window_copy_cmd_other_end(struct window_copy_cmd_state *cs)
 }
 
 static enum window_copy_cmd_action
+window_copy_cmd_selection_mode(struct window_copy_cmd_state *cs)
+{
+	struct window_mode_entry	*wme = cs->wme;
+	struct options			*so = cs->s->options;
+	struct window_copy_mode_data	*data = wme->data;
+	const char			*s = args_string(cs->wargs, 0);
+
+	if (s == NULL || strcasecmp(s, "char") == 0 || strcasecmp(s, "c") == 0)
+		data->selflag = SEL_CHAR;
+	else if (strcasecmp(s, "word") == 0 || strcasecmp(s, "w") == 0) {
+		data->separators = options_get_string(so, "word-separators");
+		data->selflag = SEL_WORD;
+	} else if (strcasecmp(s, "line") == 0 || strcasecmp(s, "l") == 0)
+		data->selflag = SEL_LINE;
+	return (WINDOW_COPY_CMD_NOTHING);
+}
+
+static enum window_copy_cmd_action
 window_copy_cmd_page_down(struct window_copy_cmd_state *cs)
 {
 	struct window_mode_entry	*wme = cs->wme;
@@ -2074,6 +2128,36 @@ window_copy_cmd_rectangle_toggle(struct window_copy_cmd_state *cs)
 }
 
 static enum window_copy_cmd_action
+window_copy_cmd_scroll_exit_on(struct window_copy_cmd_state *cs)
+{
+	struct window_copy_mode_data	*data = cs->wme->data;
+
+	data->scroll_exit = 1;
+
+	return (WINDOW_COPY_CMD_NOTHING);
+}
+
+static enum window_copy_cmd_action
+window_copy_cmd_scroll_exit_off(struct window_copy_cmd_state *cs)
+{
+	struct window_copy_mode_data	*data = cs->wme->data;
+
+	data->scroll_exit = 0;
+
+	return (WINDOW_COPY_CMD_NOTHING);
+}
+
+static enum window_copy_cmd_action
+window_copy_cmd_scroll_exit_toggle(struct window_copy_cmd_state *cs)
+{
+	struct window_copy_mode_data	*data = cs->wme->data;
+
+	data->scroll_exit = !data->scroll_exit;
+
+	return (WINDOW_COPY_CMD_NOTHING);
+}
+
+static enum window_copy_cmd_action
 window_copy_cmd_scroll_down(struct window_copy_cmd_state *cs)
 {
 	struct window_mode_entry	*wme = cs->wme;
@@ -2179,7 +2263,7 @@ static enum window_copy_cmd_action
 window_copy_cmd_select_word(struct window_copy_cmd_state *cs)
 {
 	struct window_mode_entry	*wme = cs->wme;
-	struct options			*session_options = cs->s->options;
+	struct options			*so = cs->s->options;
 	struct window_copy_mode_data	*data = wme->data;
 	u_int				 px, py, nextx, nexty;
 
@@ -2189,8 +2273,7 @@ window_copy_cmd_select_word(struct window_copy_cmd_state *cs)
 	data->dx = data->cx;
 	data->dy = screen_hsize(data->backing) + data->cy - data->oy;
 
-	data->separators = options_get_string(session_options,
-	    "word-separators");
+	data->separators = options_get_string(so, "word-separators");
 	window_copy_cursor_previous_word(wme, data->separators, 0);
 	px = data->cx;
 	py = screen_hsize(data->backing) + data->cy - data->oy;
@@ -2649,14 +2732,23 @@ window_copy_cmd_refresh_from_pane(struct window_copy_cmd_state *cs)
 	struct window_mode_entry	*wme = cs->wme;
 	struct window_pane		*wp = wme->swp;
 	struct window_copy_mode_data	*data = wme->data;
+	u_int				 oy_from_top;
 
 	if (data->viewmode)
 		return (WINDOW_COPY_CMD_NOTHING);
+	oy_from_top = screen_hsize(data->backing) - data->oy;
 
 	screen_free(data->backing);
 	free(data->backing);
 	data->backing = window_copy_clone_screen(&wp->base, &data->screen, NULL,
 	    NULL, wme->swp != wme->wp);
+
+	if (oy_from_top <= screen_hsize(data->backing))
+		data->oy = screen_hsize(data->backing) - oy_from_top;
+	else {
+		data->cy = 0;
+		data->oy = screen_hsize(data->backing);
+	}
 
 	window_copy_size_changed(wme);
 	return (WINDOW_COPY_CMD_REDRAW);
@@ -2667,431 +2759,559 @@ static const struct {
 	u_int				  minargs;
 	u_int				  maxargs;
 	struct args_parse		  args;
+
+#define WINDOW_COPY_CMD_FLAG_READONLY 0x1
+	int				  flags;
+
 	enum window_copy_cmd_clear	  clear;
 	enum window_copy_cmd_action	(*f)(struct window_copy_cmd_state *);
 } window_copy_cmd_table[] = {
 	{ .command = "append-selection",
 	  .args = { "", 0, 0, NULL },
+	  .flags = 0,
 	  .clear = WINDOW_COPY_CMD_CLEAR_ALWAYS,
 	  .f = window_copy_cmd_append_selection
 	},
 	{ .command = "append-selection-and-cancel",
 	  .args = { "", 0, 0, NULL },
+	  .flags = 0,
 	  .clear = WINDOW_COPY_CMD_CLEAR_ALWAYS,
 	  .f = window_copy_cmd_append_selection_and_cancel
 	},
 	{ .command = "back-to-indentation",
 	  .args = { "", 0, 0, NULL },
+	  .flags = WINDOW_COPY_CMD_FLAG_READONLY,
 	  .clear = WINDOW_COPY_CMD_CLEAR_ALWAYS,
 	  .f = window_copy_cmd_back_to_indentation
 	},
 	{ .command = "begin-selection",
 	  .args = { "", 0, 0, NULL },
+	  .flags = 0,
 	  .clear = WINDOW_COPY_CMD_CLEAR_ALWAYS,
 	  .f = window_copy_cmd_begin_selection
 	},
 	{ .command = "bottom-line",
 	  .args = { "", 0, 0, NULL },
+	  .flags = WINDOW_COPY_CMD_FLAG_READONLY,
 	  .clear = WINDOW_COPY_CMD_CLEAR_EMACS_ONLY,
 	  .f = window_copy_cmd_bottom_line
 	},
 	{ .command = "cancel",
 	  .args = { "", 0, 0, NULL },
+	  .flags = WINDOW_COPY_CMD_FLAG_READONLY,
 	  .clear = WINDOW_COPY_CMD_CLEAR_ALWAYS,
 	  .f = window_copy_cmd_cancel
 	},
 	{ .command = "clear-selection",
 	  .args = { "", 0, 0, NULL },
+	  .flags = 0,
 	  .clear = WINDOW_COPY_CMD_CLEAR_ALWAYS,
 	  .f = window_copy_cmd_clear_selection
 	},
 	{ .command = "copy-end-of-line",
 	  .args = { "CP", 0, 1, NULL },
+	  .flags = 0,
 	  .clear = WINDOW_COPY_CMD_CLEAR_ALWAYS,
 	  .f = window_copy_cmd_copy_end_of_line
 	},
 	{ .command = "copy-end-of-line-and-cancel",
 	  .args = { "CP", 0, 1, NULL },
+	  .flags = 0,
 	  .clear = WINDOW_COPY_CMD_CLEAR_ALWAYS,
 	  .f = window_copy_cmd_copy_end_of_line_and_cancel
 	},
 	{ .command = "copy-pipe-end-of-line",
 	  .args = { "CP", 0, 2, NULL },
+	  .flags = 0,
 	  .clear = WINDOW_COPY_CMD_CLEAR_ALWAYS,
 	  .f = window_copy_cmd_copy_pipe_end_of_line
 	},
 	{ .command = "copy-pipe-end-of-line-and-cancel",
 	  .args = { "CP", 0, 2, NULL },
+	  .flags = 0,
 	  .clear = WINDOW_COPY_CMD_CLEAR_ALWAYS,
 	  .f = window_copy_cmd_copy_pipe_end_of_line_and_cancel
 	},
 	{ .command = "copy-line",
 	  .args = { "CP", 0, 1, NULL },
+	  .flags = 0,
 	  .clear = WINDOW_COPY_CMD_CLEAR_ALWAYS,
 	  .f = window_copy_cmd_copy_line
 	},
 	{ .command = "copy-line-and-cancel",
 	  .args = { "CP", 0, 1, NULL },
+	  .flags = 0,
 	  .clear = WINDOW_COPY_CMD_CLEAR_ALWAYS,
 	  .f = window_copy_cmd_copy_line_and_cancel
 	},
 	{ .command = "copy-pipe-line",
 	  .args = { "CP", 0, 2, NULL },
+	  .flags = 0,
 	  .clear = WINDOW_COPY_CMD_CLEAR_ALWAYS,
 	  .f = window_copy_cmd_copy_pipe_line
 	},
 	{ .command = "copy-pipe-line-and-cancel",
 	  .args = { "CP", 0, 2, NULL },
+	  .flags = 0,
 	  .clear = WINDOW_COPY_CMD_CLEAR_ALWAYS,
 	  .f = window_copy_cmd_copy_pipe_line_and_cancel
 	},
 	{ .command = "copy-pipe-no-clear",
 	  .args = { "CP", 0, 2, NULL },
+	  .flags = 0,
 	  .clear = WINDOW_COPY_CMD_CLEAR_NEVER,
 	  .f = window_copy_cmd_copy_pipe_no_clear
 	},
 	{ .command = "copy-pipe",
 	  .args = { "CP", 0, 2, NULL },
+	  .flags = 0,
 	  .clear = WINDOW_COPY_CMD_CLEAR_ALWAYS,
 	  .f = window_copy_cmd_copy_pipe
 	},
 	{ .command = "copy-pipe-and-cancel",
 	  .args = { "CP", 0, 2, NULL },
+	  .flags = 0,
 	  .clear = WINDOW_COPY_CMD_CLEAR_ALWAYS,
 	  .f = window_copy_cmd_copy_pipe_and_cancel
 	},
 	{ .command = "copy-selection-no-clear",
 	  .args = { "CP", 0, 1, NULL },
+	  .flags = 0,
 	  .clear = WINDOW_COPY_CMD_CLEAR_NEVER,
 	  .f = window_copy_cmd_copy_selection_no_clear
 	},
 	{ .command = "copy-selection",
 	  .args = { "CP", 0, 1, NULL },
+	  .flags = 0,
 	  .clear = WINDOW_COPY_CMD_CLEAR_ALWAYS,
 	  .f = window_copy_cmd_copy_selection
 	},
 	{ .command = "copy-selection-and-cancel",
 	  .args = { "CP", 0, 1, NULL },
+	  .flags = 0,
 	  .clear = WINDOW_COPY_CMD_CLEAR_ALWAYS,
 	  .f = window_copy_cmd_copy_selection_and_cancel
 	},
 	{ .command = "cursor-down",
 	  .args = { "", 0, 0, NULL },
+	  .flags = WINDOW_COPY_CMD_FLAG_READONLY,
 	  .clear = WINDOW_COPY_CMD_CLEAR_EMACS_ONLY,
 	  .f = window_copy_cmd_cursor_down
 	},
 	{ .command = "cursor-down-and-cancel",
 	  .args = { "", 0, 0, NULL },
+	  .flags = WINDOW_COPY_CMD_FLAG_READONLY,
 	  .clear = WINDOW_COPY_CMD_CLEAR_ALWAYS,
 	  .f = window_copy_cmd_cursor_down_and_cancel
 	},
 	{ .command = "cursor-left",
 	  .args = { "", 0, 0, NULL },
+	  .flags = WINDOW_COPY_CMD_FLAG_READONLY,
 	  .clear = WINDOW_COPY_CMD_CLEAR_EMACS_ONLY,
 	  .f = window_copy_cmd_cursor_left
 	},
 	{ .command = "cursor-right",
 	  .args = { "", 0, 0, NULL },
+	  .flags = WINDOW_COPY_CMD_FLAG_READONLY,
 	  .clear = WINDOW_COPY_CMD_CLEAR_EMACS_ONLY,
 	  .f = window_copy_cmd_cursor_right
 	},
 	{ .command = "cursor-up",
 	  .args = { "", 0, 0, NULL },
+	  .flags = WINDOW_COPY_CMD_FLAG_READONLY,
 	  .clear = WINDOW_COPY_CMD_CLEAR_EMACS_ONLY,
 	  .f = window_copy_cmd_cursor_up
 	},
+	{ .command = "cursor-centre-vertical",
+	  .args = { "", 0, 0, NULL },
+	  .flags = WINDOW_COPY_CMD_FLAG_READONLY,
+	  .clear = WINDOW_COPY_CMD_CLEAR_EMACS_ONLY,
+	  .f = window_copy_cmd_centre_vertical,
+	},
+	{ .command = "cursor-centre-horizontal",
+	  .args = { "", 0, 0, NULL },
+	  .flags = WINDOW_COPY_CMD_FLAG_READONLY,
+	  .clear = WINDOW_COPY_CMD_CLEAR_EMACS_ONLY,
+	  .f = window_copy_cmd_centre_horizontal,
+	},
 	{ .command = "end-of-line",
 	  .args = { "", 0, 0, NULL },
+	  .flags = WINDOW_COPY_CMD_FLAG_READONLY,
 	  .clear = WINDOW_COPY_CMD_CLEAR_EMACS_ONLY,
 	  .f = window_copy_cmd_end_of_line
 	},
 	{ .command = "goto-line",
 	  .args = { "", 1, 1, NULL },
+	  .flags = WINDOW_COPY_CMD_FLAG_READONLY,
 	  .clear = WINDOW_COPY_CMD_CLEAR_EMACS_ONLY,
 	  .f = window_copy_cmd_goto_line
 	},
 	{ .command = "halfpage-down",
 	  .args = { "", 0, 0, NULL },
+	  .flags = WINDOW_COPY_CMD_FLAG_READONLY,
 	  .clear = WINDOW_COPY_CMD_CLEAR_EMACS_ONLY,
 	  .f = window_copy_cmd_halfpage_down
 	},
 	{ .command = "halfpage-down-and-cancel",
 	  .args = { "", 0, 0, NULL },
+	  .flags = WINDOW_COPY_CMD_FLAG_READONLY,
 	  .clear = WINDOW_COPY_CMD_CLEAR_ALWAYS,
 	  .f = window_copy_cmd_halfpage_down_and_cancel
 	},
 	{ .command = "halfpage-up",
 	  .args = { "", 0, 0, NULL },
+	  .flags = WINDOW_COPY_CMD_FLAG_READONLY,
 	  .clear = WINDOW_COPY_CMD_CLEAR_EMACS_ONLY,
 	  .f = window_copy_cmd_halfpage_up
 	},
 	{ .command = "history-bottom",
 	  .args = { "", 0, 0, NULL },
+	  .flags = WINDOW_COPY_CMD_FLAG_READONLY,
 	  .clear = WINDOW_COPY_CMD_CLEAR_EMACS_ONLY,
 	  .f = window_copy_cmd_history_bottom
 	},
 	{ .command = "history-top",
 	  .args = { "", 0, 0, NULL },
+	  .flags = WINDOW_COPY_CMD_FLAG_READONLY,
 	  .clear = WINDOW_COPY_CMD_CLEAR_EMACS_ONLY,
 	  .f = window_copy_cmd_history_top
 	},
 	{ .command = "jump-again",
 	  .args = { "", 0, 0, NULL },
+	  .flags = 0,
 	  .clear = WINDOW_COPY_CMD_CLEAR_EMACS_ONLY,
 	  .f = window_copy_cmd_jump_again
 	},
 	{ .command = "jump-backward",
 	  .args = { "", 1, 1, NULL },
+	  .flags = 0,
 	  .clear = WINDOW_COPY_CMD_CLEAR_EMACS_ONLY,
 	  .f = window_copy_cmd_jump_backward
 	},
 	{ .command = "jump-forward",
 	  .args = { "", 1, 1, NULL },
+	  .flags = 0,
 	  .clear = WINDOW_COPY_CMD_CLEAR_EMACS_ONLY,
 	  .f = window_copy_cmd_jump_forward
 	},
 	{ .command = "jump-reverse",
 	  .args = { "", 0, 0, NULL },
+	  .flags = 0,
 	  .clear = WINDOW_COPY_CMD_CLEAR_EMACS_ONLY,
 	  .f = window_copy_cmd_jump_reverse
 	},
 	{ .command = "jump-to-backward",
 	  .args = { "", 1, 1, NULL },
+	  .flags = 0,
 	  .clear = WINDOW_COPY_CMD_CLEAR_EMACS_ONLY,
 	  .f = window_copy_cmd_jump_to_backward
 	},
 	{ .command = "jump-to-forward",
 	  .args = { "", 1, 1, NULL },
+	  .flags = 0,
 	  .clear = WINDOW_COPY_CMD_CLEAR_EMACS_ONLY,
 	  .f = window_copy_cmd_jump_to_forward
 	},
 	{ .command = "jump-to-mark",
 	  .args = { "", 0, 0, NULL },
+	  .flags = WINDOW_COPY_CMD_FLAG_READONLY,
 	  .clear = WINDOW_COPY_CMD_CLEAR_ALWAYS,
 	  .f = window_copy_cmd_jump_to_mark
 	},
 	{ .command = "next-prompt",
 	  .args = { "o", 0, 0, NULL },
+	  .flags = WINDOW_COPY_CMD_FLAG_READONLY,
 	  .clear = WINDOW_COPY_CMD_CLEAR_ALWAYS,
 	  .f = window_copy_cmd_next_prompt
 	},
 	{ .command = "previous-prompt",
 	  .args = { "o", 0, 0, NULL },
+	  .flags = WINDOW_COPY_CMD_FLAG_READONLY,
 	  .clear = WINDOW_COPY_CMD_CLEAR_ALWAYS,
 	  .f = window_copy_cmd_previous_prompt
 	},
 	{ .command = "middle-line",
 	  .args = { "", 0, 0, NULL },
+	  .flags = WINDOW_COPY_CMD_FLAG_READONLY,
 	  .clear = WINDOW_COPY_CMD_CLEAR_EMACS_ONLY,
 	  .f = window_copy_cmd_middle_line
 	},
 	{ .command = "next-matching-bracket",
 	  .args = { "", 0, 0, NULL },
+	  .flags = WINDOW_COPY_CMD_FLAG_READONLY,
 	  .clear = WINDOW_COPY_CMD_CLEAR_ALWAYS,
 	  .f = window_copy_cmd_next_matching_bracket
 	},
 	{ .command = "next-paragraph",
 	  .args = { "", 0, 0, NULL },
+	  .flags = WINDOW_COPY_CMD_FLAG_READONLY,
 	  .clear = WINDOW_COPY_CMD_CLEAR_EMACS_ONLY,
 	  .f = window_copy_cmd_next_paragraph
 	},
 	{ .command = "next-space",
 	  .args = { "", 0, 0, NULL },
+	  .flags = WINDOW_COPY_CMD_FLAG_READONLY,
 	  .clear = WINDOW_COPY_CMD_CLEAR_EMACS_ONLY,
 	  .f = window_copy_cmd_next_space
 	},
 	{ .command = "next-space-end",
 	  .args = { "", 0, 0, NULL },
+	  .flags = WINDOW_COPY_CMD_FLAG_READONLY,
 	  .clear = WINDOW_COPY_CMD_CLEAR_EMACS_ONLY,
 	  .f = window_copy_cmd_next_space_end
 	},
 	{ .command = "next-word",
 	  .args = { "", 0, 0, NULL },
+	  .flags = WINDOW_COPY_CMD_FLAG_READONLY,
 	  .clear = WINDOW_COPY_CMD_CLEAR_EMACS_ONLY,
 	  .f = window_copy_cmd_next_word
 	},
 	{ .command = "next-word-end",
 	  .args = { "", 0, 0, NULL },
+	  .flags = WINDOW_COPY_CMD_FLAG_READONLY,
 	  .clear = WINDOW_COPY_CMD_CLEAR_EMACS_ONLY,
 	  .f = window_copy_cmd_next_word_end
 	},
 	{ .command = "other-end",
 	  .args = { "", 0, 0, NULL },
+	  .flags = 0,
 	  .clear = WINDOW_COPY_CMD_CLEAR_EMACS_ONLY,
 	  .f = window_copy_cmd_other_end
 	},
 	{ .command = "page-down",
 	  .args = { "", 0, 0, NULL },
+	  .flags = WINDOW_COPY_CMD_FLAG_READONLY,
 	  .clear = WINDOW_COPY_CMD_CLEAR_EMACS_ONLY,
 	  .f = window_copy_cmd_page_down
 	},
 	{ .command = "page-down-and-cancel",
 	  .args = { "", 0, 0, NULL },
+	  .flags = WINDOW_COPY_CMD_FLAG_READONLY,
 	  .clear = WINDOW_COPY_CMD_CLEAR_ALWAYS,
 	  .f = window_copy_cmd_page_down_and_cancel
 	},
 	{ .command = "page-up",
 	  .args = { "", 0, 0, NULL },
+	  .flags = WINDOW_COPY_CMD_FLAG_READONLY,
 	  .clear = WINDOW_COPY_CMD_CLEAR_EMACS_ONLY,
 	  .f = window_copy_cmd_page_up
 	},
 	{ .command = "pipe-no-clear",
 	  .args = { "", 0, 1, NULL },
+	  .flags = 0,
 	  .clear = WINDOW_COPY_CMD_CLEAR_NEVER,
 	  .f = window_copy_cmd_pipe_no_clear
 	},
 	{ .command = "pipe",
 	  .args = { "", 0, 1, NULL },
+	  .flags = 0,
 	  .clear = WINDOW_COPY_CMD_CLEAR_ALWAYS,
 	  .f = window_copy_cmd_pipe
 	},
 	{ .command = "pipe-and-cancel",
 	  .args = { "", 0, 1, NULL },
+	  .flags = 0,
 	  .clear = WINDOW_COPY_CMD_CLEAR_ALWAYS,
 	  .f = window_copy_cmd_pipe_and_cancel
 	},
 	{ .command = "previous-matching-bracket",
 	  .args = { "", 0, 0, NULL },
+	  .flags = WINDOW_COPY_CMD_FLAG_READONLY,
 	  .clear = WINDOW_COPY_CMD_CLEAR_ALWAYS,
 	  .f = window_copy_cmd_previous_matching_bracket
 	},
 	{ .command = "previous-paragraph",
 	  .args = { "", 0, 0, NULL },
+	  .flags = WINDOW_COPY_CMD_FLAG_READONLY,
 	  .clear = WINDOW_COPY_CMD_CLEAR_EMACS_ONLY,
 	  .f = window_copy_cmd_previous_paragraph
 	},
 	{ .command = "previous-space",
 	  .args = { "", 0, 0, NULL },
+	  .flags = WINDOW_COPY_CMD_FLAG_READONLY,
 	  .clear = WINDOW_COPY_CMD_CLEAR_EMACS_ONLY,
 	  .f = window_copy_cmd_previous_space
 	},
 	{ .command = "previous-word",
 	  .args = { "", 0, 0, NULL },
+	  .flags = WINDOW_COPY_CMD_FLAG_READONLY,
 	  .clear = WINDOW_COPY_CMD_CLEAR_EMACS_ONLY,
 	  .f = window_copy_cmd_previous_word
 	},
 	{ .command = "rectangle-on",
 	  .args = { "", 0, 0, NULL },
+	  .flags = 0,
 	  .clear = WINDOW_COPY_CMD_CLEAR_ALWAYS,
 	  .f = window_copy_cmd_rectangle_on
 	},
 	{ .command = "rectangle-off",
 	  .args = { "", 0, 0, NULL },
+	  .flags = 0,
 	  .clear = WINDOW_COPY_CMD_CLEAR_ALWAYS,
 	  .f = window_copy_cmd_rectangle_off
 	},
 	{ .command = "rectangle-toggle",
 	  .args = { "", 0, 0, NULL },
+	  .flags = 0,
 	  .clear = WINDOW_COPY_CMD_CLEAR_ALWAYS,
 	  .f = window_copy_cmd_rectangle_toggle
 	},
 	{ .command = "refresh-from-pane",
 	  .args = { "", 0, 0, NULL },
+	  .flags = WINDOW_COPY_CMD_FLAG_READONLY,
 	  .clear = WINDOW_COPY_CMD_CLEAR_ALWAYS,
 	  .f = window_copy_cmd_refresh_from_pane
 	},
 	{ .command = "scroll-bottom",
 	  .args = { "", 0, 0, NULL },
+	  .flags = WINDOW_COPY_CMD_FLAG_READONLY,
 	  .clear = WINDOW_COPY_CMD_CLEAR_ALWAYS,
 	  .f = window_copy_cmd_scroll_bottom
 	},
 	{ .command = "scroll-down",
 	  .args = { "", 0, 0, NULL },
+	  .flags = WINDOW_COPY_CMD_FLAG_READONLY,
 	  .clear = WINDOW_COPY_CMD_CLEAR_EMACS_ONLY,
 	  .f = window_copy_cmd_scroll_down
 	},
 	{ .command = "scroll-down-and-cancel",
 	  .args = { "", 0, 0, NULL },
+	  .flags = WINDOW_COPY_CMD_FLAG_READONLY,
 	  .clear = WINDOW_COPY_CMD_CLEAR_ALWAYS,
 	  .f = window_copy_cmd_scroll_down_and_cancel
 	},
+	{ .command = "scroll-exit-on",
+	  .args = { "", 0, 0, NULL },
+	  .clear = WINDOW_COPY_CMD_CLEAR_ALWAYS,
+	  .f = window_copy_cmd_scroll_exit_on
+	},
+	{ .command = "scroll-exit-off",
+	  .args = { "", 0, 0, NULL },
+	  .clear = WINDOW_COPY_CMD_CLEAR_ALWAYS,
+	  .f = window_copy_cmd_scroll_exit_off
+	},
+	{ .command = "scroll-exit-toggle",
+	  .args = { "", 0, 0, NULL },
+	  .clear = WINDOW_COPY_CMD_CLEAR_ALWAYS,
+	  .f = window_copy_cmd_scroll_exit_toggle
+	},
 	{ .command = "scroll-middle",
 	  .args = { "", 0, 0, NULL },
+	  .flags = WINDOW_COPY_CMD_FLAG_READONLY,
 	  .clear = WINDOW_COPY_CMD_CLEAR_ALWAYS,
 	  .f = window_copy_cmd_scroll_middle
 	},
+	{ .command = "scroll-to-mouse",
+	  .args = { "e", 0, 0, NULL },
+	  .flags = WINDOW_COPY_CMD_FLAG_READONLY,
+	  .clear = WINDOW_COPY_CMD_CLEAR_EMACS_ONLY,
+	  .f = window_copy_cmd_scroll_to_mouse
+	},
 	{ .command = "scroll-top",
 	  .args = { "", 0, 0, NULL },
+	  .flags = WINDOW_COPY_CMD_FLAG_READONLY,
 	  .clear = WINDOW_COPY_CMD_CLEAR_ALWAYS,
 	  .f = window_copy_cmd_scroll_top
 	},
 	{ .command = "scroll-up",
 	  .args = { "", 0, 0, NULL },
+	  .flags = WINDOW_COPY_CMD_FLAG_READONLY,
 	  .clear = WINDOW_COPY_CMD_CLEAR_EMACS_ONLY,
 	  .f = window_copy_cmd_scroll_up
 	},
 	{ .command = "search-again",
 	  .args = { "", 0, 0, NULL },
+	  .flags = 0,
 	  .clear = WINDOW_COPY_CMD_CLEAR_ALWAYS,
 	  .f = window_copy_cmd_search_again
 	},
 	{ .command = "search-backward",
 	  .args = { "", 0, 1, NULL },
+	  .flags = 0,
 	  .clear = WINDOW_COPY_CMD_CLEAR_ALWAYS,
 	  .f = window_copy_cmd_search_backward
 	},
 	{ .command = "search-backward-text",
 	  .args = { "", 0, 1, NULL },
+	  .flags = 0,
 	  .clear = WINDOW_COPY_CMD_CLEAR_ALWAYS,
 	  .f = window_copy_cmd_search_backward_text
 	},
 	{ .command = "search-backward-incremental",
 	  .args = { "", 1, 1, NULL },
+	  .flags = 0,
 	  .clear = WINDOW_COPY_CMD_CLEAR_ALWAYS,
 	  .f = window_copy_cmd_search_backward_incremental
 	},
 	{ .command = "search-forward",
 	  .args = { "", 0, 1, NULL },
+	  .flags = 0,
 	  .clear = WINDOW_COPY_CMD_CLEAR_ALWAYS,
 	  .f = window_copy_cmd_search_forward
 	},
 	{ .command = "search-forward-text",
 	  .args = { "", 0, 1, NULL },
+	  .flags = 0,
 	  .clear = WINDOW_COPY_CMD_CLEAR_ALWAYS,
 	  .f = window_copy_cmd_search_forward_text
 	},
 	{ .command = "search-forward-incremental",
 	  .args = { "", 1, 1, NULL },
+	  .flags = 0,
 	  .clear = WINDOW_COPY_CMD_CLEAR_ALWAYS,
 	  .f = window_copy_cmd_search_forward_incremental
 	},
 	{ .command = "search-reverse",
 	  .args = { "", 0, 0, NULL },
+	  .flags = 0,
 	  .clear = WINDOW_COPY_CMD_CLEAR_ALWAYS,
 	  .f = window_copy_cmd_search_reverse
 	},
 	{ .command = "select-line",
 	  .args = { "", 0, 0, NULL },
+	  .flags = 0,
 	  .clear = WINDOW_COPY_CMD_CLEAR_ALWAYS,
 	  .f = window_copy_cmd_select_line
 	},
 	{ .command = "select-word",
 	  .args = { "", 0, 0, NULL },
+	  .flags = 0,
 	  .clear = WINDOW_COPY_CMD_CLEAR_ALWAYS,
 	  .f = window_copy_cmd_select_word
 	},
+	{ .command = "selection-mode",
+	  .args = { "", 0, 1, NULL },
+	  .flags = 0,
+	  .clear = 0,
+	  .f = window_copy_cmd_selection_mode
+	},
 	{ .command = "set-mark",
 	  .args = { "", 0, 0, NULL },
+	  .flags = WINDOW_COPY_CMD_FLAG_READONLY,
 	  .clear = WINDOW_COPY_CMD_CLEAR_ALWAYS,
 	  .f = window_copy_cmd_set_mark
 	},
 	{ .command = "start-of-line",
 	  .args = { "", 0, 0, NULL },
+	  .flags = WINDOW_COPY_CMD_FLAG_READONLY,
 	  .clear = WINDOW_COPY_CMD_CLEAR_EMACS_ONLY,
 	  .f = window_copy_cmd_start_of_line
 	},
 	{ .command = "stop-selection",
 	  .args = { "", 0, 0, NULL },
+	  .flags = 0,
 	  .clear = WINDOW_COPY_CMD_CLEAR_ALWAYS,
 	  .f = window_copy_cmd_stop_selection
 	},
 	{ .command = "toggle-position",
 	  .args = { "", 0, 0, NULL },
+	  .flags = WINDOW_COPY_CMD_FLAG_READONLY,
 	  .clear = WINDOW_COPY_CMD_CLEAR_NEVER,
 	  .f = window_copy_cmd_toggle_position
 	},
 	{ .command = "top-line",
 	  .args = { "", 0, 0, NULL },
+	  .flags = WINDOW_COPY_CMD_FLAG_READONLY,
 	  .clear = WINDOW_COPY_CMD_CLEAR_EMACS_ONLY,
 	  .f = window_copy_cmd_top_line
 	}
@@ -3131,6 +3351,14 @@ window_copy_command(struct window_mode_entry *wme, struct client *c,
 	action = WINDOW_COPY_CMD_NOTHING;
 	for (i = 0; i < nitems(window_copy_cmd_table); i++) {
 		if (strcmp(window_copy_cmd_table[i].command, command) == 0) {
+			if (c->flags & CLIENT_READONLY &&
+			    (~window_copy_cmd_table[i].flags &
+			    WINDOW_COPY_CMD_FLAG_READONLY)) {
+				status_message_set(c, -1, 1, 0, 0,
+				    "client is read-only");
+				return;
+			}
+
 			cs.wargs = args_parse(&window_copy_cmd_table[i].args,
 			    args_values(args), count, &error);
 
@@ -3167,6 +3395,15 @@ window_copy_command(struct window_mode_entry *wme, struct client *c,
 		window_pane_reset_mode(wp);
 	else if (action == WINDOW_COPY_CMD_REDRAW)
 		window_copy_redraw_screen(wme);
+	else if (action == WINDOW_COPY_CMD_NOTHING) {
+		/*
+		 * Nothing is not actually nothing - most commands at least
+		 * move the cursor (what would be the point of a command that
+		 * literally does nothing?) and in that case we need to redraw
+		 * the first line to update the indicator.
+		 */
+		window_copy_redraw_lines(wme, 0, 1);
+	}
 }
 
 static void
@@ -3538,6 +3775,10 @@ window_copy_stringify(struct grid *gd, u_int py, u_int first, u_int last,
 	buf = xrealloc(buf, bufsize);
 
 	gl = grid_peek_line(gd, py);
+	if (gl == NULL) {
+		buf[*size - 1] = '\0';
+		return (buf);
+	}
 	bx = *size - 1;
 	for (ax = first; ax < last; ax++) {
 		d = window_copy_cellstring(gl, ax, &dlen, &allocated);
@@ -3583,6 +3824,10 @@ window_copy_cstrtocellpos(struct grid *gd, u_int ncells, u_int *ppx, u_int *ppy,
 	px = *ppx;
 	pywrap = *ppy;
 	gl = grid_peek_line(gd, pywrap);
+	if (gl == NULL) {
+		free(cells);
+		return;
+	}
 	while (cell < ncells) {
 		cells[cell].d = window_copy_cellstring(gl, px,
 		    &cells[cell].dlen, &cells[cell].allocated);
@@ -3592,6 +3837,8 @@ window_copy_cstrtocellpos(struct grid *gd, u_int ncells, u_int *ppx, u_int *ppy,
 			px = 0;
 			pywrap++;
 			gl = grid_peek_line(gd, pywrap);
+			if (gl == NULL)
+				break;
 		}
 	}
 
@@ -3993,7 +4240,7 @@ window_copy_visible_lines(struct window_copy_mode_data *data, u_int *start,
 
 	for (*start = gd->hsize - data->oy; *start > 0; (*start)--) {
 		gl = grid_peek_line(gd, (*start) - 1);
-		if (~gl->flags & GRID_LINE_WRAPPED)
+		if (gl == NULL || ~gl->flags & GRID_LINE_WRAPPED)
 			break;
 	}
 	*end = gd->hsize - data->oy + gd->sy;
@@ -4183,6 +4430,9 @@ static void
 window_copy_clear_marks(struct window_mode_entry *wme)
 {
 	struct window_copy_mode_data	*data = wme->data;
+
+	data->searchcount = -1;
+	data->searchmore = 0;
 
 	free(data->searchmark);
 	data->searchmark = NULL;
@@ -4509,6 +4759,16 @@ window_copy_redraw_screen(struct window_mode_entry *wme)
 	struct window_copy_mode_data	*data = wme->data;
 
 	window_copy_redraw_lines(wme, 0, screen_size_y(&data->screen));
+}
+
+static void
+window_copy_style_changed(struct window_mode_entry *wme)
+{
+	struct window_copy_mode_data	*data = wme->data;
+
+	if (data->screen.sel != NULL)
+		window_copy_set_selection(wme, 0, 1);
+	window_copy_redraw_screen(wme);
 }
 
 static void
@@ -4887,6 +5147,8 @@ window_copy_copy_buffer(struct window_mode_entry *wme, const char *prefix,
 
 	if (set_paste)
 		paste_add(prefix, buf, len);
+	else
+		free(buf);
 }
 
 static void *
@@ -4911,9 +5173,11 @@ static void
 window_copy_pipe(struct window_mode_entry *wme, struct session *s,
     const char *cmd)
 {
+	void	*buf;
 	size_t	len;
 
-	window_copy_pipe_run(wme, s, cmd, &len);
+	buf = window_copy_pipe_run(wme, s, cmd, &len);
+	free (buf);
 }
 
 static void
@@ -4924,9 +5188,10 @@ window_copy_copy_pipe(struct window_mode_entry *wme, struct session *s,
 	size_t	 len;
 
 	buf = window_copy_pipe_run(wme, s, cmd, &len);
-	if (buf != NULL)
+	if (buf != NULL) {
 		window_copy_copy_buffer(wme, prefix, buf, len, set_paste,
 		    set_clip);
+	}
 }
 
 static void
@@ -4937,18 +5202,19 @@ window_copy_copy_selection(struct window_mode_entry *wme, const char *prefix,
 	size_t	 len;
 
 	buf = window_copy_get_selection(wme, &len);
-	if (buf != NULL)
+	if (buf != NULL) {
 		window_copy_copy_buffer(wme, prefix, buf, len, set_paste,
 		    set_clip);
+	}
 }
 
 static void
 window_copy_append_selection(struct window_mode_entry *wme)
 {
 	struct window_pane		*wp = wme->wp;
-	char				*buf;
+	char				*buf, *bufname = NULL;
 	struct paste_buffer		*pb;
-	const char			*bufdata, *bufname = NULL;
+	const char			*bufdata;
 	size_t				 len, bufsize;
 	struct screen_write_ctx		 ctx;
 
@@ -4973,6 +5239,7 @@ window_copy_append_selection(struct window_mode_entry *wme)
 	}
 	if (paste_set(buf, len, bufname, NULL) != 0)
 		free(buf);
+	free(bufname);
 }
 
 static void

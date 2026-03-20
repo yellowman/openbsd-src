@@ -1,9 +1,5 @@
-#	$OpenBSD: airport,v 1.102 2025/06/09 17:02:08 fcambus Exp $
+#	$OpenBSD: airport,v 1.107 2026/02/11 20:38:50 mlarkin Exp $
 #	@(#)airport	8.1 (Berkeley) 6/8/93
-#
-# Some of this information from the Airport Search Engine at
-# http://www.uni-karlsruhe.de/~un9v/atm/ase.html, more are
-# available at http://www.mapping.com/airportcodes.shtml
 #
 # Only use the IATA airport codes, and only add ones you have been to.
 # Only add airports. No trains or buses!
@@ -545,6 +541,7 @@ FEZ:Fez, Morocco
 FFM:Fergus Falls, Minnesota, USA
 FHU:Fort Huachuca/Sierra Vista, Arizona, USA
 FIH:Kinshasa, Democratic Republic of the Congo
+FKB:Karlsruhe / Baden-Baden, Germany
 FKL:Chess Lamberton, Franklin, Pennsylvania, USA
 FLG:Flagstaff, Arizona, USA
 FLL:Ft. Lauderdale-Hollywood International, Florida, USA
@@ -1678,6 +1675,7 @@ TBU:Nuku Alofa/Tongatapu International, Tonga
 TCI:Tenerife Norte Los Rodeos, Canary Islands, Spain
 TCL:Van De Graff, Tuscaloosa, Alabama, USA
 TDD:Trinidad, Bolivia
+TDX:Trat, Thailand
 TED:Thisted, Denmark
 TER:Lajes, Terceira Island, Azores Islands, Portugal
 TEX:Telluride, Colorado, USA
@@ -1731,6 +1729,7 @@ TRE:Tiree Island, Scotland, United Kingdom
 TRF:Torp, Sandefjord, Norway
 TRG:Tauranga, New Zealand
 TRK:Tarakan, Indonesia
+TRM:Jacqueline Cochran Regional, Thermal, California, USA
 TRN:Caselle, Turin, Italy
 TRS:Ronchi Dei Legionari, Trieste, Italy
 TRU:Trujillo, Peru
@@ -1775,6 +1774,7 @@ UAQ:San Juan, Argentina
 UBJ:Ube, Japan
 UCA:Utica/Oneida County, New York, USA
 UCT:Ukhta, Russia
+UDD:Bermuda Dunes, California, USA
 UDJ:Uzhgorod International, Zakarpattia, Ukraine
 UDR:Udaipur, India
 UEL:Quelimane, Mozambique
@@ -1786,6 +1786,7 @@ UIN:Baldwin Field, Quincy, Illinois, USA
 UIO:Mariscal, Quito, Ecuador
 UIP:Pluguffan, Quimper, France
 UKA:Ukunda Airstrip, Kwale County, Kenya
+UKK:Ust-Kamenogorsk, Kazakhstan
 UKS:Sevastopol International, Sevastopol, Ukraine
 ULN:Ulan Bator, Mongolia
 ULY:Ulyanovsk, Russia

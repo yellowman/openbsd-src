@@ -1,4 +1,4 @@
-/* $OpenBSD: vmm_machdep.c,v 1.61 2025/07/04 10:11:28 jsg Exp $ */
+/* $OpenBSD: vmm_machdep.c,v 1.72 2026/02/16 15:08:41 hshoexer Exp $ */
 /*
  * Copyright (c) 2014 Mike Larkin <mlarkin@openbsd.org>
  *
@@ -252,24 +252,30 @@ vmm_enabled(void)
 {
 	struct cpu_info *ci;
 	CPU_INFO_ITERATOR cii;
-	int found_vmx = 0, found_svm = 0;
+	int found_ept = 0, found_svm = 0;
 
-	/* Check if we have at least one CPU with either VMX or SVM */
+	/* Check if we have at least one CPU with either VMX/EPT or SVM */
 	CPU_INFO_FOREACH(cii, ci) {
-		if (ci->ci_vmm_flags & CI_VMM_VMX)
-			found_vmx = 1;
+		if (ci->ci_vmm_flags & CI_VMM_EPT)
+			found_ept = 1;
 		if (ci->ci_vmm_flags & CI_VMM_SVM)
 			found_svm = 1;
 	}
 
-	/* Don't support both SVM and VMX at the same time */
-	if (found_vmx && found_svm)
+	/* Don't support both SVM and VMX/EPT at the same time */
+	if (found_ept && found_svm)
 		return (0);
 
-	if (found_vmx || found_svm)
+	if (found_ept || found_svm)
 		return 1;
 
 	return 0;
+}
+
+int
+vmm_probe_machdep(struct device *parent, void *match, void *aux)
+{
+	return vmm_enabled();
 }
 
 void
@@ -2150,10 +2156,8 @@ vcpu_reset_regs_vmx(struct vcpu *vcpu, struct vcpu_reg_state *vrs)
 	    IA32_VMX_ACTIVATE_SECONDARY_CONTROLS, 1)) {
 		if (vcpu_vmx_check_cap(vcpu, IA32_VMX_PROCBASED2_CTLS,
 		    IA32_VMX_UNRESTRICTED_GUEST, 1)) {
-			if ((cr0 & (CR0_PE | CR0_PG)) == 0) {
-				want1 |= IA32_VMX_UNRESTRICTED_GUEST;
-				ug = 1;
-			}
+			want1 |= IA32_VMX_UNRESTRICTED_GUEST;
+			ug = 1;
 		}
 	}
 
@@ -3340,7 +3344,7 @@ vm_run(struct vm_run_params *vrp)
 {
 	struct vm *vm;
 	struct vcpu *vcpu;
-	int ret = 0;
+	int ret = 0, vcpu_rv = 0;
 	u_int old, next;
 
 	/*
@@ -3385,25 +3389,22 @@ vm_run(struct vm_run_params *vrp)
 	WRITE_ONCE(vcpu->vc_curcpu, curcpu());
 	/* Run the VCPU specified in vrp */
 	if (vcpu->vc_virt_mode == VMM_MODE_EPT) {
-		ret = vcpu_run_vmx(vcpu, vrp);
+		vcpu_rv = vcpu_run_vmx(vcpu, vrp);
 	} else if (vcpu->vc_virt_mode == VMM_MODE_RVI) {
-		ret = vcpu_run_svm(vcpu, vrp);
+		vcpu_rv = vcpu_run_svm(vcpu, vrp);
 	}
 	WRITE_ONCE(vcpu->vc_curcpu, NULL);
 
-	if (ret == 0 || ret == EAGAIN) {
-		/* If we are exiting, populate exit data so vmd can help. */
-		vrp->vrp_exit_reason = (ret == 0) ? VM_EXIT_NONE
+	if (vcpu_rv == 0 || vcpu_rv == EAGAIN) {
+		/* vcpu requires useland assist or is yielding */
+		vrp->vrp_exit_reason = (vcpu_rv == 0) ? VM_EXIT_NONE
 		    : vcpu->vc_gueststate.vg_exit_reason;
 		vrp->vrp_irqready = vcpu->vc_irqready;
 		vcpu->vc_state = VCPU_STATE_STOPPED;
-
-		if (copyout(&vcpu->vc_exit, vrp->vrp_exit,
-		    sizeof(struct vm_exit)) == EFAULT) {
-			ret = EFAULT;
-		} else
-			ret = 0;
+		ret = copyout(&vcpu->vc_exit, vrp->vrp_exit,
+		    sizeof(struct vm_exit));
 	} else {
+		/* vcpu is in a terminal state */
 		vrp->vrp_exit_reason = VM_EXIT_TERMINATED;
 		vcpu->vc_state = VCPU_STATE_TERMINATED;
 	}
@@ -3468,8 +3469,8 @@ vmm_fpusave(struct vcpu *vcpu)
 	}
 
 	/*
-	 * Save full copy of FPU state - guest content is always
-	 * a subset of host's save area (see xsetbv exit handler)
+	 * Save a copy of FPU state - guest content is always
+	 * a subset of host's save area. PKRU is saved separately.
 	 */
 	fpusavereset(&vcpu->vc_g_fpu);
 	vcpu->vc_fpuinited = 1;
@@ -3643,6 +3644,7 @@ vmm_translate_gva(struct vcpu *vcpu, uint64_t va, uint64_t *pa, int mode)
  *  0: The run loop exited and no help is needed from vmd
  *  EAGAIN: The run loop exited and help from vmd is needed
  *  EINVAL: an error occurred
+ *  EIO: the vcpu halted without interrupts enabled
  */
 int
 vcpu_run_vmx(struct vcpu *vcpu, struct vm_run_params *vrp)
@@ -3827,6 +3829,10 @@ vcpu_run_vmx(struct vcpu *vcpu, struct vm_run_params *vrp)
 			case VMM_EX_OF:
 				/* Software Exceptions */
 				eii |= (4ULL << 8);
+				break;
+			case VMM_EX_UD:
+				/* Hardware exception, no error code. */
+				eii |= (3ULL << 8);
 				break;
 			case VMM_EX_DF:
 			case VMM_EX_TS:
@@ -4208,7 +4214,7 @@ int
 svm_handle_exit(struct vcpu *vcpu)
 {
 	uint64_t exit_reason, rflags;
-	int update_rip, ret = 0;
+	int update_rip, ret = 0, guest_cpl;
 	struct vmcb *vmcb = (struct vmcb *)vcpu->vc_control_va;
 
 	update_rip = 0;
@@ -4269,7 +4275,6 @@ svm_handle_exit(struct vcpu *vcpu)
 	case SVM_VMEXIT_MWAIT_CONDITIONAL:
 	case SVM_VMEXIT_MONITOR:
 	case SVM_VMEXIT_VMRUN:
-	case SVM_VMEXIT_VMMCALL:
 	case SVM_VMEXIT_VMLOAD:
 	case SVM_VMEXIT_VMSAVE:
 	case SVM_VMEXIT_STGI:
@@ -4289,6 +4294,15 @@ svm_handle_exit(struct vcpu *vcpu)
 		break;
 	case SVM_VMEXIT_VMGEXIT:
 		ret = svm_handle_vmgexit(vcpu);
+		break;
+	case SVM_VMEXIT_VMMCALL:
+		guest_cpl = vmm_get_guest_cpu_cpl(vcpu);
+		if (guest_cpl == 0 &&
+		    vcpu->vc_gueststate.vg_rax == HVCALL_FORCED_ABORT)
+			return (EINVAL);
+		DPRINTF("SVM_VMEXIT_VMMCALL at cpl=%d\n", guest_cpl);
+		ret = vmm_inject_ud(vcpu);
+		update_rip = 0;
 		break;
 	default:
 		DPRINTF("%s: unhandled exit 0x%llx (pa=0x%llx)\n", __func__,
@@ -4333,6 +4347,8 @@ svm_vmgexit_sync_host(struct vcpu *vcpu)
 		return (0);
 
 	ghcb = (struct ghcb_sa *)vcpu->vc_svm_ghcb_va;
+	if (ghcb_empty(ghcb))
+		return (0);
 	if (!ghcb_valid(ghcb))
 		return (EINVAL);
 	valid_bm = ghcb->valid_bitmap;
@@ -4485,14 +4501,8 @@ svm_handle_vmgexit(struct vcpu *vcpu)
 	uint64_t		 result;
 	int			 syncout, error = 0;
 
-	if (vcpu->vc_svm_ghcb_va == 0 && (vmcb->v_ghcb_gpa & ~PG_FRAME) == 0 &&
+	if ((vmcb->v_ghcb_gpa & ~PG_FRAME) == 0 &&
 	    (vmcb->v_ghcb_gpa & PG_FRAME) != 0) {
-		/*
-		 * Guest provides a valid guest physical address
-		 * for GHCB and it is not set yet -> assign it.
-		 *
-		 * We only accept a GHCB once; we decline re-definition.
-		 */
 		ghcb_gpa = vmcb->v_ghcb_gpa & PG_FRAME;
 		if (!pmap_extract(vm->vm_pmap, ghcb_gpa, &ghcb_hpa))
 			return (EINVAL);
@@ -4572,6 +4582,9 @@ svm_handle_vmgexit(struct vcpu *vcpu)
 		vmcb->v_rip = vcpu->vc_gueststate.vg_rip;
 		syncout = 1;
 		break;
+	case SVM_VMEXIT_VMGEXIT:
+		error = vmm_inject_ud(vcpu);
+		break;
 	default:
 		DPRINTF("%s: unknown exit 0x%llx\n", __func__,
 		    vmcb->v_exitcode);
@@ -4641,7 +4654,7 @@ int
 vmx_handle_exit(struct vcpu *vcpu)
 {
 	uint64_t exit_reason, rflags, istate;
-	int update_rip, ret = 0;
+	int update_rip, ret = 0, guest_cpl;
 
 	update_rip = 0;
 	exit_reason = vcpu->vc_gueststate.vg_exit_reason;
@@ -4704,7 +4717,6 @@ vmx_handle_exit(struct vcpu *vcpu)
 	case VMX_EXIT_VMPTRLD:
 	case VMX_EXIT_VMPTRST:
 	case VMX_EXIT_VMCLEAR:
-	case VMX_EXIT_VMCALL:
 	case VMX_EXIT_VMFUNC:
 	case VMX_EXIT_VMXOFF:
 	case VMX_EXIT_INVVPID:
@@ -4721,6 +4733,15 @@ vmx_handle_exit(struct vcpu *vcpu)
 		vmx_dump_vmcs(vcpu);
 #endif /* VMM_DEBUG */
 		ret = EAGAIN;
+		update_rip = 0;
+		break;
+	case VMX_EXIT_VMCALL:
+		guest_cpl = vmm_get_guest_cpu_cpl(vcpu);
+		if (guest_cpl == 0 &&
+		    vcpu->vc_gueststate.vg_rax == HVCALL_FORCED_ABORT)
+			return (EINVAL);
+		DPRINTF("VMX_EXIT_VMCALL at cpl=%d\n", guest_cpl);
+		ret = vmm_inject_ud(vcpu);
 		update_rip = 0;
 		break;
 	default:
@@ -5927,7 +5948,7 @@ svm_handle_xsetbv(struct vcpu *vcpu)
 int
 vmm_handle_xsetbv(struct vcpu *vcpu, uint64_t *rax)
 {
-	uint64_t *rdx, *rcx, val;
+	uint64_t *rdx, *rcx, val, mask = xsave_mask & XFEATURE_XCR0_MASK;
 
 	rcx = &vcpu->vc_gueststate.vg_rcx;
 	rdx = &vcpu->vc_gueststate.vg_rdx;
@@ -5943,8 +5964,12 @@ vmm_handle_xsetbv(struct vcpu *vcpu, uint64_t *rax)
 		return (vmm_inject_gp(vcpu));
 	}
 
+	/* If we're exposing PKRU features, allow guests to set PKRU in xcr0. */
+	if (vmm_softc->sc_md.pkru_enabled)
+		mask |= XFEATURE_PKRU;
+
 	val = *rax + (*rdx << 32);
-	if (val & ~xsave_mask) {
+	if (val & ~mask) {
 		DPRINTF("%s: guest specified xcr0 outside xsave_mask %lld\n",
 		    __func__, val);
 		return (vmm_inject_gp(vcpu));
@@ -6125,6 +6150,7 @@ svm_handle_msr(struct vcpu *vcpu)
 		case MSR_BIOS_SIGN:
 		case MSR_INT_PEN_MSG:
 		case MSR_PLATFORM_ID:
+		case MSR_SYS_CFG:
 			/* Ignored */
 			*rax = 0;
 			*rdx = 0;
@@ -6160,14 +6186,14 @@ static void
 vmm_handle_cpuid_0xd(struct vcpu *vcpu, uint32_t subleaf, uint64_t *rax,
     uint32_t eax, uint32_t ebx, uint32_t ecx, uint32_t edx)
 {
+	uint64_t xcr0 = vcpu->vc_gueststate.vg_xcr0;
+
 	if (subleaf == 0) {
 		/*
 		 * CPUID(0xd.0) depends on the value in XCR0 and MSR_XSS.  If
 		 * the guest XCR0 isn't the same as the host then set it, redo
 		 * the CPUID, and restore it.
 		 */
-		uint64_t xcr0 = vcpu->vc_gueststate.vg_xcr0;
-
 		/*
 		 * "ecx enumerates the size required ... for an area
 		 *  containing all the ... components supported by this
@@ -6187,11 +6213,31 @@ vmm_handle_cpuid_0xd(struct vcpu *vcpu, uint32_t subleaf, uint64_t *rax,
 		}
 		eax = xsave_mask & XFEATURE_XCR0_MASK;
 		edx = (xsave_mask & XFEATURE_XCR0_MASK) >> 32;
+
+		/*
+		 * Emulate support for the pkru xsave region if the
+		 * host has pku enabled. This allow guests to enable
+		 * it in xcr0 and use xsave/xrstor on context switches
+		 * to save or restore pkru.
+		 */
+		if (vmm_softc->sc_md.pkru_enabled) {
+			eax |= XFEATURE_PKRU;
+			ecx = sizeof(struct savefpu) + sizeof(uint64_t);
+			if (xcr0 & XFEATURE_PKRU)
+				ebx = ecx;
+		}
 	} else if (subleaf == 1) {
 		/* mask out XSAVEC, XSAVES, and XFD support */
 		eax &= XSAVE_XSAVEOPT | XSAVE_XGETBV1;
 		ebx = 0;	/* no xsavec or xsaves for now */
 		ecx = edx = 0;	/* no xsaves for now */
+	} else if ((1ULL << subleaf) == XFEATURE_PKRU) {
+		if (vmm_softc->sc_md.pkru_enabled) {
+			eax = sizeof(uint64_t);		/* size of PKRU area */
+			ebx = sizeof(struct savefpu);	/* offset of area */
+		} else
+			eax = ebx = 0;
+		ecx = edx = 0;
 	} else if (subleaf >= 63 ||
 	    ((1ULL << subleaf) & xsave_mask & XFEATURE_XCR0_MASK) == 0) {
 		/* disclaim subleaves of features we don't expose */
@@ -6462,8 +6508,11 @@ vmm_handle_cpuid(struct vcpu *vcpu)
 		*rdx = *((uint32_t *)&vmm_hv_signature[8]);
 		break;
 	case 0x40000001:	/* KVM hypervisor features */
-		*rax = (1 << KVM_FEATURE_CLOCKSOURCE2) |
-		    (1 << KVM_FEATURE_CLOCKSOURCE_STABLE_BIT);
+		if (tsc_frequency > 0)
+			*rax = (1 << KVM_FEATURE_CLOCKSOURCE2) |
+			    (1 << KVM_FEATURE_CLOCKSOURCE_STABLE_BIT);
+		else
+			*rax = 0;
 		*rbx = 0;
 		*rcx = 0;
 		*rdx = 0;
@@ -6475,9 +6524,10 @@ vmm_handle_cpuid(struct vcpu *vcpu)
 		*rdx = *((uint32_t *)&kvm_hv_signature[8]);
 		break;
 	case 0x40000101:	/* KVM hypervisor features */
-		*rax = (1 << KVM_FEATURE_CLOCKSOURCE2) |
-		    (1 << KVM_FEATURE_CLOCKSOURCE_STABLE_BIT) |
-		    (1 << KVM_FEATURE_NOP_IO_DELAY);
+		*rax = 1 << KVM_FEATURE_NOP_IO_DELAY;
+		if (tsc_frequency > 0)
+			*rax |= (1 << KVM_FEATURE_CLOCKSOURCE2) |
+			    (1 << KVM_FEATURE_CLOCKSOURCE_STABLE_BIT);
 		*rbx = 0;
 		*rcx = 0;
 		*rdx = 0;
@@ -6688,6 +6738,10 @@ vcpu_run_svm(struct vcpu *vcpu, struct vm_run_params *vrp)
 				 * XXX check nRIP support.
 				 */
 				vmcb->v_eventinj |= (4ULL << 8);
+				break;
+			case VMM_EX_UD:
+				/* Hardware exception, no error code. */
+				vmcb->v_eventinj |= (3ULL << 8);
 				break;
 			case VMM_EX_AC:
 				vcpu->vc_inject.vie_errorcode = 0;

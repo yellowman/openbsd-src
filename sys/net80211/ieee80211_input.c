@@ -1,4 +1,4 @@
-/*	$OpenBSD: ieee80211_input.c,v 1.255 2025/03/22 07:24:08 kevlo Exp $	*/
+/*	$OpenBSD: ieee80211_input.c,v 1.260 2026/03/19 16:50:32 chris Exp $	*/
 /*	$NetBSD: ieee80211_input.c,v 1.24 2004/05/31 11:12:24 dyoung Exp $	*/
 
 /*-
@@ -424,7 +424,9 @@ ieee80211_inputm(struct ifnet *ifp, struct mbuf *m, struct ieee80211_node *ni,
 		*orxseq = nrxseq;
 	}
 	if (ic->ic_state > IEEE80211_S_SCAN) {
-		ni->ni_rssi = rxi->rxi_rssi;
+		/* Only update RSSI if driver provided a valid value. */
+		if (rxi->rxi_rssi != 0)
+			ni->ni_rssi = rxi->rxi_rssi;
 		ni->ni_rstamp = rxi->rxi_tstamp;
 		ni->ni_inact = 0;
 
@@ -637,26 +639,39 @@ ieee80211_inputm(struct ifnet *ifp, struct mbuf *m, struct ieee80211_node *ni,
 		}
 
 		if (ni->ni_flags & IEEE80211_NODE_RXMGMTPROT) {
+			int is_multicast, is_protected;
+
+			is_multicast = IEEE80211_IS_MULTICAST(wh->i_addr1);
+			is_protected = (wh->i_fc[1] & IEEE80211_FC1_PROTECTED);
+
 			/* MMPDU protection is on for Rx */
 			if (subtype == IEEE80211_FC0_SUBTYPE_DISASSOC ||
 			    subtype == IEEE80211_FC0_SUBTYPE_DEAUTH ||
 			    subtype == IEEE80211_FC0_SUBTYPE_ACTION) {
-				if (!IEEE80211_IS_MULTICAST(wh->i_addr1) &&
-				    !(wh->i_fc[1] & IEEE80211_FC1_PROTECTED)) {
+				if (rxi->rxi_flags & IEEE80211_RXI_HWDEC) {
+					m = ieee80211_input_hwdecrypt(ic, ni,
+					    m, rxi);
+					if (m == NULL)
+						goto out;
+				} else if (!is_multicast && !is_protected) {
 					/* unicast mgmt not encrypted */
+					ic->ic_stats.is_rx_unencrypted++;
 					goto out;
-				}
-				/* do software decryption */
-				m = ieee80211_decrypt(ic, m, ni);
-				if (m == NULL) {
-					/* XXX stats */
-					goto out;
+				} else {
+					/* do software decryption */
+					m = ieee80211_decrypt(ic, m, ni);
+					if (m == NULL) {
+						ic->ic_stats.is_rx_wepfail++;
+						goto out;
+					}
 				}
 				wh = mtod(m, struct ieee80211_frame *);
 			}
 		} else if ((ic->ic_flags & IEEE80211_F_RSNON) &&
-		    (wh->i_fc[1] & IEEE80211_FC1_PROTECTED)) {
+		    ((wh->i_fc[1] & IEEE80211_FC1_PROTECTED) ||
+		    (rxi->rxi_flags & IEEE80211_RXI_HWDEC))) {
 			/* encrypted but MMPDU Rx protection off for TA */
+			ic->ic_stats.is_rx_nowep++;
 			goto out;
 		}
 
@@ -1610,7 +1625,7 @@ ieee80211_recv_probe_resp(struct ieee80211com *ic, struct mbuf *m,
 	const struct ieee80211_frame *wh;
 	const u_int8_t *frm, *efrm;
 	const u_int8_t *tstamp, *ssid, *rates, *xrates, *edcaie, *wmmie, *tim;
-	const u_int8_t *rsnie, *wpaie, *htcaps, *htop, *vhtcaps, *vhtop;
+	const u_int8_t *rsnie, *wpaie, *htcaps, *htop, *vhtcaps, *vhtop, *hecaps, *heop;
 	u_int16_t capinfo, bintval;
 	u_int8_t chan, bchan, erp;
 	int is_new;
@@ -1651,7 +1666,7 @@ ieee80211_recv_probe_resp(struct ieee80211com *ic, struct mbuf *m,
 	capinfo = LE_READ_2(frm); frm += 2;
 
 	ssid = rates = xrates = edcaie = wmmie = rsnie = wpaie = tim = NULL;
-	htcaps = htop = vhtcaps = vhtop = NULL;
+	htcaps = htop = vhtcaps = vhtop = hecaps = heop = NULL;
 	if (rxi->rxi_chan)
 		bchan = rxi->rxi_chan;
 	else
@@ -1709,6 +1724,20 @@ ieee80211_recv_probe_resp(struct ieee80211com *ic, struct mbuf *m,
 			break;
 		case IEEE80211_ELEMID_VHTOP:
 			vhtop = frm;
+			break;
+		case IEEE80211_ELEMID_EXTENSION:
+			if (frm[1] < 1) {
+				ic->ic_stats.is_rx_elem_toosmall++;
+				break;
+			}
+			switch (frm[2]) {
+			case IEEE80211_ELEMID_EXT_HECAPS:
+				hecaps = frm;
+				break;
+			case IEEE80211_ELEMID_EXT_HEOP:
+				heop = frm;
+				break;
+			}
 			break;
 		case IEEE80211_ELEMID_TIM:
 			if (frm[1] < 4) {
@@ -1773,12 +1802,20 @@ ieee80211_recv_probe_resp(struct ieee80211com *ic, struct mbuf *m,
 		return;
 	}
 
+	if ((ni = ieee80211_find_node(ic, wh->i_addr2)) == NULL) {
+		ni = ieee80211_alloc_node(ic, wh->i_addr2);
+		if (ni == NULL)
+			return;
+		is_new = 1;
+	} else
+		is_new = 0;
+
 #ifdef IEEE80211_DEBUG
 	if (ieee80211_debug > 1 &&
-	    (ni == NULL || ic->ic_state == IEEE80211_S_SCAN ||
+	    (is_new || ic->ic_state == IEEE80211_S_SCAN ||
 	    (ic->ic_flags & IEEE80211_F_BGSCAN))) {
 		printf("%s: %s%s on chan %u (bss chan %u) ",
-		    __func__, (ni == NULL ? "new " : ""),
+		    __func__, (is_new ? "new " : ""),
 		    isprobe ? "probe response" : "beacon",
 		    chan, bchan);
 		ieee80211_print_essid(ssid + 2, ssid[1]);
@@ -1787,14 +1824,6 @@ ieee80211_recv_probe_resp(struct ieee80211com *ic, struct mbuf *m,
 			__func__, capinfo, bintval, erp);
 	}
 #endif
-
-	if ((ni = ieee80211_find_node(ic, wh->i_addr2)) == NULL) {
-		ni = ieee80211_alloc_node(ic, wh->i_addr2);
-		if (ni == NULL)
-			return;
-		is_new = 1;
-	} else
-		is_new = 0;
 
 	ni->ni_chan = &ic->ic_channels[chan];
 
@@ -1807,6 +1836,10 @@ ieee80211_recv_probe_resp(struct ieee80211com *ic, struct mbuf *m,
 		if (vhtop && !ieee80211_setup_vhtop(ni, vhtop + 2, vhtop[1], 1))
 			vhtop = NULL; /* invalid VHTOP */
 	}
+	if (hecaps)
+		ieee80211_setup_hecaps(ni, hecaps + 3, hecaps[1] - 1);
+	if (heop && !ieee80211_setup_heop(ni, heop + 3, heop[1] - 1, 1))
+		heop = NULL; /* invalid HEOP */
 
 	if (tim) {
 		ni->ni_dtimcount = tim[2];
@@ -1829,8 +1862,9 @@ ieee80211_recv_probe_resp(struct ieee80211com *ic, struct mbuf *m,
 			    ether_sprintf((u_int8_t *)wh->i_addr2),
 			    ni->ni_erp, erp));
 			if ((ic->ic_curmode == IEEE80211_MODE_11G ||
-			    (ic->ic_curmode == IEEE80211_MODE_11N &&
-			    IEEE80211_IS_CHAN_2GHZ(ni->ni_chan))) &&
+			    ((ic->ic_curmode == IEEE80211_MODE_11N ||
+			      ic->ic_curmode == IEEE80211_MODE_11AX) &&
+			     IEEE80211_IS_CHAN_2GHZ(ni->ni_chan))) &&
 			    (erp & IEEE80211_ERP_USE_PROTECTION))
 				ic->ic_flags |= IEEE80211_F_USEPROT;
 			else
@@ -2047,7 +2081,7 @@ ieee80211_recv_probe_req(struct ieee80211com *ic, struct mbuf *m,
 {
 	const struct ieee80211_frame *wh;
 	const u_int8_t *frm, *efrm;
-	const u_int8_t *ssid, *rates, *xrates, *htcaps, *vhtcaps;
+	const u_int8_t *ssid, *rates, *xrates, *htcaps, *vhtcaps, *hecaps;
 	u_int8_t rate;
 
 	if (ic->ic_opmode == IEEE80211_M_STA ||
@@ -2058,7 +2092,7 @@ ieee80211_recv_probe_req(struct ieee80211com *ic, struct mbuf *m,
 	frm = (const u_int8_t *)&wh[1];
 	efrm = mtod(m, u_int8_t *) + m->m_len;
 
-	ssid = rates = xrates = htcaps = vhtcaps = NULL;
+	ssid = rates = xrates = htcaps = vhtcaps = hecaps = NULL;
 	while (frm + 2 <= efrm) {
 		if (frm + 2 + frm[1] > efrm) {
 			ic->ic_stats.is_rx_elem_toosmall++;
@@ -2079,6 +2113,14 @@ ieee80211_recv_probe_req(struct ieee80211com *ic, struct mbuf *m,
 			break;
 		case IEEE80211_ELEMID_VHTCAPS:
 			vhtcaps = frm;
+			break;
+		case IEEE80211_ELEMID_EXTENSION:
+			if (frm[1] < 1) {
+				ic->ic_stats.is_rx_elem_toosmall++;
+				break;
+			}
+			if (frm[2] == IEEE80211_ELEMID_EXT_HECAPS)
+				hecaps = frm;
 			break;
 		}
 		frm += 2 + frm[1];
@@ -2134,6 +2176,10 @@ ieee80211_recv_probe_req(struct ieee80211com *ic, struct mbuf *m,
 		ieee80211_setup_vhtcaps(ni, vhtcaps + 2, vhtcaps[1]);
 	else
 		ieee80211_clear_vhtcaps(ni);
+	if (hecaps)
+		ieee80211_setup_hecaps(ni, hecaps + 3, hecaps[1] - 1);
+	else
+		ieee80211_clear_hecaps(ni);
 	IEEE80211_SEND_MGMT(ic, ni, IEEE80211_FC0_SUBTYPE_PROBE_RESP, 0);
 }
 #endif	/* IEEE80211_STA_ONLY */
@@ -2204,7 +2250,7 @@ ieee80211_recv_assoc_req(struct ieee80211com *ic, struct mbuf *m,
 	const struct ieee80211_frame *wh;
 	const u_int8_t *frm, *efrm;
 	const u_int8_t *ssid, *rates, *xrates, *rsnie, *wpaie, *wmeie;
-	const u_int8_t *htcaps, *vhtcaps;
+	const u_int8_t *htcaps, *vhtcaps, *hecaps;
 	u_int16_t capinfo, bintval;
 	int resp, status = 0;
 	struct ieee80211_rsnparams rsn;
@@ -2238,7 +2284,7 @@ ieee80211_recv_assoc_req(struct ieee80211com *ic, struct mbuf *m,
 	} else
 		resp = IEEE80211_FC0_SUBTYPE_ASSOC_RESP;
 
-	ssid = rates = xrates = rsnie = wpaie = wmeie = htcaps = vhtcaps = NULL;
+	ssid = rates = xrates = rsnie = wpaie = wmeie = htcaps = vhtcaps = hecaps = NULL;
 	while (frm + 2 <= efrm) {
 		if (frm + 2 + frm[1] > efrm) {
 			ic->ic_stats.is_rx_elem_toosmall++;
@@ -2264,6 +2310,14 @@ ieee80211_recv_assoc_req(struct ieee80211com *ic, struct mbuf *m,
 			break;
 		case IEEE80211_ELEMID_VHTCAPS:
 			vhtcaps = frm;
+			break;
+		case IEEE80211_ELEMID_EXTENSION:
+			if (frm[1] < 1) {
+				ic->ic_stats.is_rx_elem_toosmall++;
+				break;
+			}
+			if (frm[2] == IEEE80211_ELEMID_EXT_HECAPS)
+				hecaps = frm;
 			break;
 		case IEEE80211_ELEMID_VENDOR:
 			if (frm[1] < 4) {
@@ -2520,6 +2574,10 @@ ieee80211_recv_assoc_req(struct ieee80211com *ic, struct mbuf *m,
 		ieee80211_setup_vhtcaps(ni, vhtcaps + 2, vhtcaps[1]);
 	else
 		ieee80211_clear_vhtcaps(ni);
+	if (hecaps)
+		ieee80211_setup_hecaps(ni, hecaps + 3, hecaps[1] - 1);
+	else
+		ieee80211_clear_hecaps(ni);
  end:
 	if (status != 0) {
 		IEEE80211_SEND_MGMT(ic, ni, resp, status);
@@ -2548,7 +2606,7 @@ ieee80211_recv_assoc_resp(struct ieee80211com *ic, struct mbuf *m,
 	const struct ieee80211_frame *wh;
 	const u_int8_t *frm, *efrm;
 	const u_int8_t *rates, *xrates, *edcaie, *wmmie, *htcaps, *htop;
-	const u_int8_t *vhtcaps, *vhtop;
+	const u_int8_t *vhtcaps, *vhtop, *hecaps, *heop;
 	u_int16_t capinfo, status, associd;
 	u_int8_t rate;
 
@@ -2583,7 +2641,7 @@ ieee80211_recv_assoc_resp(struct ieee80211com *ic, struct mbuf *m,
 	associd = LE_READ_2(frm); frm += 2;
 
 	rates = xrates = edcaie = wmmie = htcaps = htop = NULL;
-	vhtcaps = vhtop = NULL;
+	vhtcaps = vhtop = hecaps = heop = NULL;
 	while (frm + 2 <= efrm) {
 		if (frm + 2 + frm[1] > efrm) {
 			ic->ic_stats.is_rx_elem_toosmall++;
@@ -2610,6 +2668,20 @@ ieee80211_recv_assoc_resp(struct ieee80211com *ic, struct mbuf *m,
 			break;
 		case IEEE80211_ELEMID_VHTOP:
 			vhtop = frm;
+			break;
+		case IEEE80211_ELEMID_EXTENSION:
+			if (frm[1] < 1) {
+				ic->ic_stats.is_rx_elem_toosmall++;
+				break;
+			}
+			switch (frm[2]) {
+			case IEEE80211_ELEMID_EXT_HECAPS:
+				hecaps = frm;
+				break;
+			case IEEE80211_ELEMID_EXT_HEOP:
+				heop = frm;
+				break;
+			}
 			break;
 		case IEEE80211_ELEMID_VENDOR:
 			if (frm[1] < 4) {
@@ -2664,14 +2736,21 @@ ieee80211_recv_assoc_resp(struct ieee80211com *ic, struct mbuf *m,
 			vhtop = NULL; /* invalid VHTOP */
 	}
 	ieee80211_vht_negotiate(ic, ni);
+	if (hecaps)
+		ieee80211_setup_hecaps(ni, hecaps + 3, hecaps[1] - 1);
+	if (heop && !ieee80211_setup_heop(ni, heop + 3, heop[1] - 1, 0))
+		heop = NULL; /* invalid HEOP */
+	ieee80211_he_negotiate(ic, ni);
 
-	/* Hop into 11n/11ac modes after associating to a HT/VHT AP. */
-	if (ni->ni_flags & IEEE80211_NODE_VHT)
+	/* Hop into 11n/11ac/11ax modes after associating to a HT/VHT/HE AP. */
+	if (ni->ni_flags & IEEE80211_NODE_HE)
+		ieee80211_setmode(ic, IEEE80211_MODE_11AX);
+	else if (ni->ni_flags & IEEE80211_NODE_VHT)
 		ieee80211_setmode(ic, IEEE80211_MODE_11AC);
 	else if (ni->ni_flags & IEEE80211_NODE_HT)
 		ieee80211_setmode(ic, IEEE80211_MODE_11N);
 	else
-		ieee80211_setmode(ic, ieee80211_chan2mode(ic, ni->ni_chan));
+		ieee80211_setmode(ic, ieee80211_node_abg_mode(ic, ni));
 	/*
 	 * Reset the erp state (mostly the slot time) now that
 	 * our operating mode has been nailed down.
@@ -2694,8 +2773,9 @@ ieee80211_recv_assoc_resp(struct ieee80211com *ic, struct mbuf *m,
 	 * Honor ERP protection.
 	 */
 	if ((ic->ic_curmode == IEEE80211_MODE_11G ||
-	    (ic->ic_curmode == IEEE80211_MODE_11N &&
-	    IEEE80211_IS_CHAN_2GHZ(ni->ni_chan))) &&
+	    ((ic->ic_curmode == IEEE80211_MODE_11N ||
+	      ic->ic_curmode == IEEE80211_MODE_11AX) &&
+	     IEEE80211_IS_CHAN_2GHZ(ni->ni_chan))) &&
 	    (ni->ni_erp & IEEE80211_ERP_USE_PROTECTION))
 		ic->ic_flags |= IEEE80211_F_USEPROT;
 	else

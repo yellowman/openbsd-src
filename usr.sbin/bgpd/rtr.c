@@ -1,4 +1,4 @@
-/*	$OpenBSD: rtr.c,v 1.31 2025/04/14 14:50:29 claudio Exp $ */
+/*	$OpenBSD: rtr.c,v 1.34 2026/03/19 13:36:50 claudio Exp $ */
 
 /*
  * Copyright (c) 2020 Claudio Jeker <claudio@openbsd.org>
@@ -264,9 +264,11 @@ rtr_main(int debug, int verbose)
 			fatal("poll error");
 		}
 
-		if (handle_pollfd(&pfd[PFD_PIPE_MAIN], ibuf_main) == -1)
-			fatalx("Lost connection to parent");
-		else
+		if (handle_pollfd(&pfd[PFD_PIPE_MAIN], ibuf_main) == -1) {
+			log_warnx("RTR: Lost connection to parent");
+			rtr_quit = 1;
+			continue;
+		} else
 			rtr_dispatch_imsg_parent(ibuf_main);
 
 		if (handle_pollfd(&pfd[PFD_PIPE_RDE], ibuf_rde) == -1) {
@@ -314,7 +316,6 @@ rtr_dispatch_imsg_parent(struct imsgbuf *imsgbuf)
 {
 	static struct aspa_set	*aspa;
 	struct imsg		 imsg;
-	struct bgpd_config	 tconf;
 	struct roa		 roa;
 	struct rtr_config_msg	 rtrconf;
 	struct rtr_session	*rs;
@@ -363,11 +364,9 @@ rtr_dispatch_imsg_parent(struct imsgbuf *imsgbuf)
 			rtr_open(rs, fd);
 			break;
 		case IMSG_RECONF_CONF:
-			if (imsg_get_data(&imsg, &tconf, sizeof(tconf)) == -1)
-				fatal("imsg_get_data");
-
 			nconf = new_config();
-			copy_config(nconf, &tconf);
+			if (imsg_recv_config(&imsg, nconf) == -1)
+				fatal("imsg_recv_config");
 			rtr_config_prep();
 			break;
 		case IMSG_RECONF_ROA_ITEM:

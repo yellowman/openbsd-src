@@ -1,4 +1,4 @@
-/*	$OpenBSD: trap.c,v 1.111 2025/07/11 20:04:20 bluhm Exp $	*/
+/*	$OpenBSD: trap.c,v 1.118 2026/03/08 17:07:31 deraadt Exp $	*/
 /*	$NetBSD: trap.c,v 1.2 2003/05/04 23:51:56 fvdl Exp $	*/
 
 /*-
@@ -97,7 +97,7 @@
 
 int	upageflttrap(struct trapframe *, uint64_t);
 int	kpageflttrap(struct trapframe *, uint64_t);
-int	vctrap(struct trapframe *, int);
+int	vctrap(struct trapframe *, int, int *, int *);
 void	kerntrap(struct trapframe *);
 void	usertrap(struct trapframe *);
 void	ast(struct trapframe *);
@@ -302,22 +302,26 @@ kpageflttrap(struct trapframe *frame, uint64_t cr2)
 }
 
 int
-vctrap(struct trapframe *frame, int user)
+vctrap(struct trapframe *frame, int user, int *sig, int *code)
 {
-	uint64_t	 sw_exitcode, sw_exitinfo1, sw_exitinfo2;
 	uint8_t		*rip = (uint8_t *)(frame->tf_rip);
-	uint16_t	 port;
+	uint64_t	 port;
 	struct ghcb_sync syncout, syncin;
 	struct ghcb_sa	*ghcb;
+	struct ghcb_extra_regs	ghcb_regs;
 
 	KASSERT((read_rflags() & PSL_I) == 0);
 
+	if (user) {
+		KASSERT(sig != NULL);
+		KASSERT(code != NULL);
+	}
+
 	memset(&syncout, 0, sizeof(syncout));
 	memset(&syncin, 0, sizeof(syncin));
+	memset(&ghcb_regs, 0, sizeof(ghcb_regs));
 
-	sw_exitcode = frame->tf_err;
-	sw_exitinfo1 = 0;
-	sw_exitinfo2 = 0;
+	ghcb_regs.exitcode = frame->tf_err;
 
 	/*
 	 * The #VC trap occurs when the guest (us) performs an
@@ -329,7 +333,7 @@ vctrap(struct trapframe *frame, int user)
 	 * caused the #VC, then sync the returned values back in
 	 * (from the host).
 	 */
-	switch (sw_exitcode) {
+	switch (ghcb_regs.exitcode) {
 	case SVM_VMEXIT_CPUID:
 		ghcb_sync_val(GHCB_RAX, GHCB_SZ32, &syncout);
 		ghcb_sync_val(GHCB_RCX, GHCB_SZ32, &syncout);
@@ -340,14 +344,17 @@ vctrap(struct trapframe *frame, int user)
 		frame->tf_rip += 2;
 		break;
 	case SVM_VMEXIT_MSR: {
-		if (user)
+		if (user) {
+			*sig = SIGILL;
+			*code = ILL_PRVOPC;
 			return 0;	/* not allowed from userspace */
+		}
 		if (*rip == 0x0f && *(rip + 1) == 0x30) {
 			/* WRMSR */
 			ghcb_sync_val(GHCB_RAX, GHCB_SZ32, &syncout);
 			ghcb_sync_val(GHCB_RCX, GHCB_SZ32, &syncout);
 			ghcb_sync_val(GHCB_RDX, GHCB_SZ32, &syncout);
-			sw_exitinfo1 = 1;
+			ghcb_regs.exitinfo1 = 1;
 		} else if (*rip == 0x0f && *(rip + 1) == 0x32) {
 			/* RDMSR */
 			ghcb_sync_val(GHCB_RCX, GHCB_SZ32, &syncout);
@@ -359,22 +366,25 @@ vctrap(struct trapframe *frame, int user)
 		break;
 	    }
 	case SVM_VMEXIT_IOIO: {
-		if (user)
+		if (user) {
+			*sig = SIGILL;
+			*code = ILL_PRVOPC;
 			return 0;	/* not allowed from userspace */
+		}
 		switch (*rip) {
 		case 0x66: {
 			switch (*(rip + 1)) {
 			case 0xef:	/* out %ax,(%dx) */
 				ghcb_sync_val(GHCB_RAX, GHCB_SZ16, &syncout);
-				port = (uint16_t)frame->tf_rdx;
-				sw_exitinfo1 = (port << 16) |
+				port = frame->tf_rdx & 0xffff;
+				ghcb_regs.exitinfo1 = (port << 16) |
 				    (1ULL << 5);
 				frame->tf_rip += 2;
 				break;
 			case 0xed:	/* in (%dx),%ax */
 				ghcb_sync_val(GHCB_RAX, GHCB_SZ16, &syncin);
-				port = (uint16_t)frame->tf_rdx;
-				sw_exitinfo1 = (port << 16) |
+				port = frame->tf_rdx & 0xffff;
+				ghcb_regs.exitinfo1 = (port << 16) |
 				    (1ULL << 5) | (1ULL << 0);
 				frame->tf_rip += 2;
 				break;
@@ -385,41 +395,41 @@ vctrap(struct trapframe *frame, int user)
 		    }
 		case 0xe4:	/* in $port,%al */
 			ghcb_sync_val(GHCB_RAX, GHCB_SZ8, &syncin);
-			port = *(rip + 1);
-			sw_exitinfo1 = (port << 16) | (1ULL << 4) |
+			port = *(rip + 1) & 0xff;
+			ghcb_regs.exitinfo1 = (port << 16) | (1ULL << 4) |
 			    (1ULL << 0);
 			frame->tf_rip += 2;
 			break;
 		case 0xe6:	/* outb %al,$port */
 			ghcb_sync_val(GHCB_RAX, GHCB_SZ8, &syncout);
-			port = *(rip + 1);
-			sw_exitinfo1 = (port << 16) | (1ULL << 4);
+			port = *(rip + 1) & 0xff;
+			ghcb_regs.exitinfo1 = (port << 16) | (1ULL << 4);
 			frame->tf_rip += 2;
 			break;
 		case 0xec:	/* in (%dx),%al */
 			ghcb_sync_val(GHCB_RAX, GHCB_SZ8, &syncin);
-			port = (uint16_t)frame->tf_rdx;
-			sw_exitinfo1 = (port << 16) | (1ULL << 4) |
+			port = frame->tf_rdx & 0xffff;
+			ghcb_regs.exitinfo1 = (port << 16) | (1ULL << 4) |
 			    (1ULL << 0);
 			frame->tf_rip += 1;
 			break;
 		case 0xed:	/* in (%dx),%eax */
 			ghcb_sync_val(GHCB_RAX, GHCB_SZ32, &syncin);
-			port = (uint16_t)frame->tf_rdx;
-			sw_exitinfo1 = (port << 16) | (1ULL << 6) |
+			port = frame->tf_rdx & 0xffff;
+			ghcb_regs.exitinfo1 = (port << 16) | (1ULL << 6) |
 			    (1ULL << 0);
 			frame->tf_rip += 1;
 			break;
 		case 0xee:	/* out %al,(%dx) */
 			ghcb_sync_val(GHCB_RAX, GHCB_SZ8, &syncout);
-			port = (uint16_t)frame->tf_rdx;
-			sw_exitinfo1 = (port << 16) | (1ULL << 4);
+			port = frame->tf_rdx & 0xffff;
+			ghcb_regs.exitinfo1 = (port << 16) | (1ULL << 4);
 			frame->tf_rip += 1;
 			break;
 		case 0xef:	/* out %eax,(%dx) */
 			ghcb_sync_val(GHCB_RAX, GHCB_SZ32, &syncout);
-			port = (uint16_t)frame->tf_rdx;
-			sw_exitinfo1 = (port << 16) | (1ULL << 6);
+			port = frame->tf_rdx & 0xffff;
+			ghcb_regs.exitinfo1 = (port << 16) | (1ULL << 6);
 			frame->tf_rip += 1;
 			break;
 		default:
@@ -427,8 +437,34 @@ vctrap(struct trapframe *frame, int user)
 		}
 		break;
 	    }
+	case SVM_VMEXIT_VMMCALL:
+		if (user) {
+			*sig = SIGILL;
+			*code = ILL_PRVOPC;
+			return 0;	/* not allowed from userspace */
+		}
+		panic("unexpected VMMCALL in kernelspace");
+		/* NOTREACHED */
+	case SVM_VMEXIT_NPF:
+		if (user) {
+			*sig = SIGBUS;
+			*code = BUS_ADRERR;
+			return 0;	/* not allowed from userspace */
+		}
+		panic("unexpected MMIO in kernelspace");
+		/* NOTREACHED */
+	case SVM_VMEXIT_WBINVD:
+		/*
+		 * There is no special GHCB request for WBNOINVD.
+		 * Signal WBINVD to emulate WBNOINVD.
+		 */
+		if (*rip == 0xf3)
+			frame->tf_rip += 3;
+		else
+			frame->tf_rip += 2;
+		break;
 	default:
-		panic("invalid exit code 0x%llx", sw_exitcode);
+		panic("invalid exit code 0x%llx", ghcb_regs.exitcode);
 	}
 
 	/* Always required */
@@ -438,8 +474,9 @@ vctrap(struct trapframe *frame, int user)
 
 	/* Sync out to GHCB */
 	ghcb = (struct ghcb_sa *)ghcb_vaddr;
-	ghcb_sync_out(frame, sw_exitcode, sw_exitinfo1, sw_exitinfo2, ghcb,
-	    &syncout);
+	ghcb_sync_out(frame, &ghcb_regs, ghcb, &syncout);
+
+	wrmsr(MSR_SEV_GHCB, ghcb_paddr);
 
 	/* Call hypervisor. */
 	vmgexit();
@@ -451,7 +488,7 @@ vctrap(struct trapframe *frame, int user)
 	}
 
 	/* Sync in from GHCB */
-	ghcb_sync_in(frame, ghcb, &syncin);
+	ghcb_sync_in(frame, NULL, ghcb, &syncin);
 
 	return 1;
 }
@@ -471,7 +508,7 @@ kerntrap(struct trapframe *frame)
 	uint64_t cr2 = rcr2();
 
 	verify_smap(__func__);
-	uvmexp.traps++;
+	atomic_inc_int(&uvmexp.traps);
 	debug_trap(frame, curproc, type);
 
 	switch (type) {
@@ -509,7 +546,7 @@ kerntrap(struct trapframe *frame)
 #endif /* NISA > 0 */
 
 	case T_VC:
-		if (vctrap(frame, 0))
+		if (vctrap(frame, 0, NULL, NULL))
 			return;
 		goto we_re_toast;
 	}
@@ -543,7 +580,7 @@ usertrap(struct trapframe *frame)
 	int sig, code;
 
 	verify_smap(__func__);
-	uvmexp.traps++;
+	atomic_inc_int(&uvmexp.traps);
 	debug_trap(frame, p, type);
 
 	p->p_md.md_regs = frame;
@@ -592,10 +629,8 @@ usertrap(struct trapframe *frame)
 		    : ILL_BADSTK;
 		break;
 	case T_VC:
-		if (vctrap(frame, 1))
+		if (vctrap(frame, 1, &sig, &code))
 			goto out;
-		sig = SIGILL;
-		code = ILL_PRVOPC;
 		break;
 	case T_PAGEFLT:			/* page fault */
 		if (!uvm_map_inentry(p, &p->p_spinentry, PROC_STACK(p),
@@ -704,11 +739,11 @@ ast(struct trapframe *frame)
 {
 	struct proc *p = curproc;
 
-	uvmexp.traps++;
+	atomic_inc_int(&uvmexp.traps);
 	KASSERT(!KERNELMODE(frame->tf_cs, frame->tf_rflags));
 	p->p_md.md_regs = frame;
 	refreshcreds(p);
-	uvmexp.softs++;
+	atomic_inc_int(&uvmexp.softs);
 	mi_ast(p, curcpu()->ci_want_resched);
 	userret(p);
 }
@@ -727,7 +762,7 @@ syscall(struct trapframe *frame)
 	register_t code, *args, rval[2];
 
 	verify_smap(__func__);
-	uvmexp.syscalls++;
+	atomic_inc_int(&uvmexp.syscalls);
 	p = curproc;
 
 	if (verify_pkru(p)) {

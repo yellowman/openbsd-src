@@ -1,4 +1,4 @@
-/*	$OpenBSD: in6_proto.c,v 1.147 2025/07/26 01:16:59 mvs Exp $	*/
+/*	$OpenBSD: in6_proto.c,v 1.153 2025/10/24 11:51:49 mvs Exp $	*/
 /*	$KAME: in6_proto.c,v 1.66 2000/10/10 15:35:47 itojun Exp $	*/
 
 /*
@@ -120,6 +120,7 @@ const struct protosw inet6sw[] = {
 {
   .pr_domain	= &inet6domain,
   .pr_protocol	= IPPROTO_IPV6,
+  .pr_flags	= PR_MPSYSCTL,
   .pr_init	= ip6_init,
   .pr_slowtimo	= frag6_slowtimo,
   .pr_sysctl	= ip6_sysctl
@@ -168,7 +169,7 @@ const struct protosw inet6sw[] = {
   .pr_type	= SOCK_RAW,
   .pr_domain	= &inet6domain,
   .pr_protocol	= IPPROTO_ICMPV6,
-  .pr_flags	= PR_ATOMIC|PR_ADDR,
+  .pr_flags	= PR_ATOMIC|PR_ADDR|PR_MPSYSCTL,
   .pr_input	= icmp6_input,
   .pr_ctlinput	= rip6_ctlinput,
   .pr_ctloutput	= rip6_ctloutput,
@@ -356,16 +357,12 @@ int	ip6_defhlim = IPV6_DEFHLIM;			/* [a] */
 int	ip6_defmcasthlim = IPV6_DEFAULT_MULTICAST_HOPS; /* [a] */
 int	ip6_maxfragpackets = 200;			/* [a] */
 int	ip6_maxfrags = 200;	/* [a] */
-int	ip6_log_interval = 5;	/* [a] */
 int	ip6_hdrnestlimit = 10;	/* [a] appropriate? */
 int	ip6_dad_count = 1;	/* [a] DupAddrDetectionTransmits */
 int	ip6_dad_pending;	/* number of currently running DADs */
-int	ip6_auto_flowlabel = 1;	/* [a] */
-int	ip6_use_deprecated = 1;	/* [a] allow deprecated addr (RFC2462 5.5.4) */
 int	ip6_mcast_pmtu = 0;	/* [a] enable pMTU discovery for multicast? */
 int	ip6_neighborgcthresh = 2048; /* [a] Threshold # of NDP entries for GC */
-int	ip6_maxdynroutes = 4096; /* Max # of routes created via redirect */
-time_t	ip6_log_time = (time_t)0L;
+int	ip6_maxdynroutes = 4096; /* [a] Max # of routes created via redirect */
 
 /* raw IP6 parameters */
 /*
@@ -379,5 +376,5 @@ u_long	rip6_recvspace = RIPV6RCVQ;
 
 /* ICMPV6 parameters */
 int	icmp6_redirtimeout = 10 * 60;	/* 10 minutes */
-int	icmp6errppslim = 100;		/* 100pps */
+int	icmp6errppslim = 100;		/* [a] 100pps */
 int	ip6_mtudisc_timeout = IPMTUDISCTIMEOUT;	/* [a] */

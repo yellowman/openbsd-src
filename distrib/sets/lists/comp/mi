@@ -306,6 +306,7 @@
 ./usr/include/dev/ic/iha.h
 ./usr/include/dev/ic/imxiicvar.h
 ./usr/include/dev/ic/iosfvar.h
+./usr/include/dev/ic/ispivar.h
 ./usr/include/dev/ic/lancereg.h
 ./usr/include/dev/ic/lancevar.h
 ./usr/include/dev/ic/lemacreg.h
@@ -354,6 +355,7 @@
 ./usr/include/dev/ic/pgtvar.h
 ./usr/include/dev/ic/pluartvar.h
 ./usr/include/dev/ic/pspvar.h
+./usr/include/dev/ic/qcuartvar.h
 ./usr/include/dev/ic/qlareg.h
 ./usr/include/dev/ic/qlavar.h
 ./usr/include/dev/ic/qlwreg.h
@@ -626,6 +628,7 @@
 ./usr/include/dev/pci/ixgb_ids.h
 ./usr/include/dev/pci/ixgbe.h
 ./usr/include/dev/pci/ixgbe_type.h
+./usr/include/dev/pci/lpssreg.h
 ./usr/include/dev/pci/mpiireg.h
 ./usr/include/dev/pci/neoreg.h
 ./usr/include/dev/pci/pccbbreg.h
@@ -915,8 +918,11 @@
 ./usr/include/fstab.h
 ./usr/include/fts.h
 ./usr/include/ftw.h
-./usr/include/fuse.h
-./usr/include/fuse_opt.h
+./usr/include/fuse
+./usr/include/fuse/fuse.h
+./usr/include/fuse/fuse_common.h
+./usr/include/fuse/fuse_lowlevel.h
+./usr/include/fuse/fuse_opt.h
 ./usr/include/gelf.h
 ./usr/include/getopt.h
 ./usr/include/glob.h
@@ -1144,6 +1150,7 @@
 ./usr/include/openssl/lhash.h
 ./usr/include/openssl/md4.h
 ./usr/include/openssl/md5.h
+./usr/include/openssl/mlkem.h
 ./usr/include/openssl/modes.h
 ./usr/include/openssl/obj_mac.h
 ./usr/include/openssl/objects.h
@@ -1606,12 +1613,10 @@
 ./usr/share/man/man1/libtool.1
 ./usr/share/man/man1/lorder.1
 ./usr/share/man/man1/objdump.1
-./usr/share/man/man1/protoize.1
 ./usr/share/man/man1/ranlib.1
 ./usr/share/man/man1/readelf.1
 ./usr/share/man/man1/rpcgen.1
 ./usr/share/man/man1/strip.1
-./usr/share/man/man1/unprotoize.1
 ./usr/share/man/man1/yacc.1
 ./usr/share/man/man2/__get_tcb.2
 ./usr/share/man/man2/__thrsigdivert.2
@@ -2587,11 +2592,14 @@
 ./usr/share/man/man3/fuse_get_context.3
 ./usr/share/man/man3/fuse_get_session.3
 ./usr/share/man/man3/fuse_loop.3
+./usr/share/man/man3/fuse_lowlevel_new.3
 ./usr/share/man/man3/fuse_main.3
 ./usr/share/man/man3/fuse_mount.3
 ./usr/share/man/man3/fuse_new.3
 ./usr/share/man/man3/fuse_opt.3
 ./usr/share/man/man3/fuse_parse_cmdline.3
+./usr/share/man/man3/fuse_reply_err.3
+./usr/share/man/man3/fuse_session_loop.3
 ./usr/share/man/man3/fuse_set_signal_handlers.3
 ./usr/share/man/man3/fuse_setup.3
 ./usr/share/man/man3/fuse_teardown.3
@@ -2620,7 +2628,6 @@
 ./usr/share/man/man3/getaddrinfo.3
 ./usr/share/man/man3/getbsize.3
 ./usr/share/man/man3/getc.3
-./usr/share/man/man3/getc_unlocked.3
 ./usr/share/man/man3/getcwd.3
 ./usr/share/man/man3/getdelim.3
 ./usr/share/man/man3/getdiskbyname.3
@@ -2847,10 +2854,7 @@
 ./usr/share/man/man3/pthread_key_delete.3
 ./usr/share/man/man3/pthread_kill.3
 ./usr/share/man/man3/pthread_main_np.3
-./usr/share/man/man3/pthread_mutex_destroy.3
 ./usr/share/man/man3/pthread_mutex_init.3
-./usr/share/man/man3/pthread_mutex_lock.3
-./usr/share/man/man3/pthread_mutex_unlock.3
 ./usr/share/man/man3/pthread_mutexattr.3
 ./usr/share/man/man3/pthread_once.3
 ./usr/share/man/man3/pthread_rwlock_init.3
@@ -2872,7 +2876,6 @@
 ./usr/share/man/man3/pthreads.3
 ./usr/share/man/man3/ptsname.3
 ./usr/share/man/man3/putc.3
-./usr/share/man/man3/putc_unlocked.3
 ./usr/share/man/man3/putwc.3
 ./usr/share/man/man3/pw_dup.3
 ./usr/share/man/man3/pw_init.3
@@ -3067,6 +3070,7 @@
 ./usr/share/man/man3/wscanf.3
 ./usr/share/man/man3/xdr.3
 ./usr/share/man/man3/yp_bind.3
+./usr/share/man/man4/bcmstbintc.4
 ./usr/share/man/man9/KASSERT.9
 ./usr/share/man/man9/RBT_INIT.9
 ./usr/share/man/man9/SMR_LIST_INIT.9

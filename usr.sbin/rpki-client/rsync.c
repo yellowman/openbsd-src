@@ -1,4 +1,4 @@
-/*	$OpenBSD: rsync.c,v 1.58 2025/06/16 14:18:40 claudio Exp $ */
+/*	$OpenBSD: rsync.c,v 1.60 2025/11/13 15:18:53 job Exp $ */
 /*
  * Copyright (c) 2019 Kristaps Dzonsons <kristaps@bsd.lv>
  *
@@ -156,7 +156,6 @@ exec_rsync(const char *prog, const char *bind_addr, char *uri, char *dst,
 		args[i++] = "--include=*/";
 		args[i++] = "--include=*.cer";
 		args[i++] = "--include=*.crl";
-		args[i++] = "--include=*.gbr";
 		args[i++] = "--include=*.mft";
 		args[i++] = "--include=*.roa";
 		args[i++] = "--include=*.asa";
@@ -392,9 +391,9 @@ proc_rsync(char *prog, char *bind_addr, int fd)
 		while ((b = io_buf_get(msgq)) != NULL) {
 			/* Read host and module. */
 			io_read_buf(b, &id, sizeof(id));
-			io_read_str(b, &dst);
-			io_read_str(b, &compdst);
-			io_read_str(b, &uri);
+			io_read_opt_str(b, &dst);
+			io_read_opt_str(b, &compdst);
+			io_read_opt_str(b, &uri);
 
 			ibuf_free(b);
 

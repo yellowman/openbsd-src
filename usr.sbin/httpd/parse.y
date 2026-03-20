@@ -1,4 +1,4 @@
-/*	$OpenBSD: parse.y,v 1.128 2022/02/27 20:30:30 bluhm Exp $	*/
+/*	$OpenBSD: parse.y,v 1.131 2026/03/02 19:24:58 rsadowski Exp $	*/
 
 /*
  * Copyright (c) 2020 Matthias Pressfreund <mpfr@fn.de>
@@ -55,6 +55,7 @@
 
 #include "httpd.h"
 #include "http.h"
+#include "log.h"
 
 TAILQ_HEAD(files, file)		 files = TAILQ_HEAD_INITIALIZER(files);
 static struct file {
@@ -141,7 +142,7 @@ typedef struct {
 %token	TIMEOUT TLS TYPE TYPES HSTS MAXAGE SUBDOMAINS DEFAULT PRELOAD REQUEST
 %token	ERROR INCLUDE AUTHENTICATE WITH BLOCK DROP RETURN PASS REWRITE
 %token	CA CLIENT CRL OPTIONAL PARAM FORWARDED FOUND NOT
-%token	ERRDOCS GZIPSTATIC
+%token	ERRDOCS GZIPSTATIC BANNER
 %token	<v.string>	STRING
 %token  <v.number>	NUMBER
 %type	<v.port>	port
@@ -227,6 +228,9 @@ main		: PREFORK NUMBER	{
 		| LOGDIR STRING		{
 			conf->sc_logdir = $2;
 		}
+		| NO BANNER		{
+			conf->sc_flags |= SRVFLAG_NO_BANNER;
+		}
 		| DEFAULT TYPE mediastring	{
 			memcpy(&conf->sc_default_type, &media,
 			    sizeof(struct media_type));
@@ -299,6 +303,9 @@ server		: SERVER optmatch STRING	{
 			sun->sun_len = sizeof(struct sockaddr_un);
 
 			s->srv_conf.hsts_max_age = SERVER_HSTS_DEFAULT_AGE;
+
+			if (conf->sc_flags & SRVFLAG_NO_BANNER)
+				s->srv_conf.flags |= SRVFLAG_NO_BANNER;
 
 			(void)strlcpy(s->srv_conf.errdocroot,
 			    conf->sc_errdocroot,
@@ -550,6 +557,7 @@ serveroptsl	: LISTEN ON STRING opttls port	{
 		| request
 		| root
 		| directory
+		| banner
 		| logformat
 		| fastcgi
 		| authenticate
@@ -684,6 +692,22 @@ serveroptsl	: LISTEN ON STRING opttls port	{
 				YYERROR;
 			}
 			srv->srv_conf.flags |= SRVFLAG_SERVER_HSTS;
+		}
+		;
+
+banner		: BANNER		{
+			if (parentsrv != NULL) {
+				yyerror("banner inside location");
+				YYERROR;
+			}
+			srv->srv_conf.flags &= ~SRVFLAG_NO_BANNER;
+		}
+		| NO BANNER		{
+			if (parentsrv != NULL) {
+				yyerror("no banner inside location");
+				YYERROR;
+			}
+			srv->srv_conf.flags |= SRVFLAG_NO_BANNER;
 		}
 		;
 
@@ -1428,6 +1452,7 @@ lookup(char *s)
 		{ "authenticate",	AUTHENTICATE},
 		{ "auto",		AUTO },
 		{ "backlog",		BACKLOG },
+		{ "banner",		BANNER },
 		{ "block",		BLOCK },
 		{ "body",		BODY },
 		{ "buffer",		BUFFER },
@@ -1896,6 +1921,7 @@ load_config(const char *filename, struct httpd *x_conf)
 	struct media_type	 m;
 	int			 i;
 
+	memset(&m, 0, sizeof(m));
 	conf = x_conf;
 	conf->sc_flags = 0;
 

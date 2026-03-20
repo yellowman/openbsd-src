@@ -1,4 +1,4 @@
-/* $OpenBSD: intr.c,v 1.25 2025/05/10 10:11:02 visa Exp $ */
+/* $OpenBSD: intr.c,v 1.29 2026/03/08 20:44:27 matthieu Exp $ */
 /*
  * Copyright (c) 2011 Dale Rahn <drahn@openbsd.org>
  *
@@ -17,6 +17,7 @@
 
 #include <sys/param.h>
 #include <sys/systm.h>
+#include <sys/atomic.h>
 #include <sys/malloc.h>
 
 #include <uvm/uvm_extern.h>
@@ -64,7 +65,7 @@ void (*arm_intr_dispatch)(void *) = arm_dflt_intr;
 void
 arm_intr(void *frame)
 {
-	uvmexp.intrs++;
+	atomic_inc_int(&uvmexp.intrs);
 	/* XXX - change this to have irq_dispatch use function pointer */
 	(*arm_intr_dispatch)(frame);
 }
@@ -240,10 +241,10 @@ arm_intr_prereg_disestablish_fdt(void *cookie)
 	struct intr_prereg *ip = cookie;
 	struct interrupt_controller *ic = ip->ip_ic;
 
-	if (ip->ip_ic != NULL && ip->ip_ih != NULL)
+	if (ic != NULL && ip->ip_ih != NULL)
 		ic->ic_disestablish(ip->ip_ih);
 
-	if (ip->ip_ic != NULL)
+	if (ic == NULL)
 		LIST_REMOVE(ip, ip_list);
 
 	free(ip, M_DEVBUF, sizeof(*ip));
@@ -520,6 +521,8 @@ arm_intr_establish_fdt_msi_cpu(int node, uint64_t *addr, uint64_t *data,
 
 	val = ic->ic_establish_msi(ic->ic_cookie, addr, data,
 	    level, ci, func, cookie, name);
+	if (val == NULL)
+		return NULL;
 
 	ih = malloc(sizeof(*ih), M_DEVBUF, M_WAITOK);
 	ih->ih_ic = ic;

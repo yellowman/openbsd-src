@@ -1,4 +1,4 @@
-/*	$OpenBSD: sysv_sem.c,v 1.64 2024/07/09 04:42:48 jsg Exp $	*/
+/*	$OpenBSD: sysv_sem.c,v 1.66 2026/02/02 00:04:32 jsg Exp $	*/
 /*	$NetBSD: sysv_sem.c,v 1.26 1996/02/09 19:00:25 christos Exp $	*/
 
 /*
@@ -44,6 +44,8 @@
 #else
 #define DPRINTF(x)
 #endif
+
+#define SEMOP_MAX (MALLOC_MAX / sizeof(struct sembuf))
 
 int	semtot = 0;
 int	semutot = 0;
@@ -328,6 +330,7 @@ again:
 		    semaptr->sem_perm.seq != IPCID_TO_SEQ(semid) ||
 		    semaptr->sem_nsems != nsems) {
 			free(semval, M_TEMP, nsems * sizeof(arg.array[0]));
+			semval = NULL;
 			goto again;
 		}
 		if ((error = ipcperm(cred, &semaptr->sem_perm, IPC_R)))
@@ -380,6 +383,7 @@ again:
 		    semaptr->sem_perm.seq != IPCID_TO_SEQ(semid) ||
 		    semaptr->sem_nsems != nsems) {
 			free(semval, M_TEMP, nsems * sizeof(arg.array[0]));
+			semval = NULL;
 			goto again;
 		}
 		if ((error = ipcperm(cred, &semaptr->sem_perm, IPC_W)))
@@ -876,7 +880,7 @@ const struct sysctl_bounded_args sysvsem_vars[] = {
 	{ KERN_SEMINFO_SEMUSZ, &seminfo.semusz, SYSCTL_INT_READONLY },
 	{ KERN_SEMINFO_SEMVMX, &seminfo.semvmx, SYSCTL_INT_READONLY },
 	{ KERN_SEMINFO_SEMAEM, &seminfo.semaem, SYSCTL_INT_READONLY },
-	{ KERN_SEMINFO_SEMOPM, &seminfo.semopm, 1, INT_MAX },
+	{ KERN_SEMINFO_SEMOPM, &seminfo.semopm, 1, SEMOP_MAX },
 };
 
 /*

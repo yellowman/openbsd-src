@@ -1,4 +1,4 @@
-/*	$OpenBSD: ikev2.c,v 1.393 2025/07/09 06:48:09 yasuoka Exp $	*/
+/*	$OpenBSD: ikev2.c,v 1.395 2025/11/04 11:10:43 yasuoka Exp $	*/
 
 /*
  * Copyright (c) 2019 Tobias Heider <tobias.heider@stusta.de>
@@ -7264,6 +7264,8 @@ ikev2_cp_setaddr_pool(struct iked *env, struct iked_sa *sa,
 			}
 			free(sa->sa_cp_addr);
 			free(sa->sa_rad_addr);
+			sa->sa_cp_addr = NULL;
+			sa->sa_rad_addr = NULL;
 			RB_INSERT(iked_addrpool, &env->sc_addrpool, sa);
 			goto done;
 		}
@@ -7553,7 +7555,7 @@ ikev2_info_sa(struct iked *env, struct imsg *imsg, int dolog, const char *msg,
 	    print_map(sa->sa_state, ikev2_state_map),
 	    sa->sa_hdr.sh_initiator ? 'i' : 'r',
 	    sa->sa_natt ? " natt" : "",
-	    sa->sa_udpencap ? " udpecap" : "",
+	    sa->sa_udpencap ? " udpencap" : "",
 	    sa->sa_nexti, sa->sa_policy);
 
 	if (buflen == -1 || buf == NULL)

@@ -1,4 +1,4 @@
-/*	$OpenBSD: smtpd.c,v 1.356 2025/06/01 08:47:51 op Exp $	*/
+/*	$OpenBSD: smtpd.c,v 1.359 2026/03/10 17:30:23 martijn Exp $	*/
 
 /*
  * Copyright (c) 2008 Gilles Chehade <gilles@poolp.org>
@@ -77,7 +77,7 @@ static void	load_pki_tree(void);
 static void	load_pki_keys(void);
 
 static void	fork_filter_processes(void);
-static void	fork_filter_process(const char *, const char *, const char *, const char *, const char *, uint32_t);
+static void	fork_filter_process(const char *, struct filter_proc *);
 
 enum child_type {
 	CHILD_DAEMON,
@@ -188,6 +188,9 @@ parent_imsg(struct mproc *p, struct imsg *imsg)
 		m_get_string(&m, &password);
 		m_end(&m);
 
+		if (username == NULL || password == NULL)
+			fatalx("parent_imsg: missing username or password");
+
 		ret = parent_auth_user(username, password);
 
 		m_create(p, IMSG_LKA_AUTHENTICATE, 0, 0, -1);
@@ -212,6 +215,9 @@ parent_imsg(struct mproc *p, struct imsg *imsg)
 		m_get_id(&m, &reqid);
 		m_get_string(&m, &cause);
 		m_end(&m);
+
+		if (cause == NULL)
+			fatalx("parent_imsg: missing cause");
 
 		i = NULL;
 		while ((n = tree_iter(&children, &i, NULL, (void**)&c)))
@@ -249,6 +255,9 @@ parent_imsg(struct mproc *p, struct imsg *imsg)
 		m_msg(&m, imsg);
 		m_get_string(&m, &procname);
 		m_end(&m);
+
+		if (procname == NULL)
+			fatalx("parent_imsg: missing procname");
 
 		processor = dict_xget(env->sc_filter_processes_dict, procname);
 		m_create(p_lka, IMSG_LKA_PROCESSOR_ERRFD, 0, 0, processor->errfd);
@@ -1071,7 +1080,7 @@ smtpd(void) {
 
 	purge_task();
 
-	if (pledge("stdio rpath wpath cpath fattr tmppath "
+	if (pledge("stdio rpath wpath cpath fattr "
 	    "getpw sendfd proc exec id inet chown unix", NULL) == -1)
 		fatal("pledge");
 
@@ -1289,11 +1298,11 @@ fork_filter_processes(void)
 
 	iter = NULL;
 	while (dict_iter(env->sc_filter_processes_dict, &iter, &name, (void **)&fp))
-		fork_filter_process(name, fp->command, fp->user, fp->group, fp->chroot, fp->filter_subsystem);
+		fork_filter_process(name, fp);
 }
 
 static void
-fork_filter_process(const char *name, const char *command, const char *user, const char *group, const char *chroot_path, uint32_t subsystems)
+fork_filter_process(const char *name, struct filter_proc *fp)
 {
 	pid_t		 pid;
 	struct filter_proc	*processor;
@@ -1303,14 +1312,14 @@ fork_filter_process(const char *name, const char *command, const char *user, con
 	struct group	*gr;
 	char		 exec[_POSIX_ARG_MAX];
 	int		 execr;
+	const char	*user;
 
-	if (user == NULL)
-		user = SMTPD_USER;
+	user = fp->user != NULL ? fp->user : SMTPD_USER;
 	if ((pw = getpwnam(user)) == NULL)
 		fatal("getpwnam");
 
-	if (group) {
-		if ((gr = getgrnam(group)) == NULL)
+	if (fp->group) {
+		if ((gr = getgrnam(fp->group)) == NULL)
 			fatal("getgrnam");
 	}
 	else {
@@ -1335,7 +1344,8 @@ fork_filter_process(const char *name, const char *command, const char *user, con
 		close(errfd[0]);
 		m_create(p_lka, IMSG_LKA_PROCESSOR_FORK, 0, 0, sp[1]);
 		m_add_string(p_lka, name);
-		m_add_u32(p_lka, (uint32_t)subsystems);
+		m_add_string(p_lka, fp->tag);
+		m_add_u32(p_lka, (uint32_t)fp->filter_subsystem);
 		m_close(p_lka);
 		return;
 	}
@@ -1346,9 +1356,9 @@ fork_filter_process(const char *name, const char *command, const char *user, con
 	dup2(sp[0], STDOUT_FILENO);
 	dup2(errfd[0], STDERR_FILENO);
 
-	if (chroot_path) {
-		if (chroot(chroot_path) != 0 || chdir("/") != 0)
-			fatal("chroot: %s", chroot_path);
+	if (fp->chroot) {
+		if (chroot(fp->chroot) != 0 || chdir("/") != 0)
+			fatal("chroot: %s", fp->chroot);
 	}
 
 	if (setgroups(1, &gr->gr_gid) ||
@@ -1367,11 +1377,11 @@ fork_filter_process(const char *name, const char *command, const char *user, con
 	    signal(SIGHUP, SIG_DFL) == SIG_ERR)
 		fatal("signal");
 
-	if (command[0] == '/')
-		execr = snprintf(exec, sizeof(exec), "exec %s", command);
+	if (fp->command[0] == '/')
+		execr = snprintf(exec, sizeof(exec), "exec %s", fp->command);
 	else
 		execr = snprintf(exec, sizeof(exec), "exec %s/%s", 
-		    PATH_LIBEXEC, command);
+		    PATH_LIBEXEC, fp->command);
 	if (execr >= (int) sizeof(exec))
 		fatalx("%s: exec path too long", name);
 

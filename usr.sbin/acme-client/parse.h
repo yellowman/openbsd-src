@@ -1,4 +1,4 @@
-/*	$OpenBSD: parse.h,v 1.16 2025/06/08 23:53:19 florian Exp $ */
+/*	$OpenBSD: parse.h,v 1.18 2026/02/23 10:27:49 sthen Exp $ */
 /*
  * Copyright (c) 2016 Sebastian Benoit <benno@openbsd.org>
  *
@@ -32,6 +32,11 @@ enum keytype {
 	KT_ECDSA
 };
 
+enum identifiertype {
+	ID_DNS = 0,	/* RFC 8555 */
+	ID_IP		/* RFC 8738 */
+};
+
 struct authority_c {
 	TAILQ_ENTRY(authority_c)	 entry;
 	char				*name;
@@ -47,6 +52,7 @@ struct domain_c {
 	TAILQ_HEAD(, altname_c)	 altname_list;
 	int			 altname_count;
 	enum keytype		 keytype;
+	enum identifiertype	 idtype;
 	char			*handle;
 	char			*domain;
 	char			*key;
@@ -55,11 +61,13 @@ struct domain_c {
 	char			*fullchain;
 	char			*auth;
 	char			*challengedir;
+	char			*profile;
 };
 
 struct altname_c {
 	TAILQ_ENTRY(altname_c)	 entry;
-	char		       	*domain;
+	char			*domain;
+	enum identifiertype	 idtype;
 };
 
 struct keyfile {
@@ -86,5 +94,6 @@ struct authority_c	*authority_find0(struct acme_conf *);
 struct domain_c		*domain_find_handle(struct acme_conf *, char *);
 
 int			 domain_valid(const char *);
+const char		*ip_valid(const char *);
 
 #endif /* PARSE_H */

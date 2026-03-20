@@ -1,4 +1,4 @@
-/*	$OpenBSD: uipc_usrreq.c,v 1.220 2025/06/12 20:37:58 deraadt Exp $	*/
+/*	$OpenBSD: uipc_usrreq.c,v 1.222 2026/03/09 02:44:04 deraadt Exp $	*/
 /*	$NetBSD: uipc_usrreq.c,v 1.18 1996/02/09 19:00:50 christos Exp $	*/
 
 /*
@@ -1146,6 +1146,8 @@ restart:
 		fdp->fd_ofileflags[fds[i]] = (rp->flags & UF_PLEDGED);
 		if (flags & MSG_CMSG_CLOEXEC)
 			fdp->fd_ofileflags[fds[i]] |= UF_EXCLOSE;
+		if (flags & MSG_CMSG_CLOFORK)
+			fdp->fd_ofileflags[fds[i]] |= UF_FORKCLOSE;
 
 		rp++;
 	}
@@ -1282,6 +1284,9 @@ morespace:
 		}
 		if (fp->f_count >= FDUP_MAX_COUNT) {
 			error = EDEADLK;
+			goto fail;
+		} else if (p->p_fd->fd_ofileflags[fd] & UF_PLEDGEOPEN) {
+			error = EPERM;
 			goto fail;
 		}
 		error = pledge_sendfd(p, fp);

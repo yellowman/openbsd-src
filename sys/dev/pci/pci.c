@@ -1,4 +1,4 @@
-/*	$OpenBSD: pci.c,v 1.130 2025/06/29 19:32:08 miod Exp $	*/
+/*	$OpenBSD: pci.c,v 1.132 2025/10/29 16:26:08 kettenis Exp $	*/
 /*	$NetBSD: pci.c,v 1.31 1997/06/06 23:48:04 thorpej Exp $	*/
 
 /*
@@ -90,7 +90,7 @@ const struct cfattach pci_ca = {
 };
 
 struct cfdriver pci_cd = {
-	NULL, "pci", DV_DULL
+	NULL, "pci", DV_DULL, CD_COCOVM
 };
 
 int	pci_ndomains;
@@ -283,6 +283,8 @@ pci_suspend(struct pci_softc *sc)
 
 		pci_suspend_msix(sc->sc_pc, pd->pd_tag, sc->sc_memt,
 		    &pd->pd_msix_mc, pd->pd_msix_table);
+
+		pd->pd_pmcsr_state = pci_get_powerstate(sc->sc_pc, pd->pd_tag);
 	}
 }
 
@@ -307,8 +309,6 @@ pci_powerdown(struct pci_softc *sc)
 			 * Place the device into the lowest possible
 			 * power state.
 			 */
-			pd->pd_pmcsr_state = pci_get_powerstate(sc->sc_pc,
-			    pd->pd_tag);
 			pci_set_powerstate(sc->sc_pc, pd->pd_tag,
 			    pci_min_powerstate(sc->sc_pc, pd->pd_tag));
 		}

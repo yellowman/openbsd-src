@@ -1,4 +1,4 @@
-/* $OpenBSD: monitor_wrap.c,v 1.140 2025/07/04 07:47:35 djm Exp $ */
+/* $OpenBSD: monitor_wrap.c,v 1.146 2026/03/02 02:40:15 djm Exp $ */
 /*
  * Copyright 2002 Niels Provos <provos@citi.umich.edu>
  * Copyright 2002 Markus Friedl <markus@openbsd.org>
@@ -33,14 +33,15 @@
 #include <errno.h>
 #include <pwd.h>
 #include <signal.h>
+#include <stdarg.h>
 #include <stdio.h>
 #include <string.h>
-#include <stdarg.h>
 #include <unistd.h>
 
 #ifdef WITH_OPENSSL
 #include <openssl/bn.h>
 #include <openssl/dh.h>
+#include <openssl/evp.h>
 #endif
 
 #include "xmalloc.h"
@@ -102,8 +103,13 @@ mm_log_handler(LogLevel level, int forced, const char *msg, void *ctx)
 		fatal_f("bad length %zu", len);
 	POKE_U32(sshbuf_mutable_ptr(log_msg), len - 4);
 	if (atomicio(vwrite, mon->m_log_sendfd,
-	    sshbuf_mutable_ptr(log_msg), len) != len)
+	    sshbuf_mutable_ptr(log_msg), len) != len) {
+		if (errno == EPIPE) {
+			debug_f("write: %s", strerror(errno));
+			cleanup_exit(255);
+		}
 		fatal_f("write: %s", strerror(errno));
+	}
 	sshbuf_free(log_msg);
 }
 
@@ -245,6 +251,21 @@ mm_choose_dh(int min, int nbits, int max)
 }
 #endif
 
+void
+mm_sshkey_setcompat(struct ssh *ssh)
+{
+	struct sshbuf *m;
+	int r;
+
+	debug3_f("entering");
+	if ((m = sshbuf_new()) == NULL)
+		fatal_f("sshbuf_new failed");
+	if ((r = sshbuf_put_u32(m, ssh->compat)) != 0)
+		fatal_fr(r, "assemble");
+
+	mm_request_send(pmonitor->m_recvfd, MONITOR_REQ_SETCOMPAT, m);
+}
+
 int
 mm_sshkey_sign(struct ssh *ssh, struct sshkey *key, u_char **sigp, size_t *lenp,
     const u_char *data, size_t datalen, const char *hostkey_alg,
@@ -296,7 +317,7 @@ mm_decode_activate_server_options(struct ssh *ssh, struct sshbuf *m)
 		    (r = sshbuf_get_cstring(m, &newopts->x, NULL)) != 0) \
 			fatal_fr(r, "parse %s", #x); \
 	} while (0)
-#define M_CP_STRARRAYOPT(x, nx) do { \
+#define M_CP_STRARRAYOPT(x, nx, clobber) do { \
 		newopts->x = newopts->nx == 0 ? \
 		    NULL : xcalloc(newopts->nx, sizeof(*newopts->x)); \
 		for (i = 0; i < newopts->nx; i++) { \
@@ -315,6 +336,17 @@ mm_decode_activate_server_options(struct ssh *ssh, struct sshbuf *m)
 	log_verbose_reset();
 	for (i = 0; i < options.num_log_verbose; i++)
 		log_verbose_add(options.log_verbose[i]);
+
+	/* use the macro hell to clean up too */
+#define M_CP_STROPT(x) free(newopts->x)
+#define M_CP_STRARRAYOPT(x, nx, clobber) do { \
+		for (i = 0; i < newopts->nx; i++) \
+			free(newopts->x[i]); \
+		free(newopts->x); \
+	} while (0)
+	COPY_MATCH_STRING_OPTS();
+#undef M_CP_STROPT
+#undef M_CP_STRARRAYOPT
 	free(newopts);
 }
 
