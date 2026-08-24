@@ -1,4 +1,4 @@
-/*	$OpenBSD: ccr.c,v 1.33 2026/01/29 18:25:29 tb Exp $ */
+/*	$OpenBSD: ccr.c,v 1.43 2026/07/20 10:02:55 job Exp $ */
 /*
  * Copyright (c) 2025 Job Snijders <job@openbsd.org>
  *
@@ -324,13 +324,13 @@ append_cached_manifest(STACK_OF(ManifestInstance) *mis, struct ccr_mft *cm)
 
 	location_add_sia(mi->locations, cm->sia);
 
-	if (SLIST_EMPTY(&cm->subordinates))
+	if (SIMPLEQ_EMPTY(&cm->subordinates))
 		goto done;
 
 	if ((mi->subordinates = sk_SubjectKeyIdentifier_new(ski_cmp)) == NULL)
 		err(1, NULL);
 
-	SLIST_FOREACH(sub, &cm->subordinates, entry) {
+	SIMPLEQ_FOREACH(sub, &cm->subordinates, entry) {
 		if ((ski = SubjectKeyIdentifier_new()) == NULL)
 			err(1, NULL);
 
@@ -395,13 +395,9 @@ append_cached_vrp(STACK_OF(ROAIPAddress) *addresses, struct vrp *vrp)
 	if (num_bits > 0)
 		unused_bits = 8 - num_bits;
 
-	if (!ASN1_BIT_STRING_set(ripa->address, vrp->addr.addr, num_bytes))
-		errx(1, "ASN1_BIT_STRING_set");
-
-	/* ip_addr_parse() handles unused bits, no need to clear them here. */
-	ripa->address->flags |= ASN1_STRING_FLAG_BITS_LEFT | unused_bits;
-
-	/* XXX - assert that unused bits are zero */
+	if (!ASN1_BIT_STRING_set1(ripa->address, vrp->addr.addr, num_bytes,
+	    unused_bits))
+		errx(1, "ASN1_BIT_STRING_set1");
 
 	if (vrp->maxlength > vrp->addr.prefixlen) {
 		if ((ripa->maxLength = ASN1_INTEGER_new()) == NULL)
@@ -512,7 +508,9 @@ generate_aspapayloadstate(struct validation_data *vd)
 		errx(1, "ASPAPayloadState_new");
 
 	RB_FOREACH(vap, vap_tree, &vd->vaps) {
-		append_cached_aspa(vaps->aps, vap);
+		if (!vap->overflowed) {
+			append_cached_aspa(vaps->aps, vap);
+		}
 	}
 
 	hash_asn1_item(vaps->hash, ASN1_ITEM_rptr(ASPAPayloadSets), vaps->aps);
@@ -729,7 +727,7 @@ ccr_insert_mft_sub(struct ccr_mft_tree *tree, const struct cert *cert)
 	if (hex_decode(cert->ski, sub->ski, sizeof(sub->ski)) != 0)
 		errx(1, "hex_decode");
 
-	SLIST_INSERT_HEAD(&m->subordinates, sub, entry);
+	SIMPLEQ_INSERT_TAIL(&m->subordinates, sub, entry);
 }
 
 static inline int
@@ -748,7 +746,7 @@ ccr_mft_new(void)
 	if ((ccr_mft = calloc(1, sizeof(*ccr_mft))) == NULL)
 		err(1, NULL);
 
-	SLIST_INIT(&ccr_mft->subordinates);
+	SIMPLEQ_INIT(&ccr_mft->subordinates);
 
 	return ccr_mft;
 }
@@ -832,14 +830,14 @@ ccr_vrp_cmp(const struct vrp *a, const struct vrp *b)
 		break;
 	}
 
-	if (a->addr.prefixlen < b->addr.prefixlen)
-		return 1;
 	if (a->addr.prefixlen > b->addr.prefixlen)
+		return 1;
+	if (a->addr.prefixlen < b->addr.prefixlen)
 		return -1;
 
-	if (a->maxlength < b->maxlength)
-		return 1;
 	if (a->maxlength > b->maxlength)
+		return 1;
+	if (a->maxlength < b->maxlength)
 		return -1;
 
 	return 0;
@@ -864,9 +862,9 @@ ccr_mft_free(struct ccr_mft *ccr_mft)
 	if (ccr_mft == NULL)
 		return;
 
-	while (!SLIST_EMPTY(&ccr_mft->subordinates)) {
-		sub_ski = SLIST_FIRST(&ccr_mft->subordinates);
-		SLIST_REMOVE_HEAD(&ccr_mft->subordinates, entry);
+	while (!SIMPLEQ_EMPTY(&ccr_mft->subordinates)) {
+		sub_ski = SIMPLEQ_FIRST(&ccr_mft->subordinates);
+		SIMPLEQ_REMOVE_HEAD(&ccr_mft->subordinates, entry);
 		free(sub_ski);
 	}
 
@@ -1010,16 +1008,19 @@ parse_mft_instances(const char *fn, struct ccr *ccr,
 
 		if (!copy_asn1_string(mi->aki,
 		    ccr_mft->aki, sizeof(ccr_mft->aki))) {
-			warnx("%s: manifest instance #%d corrupted", fn, i);
+			warnx("%s: manifest instance #%d corrupted: aki",
+			    fn, i);
 			goto out;
 		}
 
 		if (!ASN1_INTEGER_get_uint64(&size, mi->size)) {
-			warnx("%s: manifest instance #%d corrupted", fn, i);
+			warnx("%s: manifest instance #%d corrupted: size parse",
+			    fn, i);
 			goto out;
 		}
 		if (size < 1000 || size > MAX_FILE_SIZE) {
-			warnx("%s: manifest instance #%d corrupted", fn, i);
+			warnx("%s: manifest instance #%d corrupted: size",
+			    fn, i);
 			goto out;
 		}
 		ccr_mft->size = size;
@@ -1034,7 +1035,8 @@ parse_mft_instances(const char *fn, struct ccr *ccr,
 			goto out;
 
 		if (sk_ACCESS_DESCRIPTION_num(mi->locations) != 1) {
-			warnx("%s: unexpected number of locations", fn);
+			warnx("%s: manifest instance #%d corrupted: unexpected"
+			    " number of locations", fn, i);
 			goto out;
 		}
 
@@ -1054,11 +1056,11 @@ parse_mft_instances(const char *fn, struct ccr *ccr,
 
 			s = sk_SubjectKeyIdentifier_value(mi->subordinates, j);
 			if (!copy_asn1_string(s, sub->ski, sizeof(sub->ski))) {
-				warnx("%s: manifest instance #%d corrupted",
-				    fn, i);
+				warnx("%s: manifest instance #%d corrupted: "
+				    "subordinates ski", fn, i);
 				goto out;
 			}
-			SLIST_INSERT_HEAD(&ccr_mft->subordinates, sub, entry);
+			SIMPLEQ_INSERT_TAIL(&ccr_mft->subordinates, sub, entry);
 			sub = NULL;
 		}
 
@@ -1093,6 +1095,12 @@ parse_manifeststate(const char *fn, struct ccr *ccr, const ManifestState *state)
 	    state->mostRecentUpdate, &ccr->most_recent_update))
 		goto out;
 
+	if (sk_ManifestInstance_num(state->mis) == 0 &&
+	    ccr->most_recent_update != 0) {
+		warnx("%s: invalid ManifestState mostRecentUpdate", fn);
+		goto out;
+	}
+
 	if (!parse_mft_instances(fn, ccr, state->mis))
 		goto out;
 
@@ -1102,7 +1110,7 @@ parse_manifeststate(const char *fn, struct ccr *ccr, const ManifestState *state)
 }
 
 static int
-parse_roa_addresses(const char *fn, struct ccr *ccr, int asid, enum afi afi,
+parse_roa_addresses(const char *fn, struct ccr *ccr, uint32_t asid, enum afi afi,
     const STACK_OF(ROAIPAddress) *addrs)
 {
 	const ROAIPAddress *r;
@@ -1170,7 +1178,7 @@ parse_roa_addresses(const char *fn, struct ccr *ccr, int asid, enum afi afi,
 }
 
 static int
-parse_roa_ipaddrb(const char *fn, struct ccr *ccr, int asid,
+parse_roa_ipaddrb(const char *fn, struct ccr *ccr, uint32_t asid,
     const STACK_OF(ROAIPAddressFamily) *ipaddrblocks)
 {
 	const ROAIPAddressFamily *ripaf;
@@ -1180,7 +1188,7 @@ parse_roa_ipaddrb(const char *fn, struct ccr *ccr, int asid,
 
 	ipb_num = sk_ROAIPAddressFamily_num(ipaddrblocks);
 	if (ipb_num != 1 && ipb_num != 2) {
-		warnx("%s: unexpected ipAddrBlocks count for AS %d", fn, asid);
+		warnx("%s: unexpected ipAddrBlocks count for AS %u", fn, asid);
 		goto out;
 	}
 
@@ -1188,7 +1196,7 @@ parse_roa_ipaddrb(const char *fn, struct ccr *ccr, int asid,
 		ripaf = sk_ROAIPAddressFamily_value(ipaddrblocks, i);
 
 		if (!ip_addr_afi_parse(fn, ripaf->addressFamily, &afi)) {
-			warnx("%s: invalid afi for AS %d", fn, asid);
+			warnx("%s: invalid afi for AS %u", fn, asid);
 			goto out;
 		}
 
@@ -1196,19 +1204,19 @@ parse_roa_ipaddrb(const char *fn, struct ccr *ccr, int asid,
 		case AFI_IPV4:
 			if (ipv6_seen > 0) {
 				warnx("%s: misordered IPv4 addressFamily for AS"
-				    " %d", fn, asid);
+				    " %u", fn, asid);
 				goto out;
 			}
 			if (ipv4_seen++ > 0) {
 				warnx("%s: IPv4 addressFamily duplicate for AS"
-				    " %d", fn, asid);
+				    " %u", fn, asid);
 				goto out;
 			}
 			break;
 		case AFI_IPV6:
 			if (ipv6_seen++ > 0) {
 				warnx("%s: IPv6 addressFamily duplicate for AS"
-				    " %d", fn, asid);
+				    " %u", fn, asid);
 				goto out;
 			}
 			break;
@@ -1235,7 +1243,7 @@ parse_roa_payloads(const char *fn, struct ccr *ccr,
 	RB_INIT(&ccr->vrps);
 
 	for (i = 0; i < rps_num; i++) {
-		int asid;
+		uint32_t asid;
 
 		rp = sk_ROAPayloadSet_value(rps, i);
 
@@ -1272,7 +1280,7 @@ parse_roastate(const char *fn, struct ccr *ccr, const ROAPayloadState *state)
 }
 
 static int
-parse_aspa_providers(const char *fn, struct ccr *ccr, int asid,
+parse_aspa_providers(const char *fn, struct ccr *ccr, uint32_t asid,
     STACK_OF(ASN1_INTEGER) *providers)
 {
 	struct vap *vap = NULL;
@@ -1281,7 +1289,7 @@ parse_aspa_providers(const char *fn, struct ccr *ccr, int asid,
 	int i, p_num, rc = 0;
 
 	if ((p_num = sk_ASN1_INTEGER_num(providers)) <= 0) {
-		warnx("%s: AS %d ASPAPayloadSet providers missing", fn, asid);
+		warnx("%s: AS %u ASPAPayloadSet providers missing", fn, asid);
 		goto out;
 	}
 
@@ -1298,13 +1306,13 @@ parse_aspa_providers(const char *fn, struct ccr *ccr, int asid,
 		aint = sk_ASN1_INTEGER_value(providers, i);
 
 		if (!as_id_parse(aint, &provider)) {
-			warnx("%s: AS %d malformed ASPA provider", fn, asid);
+			warnx("%s: AS %u malformed ASPA provider", fn, asid);
 			goto out;
 		}
 
 		if (i > 0) {
 			if (provider <= prev) {
-				warnx("%s: AS %d misordered providers", fn,
+				warnx("%s: AS %u misordered providers", fn,
 				    asid);
 				goto out;
 			}
@@ -1465,7 +1473,7 @@ parse_routerkeys(const char *fn, struct ccr *ccr, uint32_t asid,
 	prev = NULL;
 	for (i = 0; i < rk_num; i++) {
 		unsigned char *der;
-		size_t der_len;
+		int der_len;
 
 		if ((brk = calloc(1, sizeof(*brk))) == NULL)
 			err(1, NULL);
@@ -1475,7 +1483,7 @@ parse_routerkeys(const char *fn, struct ccr *ccr, uint32_t asid,
 		rk = sk_RouterKey_value(routerkeys, i);
 
 		if (ASN1_STRING_length(rk->ski) != SHA_DIGEST_LENGTH) {
-			warnx("%s: AS%d RouterKey SKI corrupted", fn, asid);
+			warnx("%s: AS %u RouterKey SKI corrupted", fn, asid);
 			goto out;
 		}
 
@@ -1483,7 +1491,7 @@ parse_routerkeys(const char *fn, struct ccr *ccr, uint32_t asid,
 
 		der = NULL;
 		if ((der_len = i2d_X509_PUBKEY(rk->spki, &der)) <= 0) {
-			warnx("%s: AS%d RouterKey SPKI corrupted", fn, asid);
+			warnx("%s: AS %u RouterKey SPKI corrupted", fn, asid);
 			goto out;
 		}
 
@@ -1535,7 +1543,7 @@ parse_rksets(const char *fn, struct ccr *ccr, STACK_OF(RouterKeySet) *rksets)
 
 		if (i > 0) {
 			if (asid <= prev) {
-				warnx("%s: AS %d misordered routerkeyset", fn,
+				warnx("%s: AS %u misordered routerkeyset", fn,
 				    asid);
 				goto out;
 			}
@@ -1597,7 +1605,7 @@ ccr_parse(const char *fn, const unsigned char *der, size_t len)
 		char buf[128];
 
 		OBJ_obj2txt(buf, sizeof(buf), ci->contentType, 1);
-		warnx("%s: unexpected OID: got %s, want 1.3.6.1.4.1.41948.828",
+		warnx("%s: unexpected OID: got %s, want 1.2.840.113549.1.9.16.1.54",
 		    fn, buf);
 		goto out;
 	}

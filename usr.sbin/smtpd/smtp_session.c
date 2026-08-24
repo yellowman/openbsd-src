@@ -1,4 +1,4 @@
-/*	$OpenBSD: smtp_session.c,v 1.446 2026/01/07 07:54:57 martijn Exp $	*/
+/*	$OpenBSD: smtp_session.c,v 1.449 2026/05/26 22:43:32 gilles Exp $	*/
 
 /*
  * Copyright (c) 2008 Gilles Chehade <gilles@poolp.org>
@@ -1422,13 +1422,6 @@ smtp_check_ehlo(struct smtp_session *s, const char *args)
 		return 0;
 	}
 
-	if (s->helo[0]) {
-		smtp_reply(s, "503 %s %s: Already identified",
-		    esc_code(ESC_STATUS_PERMFAIL, ESC_INVALID_COMMAND),
-		    esc_description(ESC_INVALID_COMMAND));
-		return 0;
-	}
-
 	if (args == NULL) {
 		smtp_reply(s, "501 %s %s: EHLO requires domain name",
 		    esc_code(ESC_STATUS_PERMFAIL, ESC_INVALID_COMMAND),
@@ -1770,6 +1763,13 @@ smtp_proceed_ehlo(struct smtp_session *s, const char *args)
 	s->flags |= SF_EHLO;
 	s->flags |= SF_8BITMIME;
 
+	/* EHLO should behave like a RSET */
+	if (s->tx) {
+		if (s->tx->msgid)
+			smtp_tx_rollback(s->tx);
+		smtp_tx_free(s->tx);
+	}
+
 	smtp_report_link_identify(s, "EHLO", s->helo);
 
 	smtp_enter_state(s, STATE_HELO);
@@ -1943,6 +1943,8 @@ smtp_rfc4954_auth_plain(struct smtp_session *s, char *arg)
 		if (user == NULL || user >= buf + len - 2)
 			goto abort;
 		user++; /* skip NUL */
+		if (user[strcspn(user, "\r\n")] != '\0')
+			goto abort;
 		if (strlcpy(s->username, user, sizeof(s->username))
 		    >= sizeof(s->username))
 			goto abort;
@@ -1951,6 +1953,8 @@ smtp_rfc4954_auth_plain(struct smtp_session *s, char *arg)
 		if (pass == NULL || pass >= buf + len - 1)
 			goto abort;
 		pass++; /* skip NUL */
+		if (pass[strcspn(pass, "\r\n")] != '\0')
+			goto abort;
 
 		m_create(p_lka,  IMSG_SMTP_AUTHENTICATE, 0, 0, -1);
 		m_add_id(p_lka, s->id);
@@ -1993,6 +1997,9 @@ smtp_rfc4954_auth_login(struct smtp_session *s, char *arg)
 				  sizeof(s->username) - 1) == -1)
 			goto abort;
 
+		if (s->username[strcspn(s->username, "\r\n")] != '\0')
+			goto abort;
+
 		smtp_enter_state(s, STATE_AUTH_PASSWORD);
 		smtp_reply(s, "334 UGFzc3dvcmQ6");
 		return;
@@ -2001,6 +2008,9 @@ smtp_rfc4954_auth_login(struct smtp_session *s, char *arg)
 		memset(buf, 0, sizeof(buf));
 		if (base64_decode(arg, (unsigned char *)buf,
 				  sizeof(buf)-1) == -1)
+			goto abort;
+
+		if (buf[strcspn(buf, "\r\n")] != '\0')
 			goto abort;
 
 		m_create(p_lka,  IMSG_SMTP_AUTHENTICATE, 0, 0, -1);
@@ -2092,6 +2102,9 @@ smtp_reply(struct smtp_session *s, char *fmt, ...)
 	va_start(ap, fmt);
 	n = vsnprintf(buf, sizeof buf, fmt, ap);
 	va_end(ap);
+	if (n >= (int)sizeof buf)
+		n = (int)sizeof buf - 1;
+
 	if (n < 0)
 		fatalx("smtp_reply: response format error");
 	if (n < 4)
@@ -2187,6 +2200,18 @@ smtp_free(struct smtp_session *s, const char * reason)
 
 	smtp_report_link_disconnect(s);
 	smtp_filter_end(s);
+
+	tree_pop(&wait_lka_helo, s->id);
+	tree_pop(&wait_lka_mail, s->id);
+	tree_pop(&wait_lka_rcpt, s->id);
+	tree_pop(&wait_parent_auth, s->id);
+	tree_pop(&wait_queue_msg, s->id);
+	tree_pop(&wait_queue_fd, s->id);
+	tree_pop(&wait_queue_commit, s->id);
+	tree_pop(&wait_ssl_init, s->id);
+	tree_pop(&wait_ssl_verify, s->id);
+	tree_pop(&wait_filters, s->id);
+	tree_pop(&wait_filter_fd, s->id);
 
 	if (s->flags & SF_SECURE && s->listener->flags & F_SMTPS)
 		stat_decrement("smtp.smtps", 1);

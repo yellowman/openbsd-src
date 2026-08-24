@@ -1,4 +1,4 @@
-/*	$OpenBSD: x509.c,v 1.128 2026/02/11 14:41:34 tb Exp $ */
+/*	$OpenBSD: x509.c,v 1.133 2026/06/21 19:23:56 tb Exp $ */
 /*
  * Copyright (c) 2022 Theo Buehler <tb@openbsd.org>
  * Copyright (c) 2021 Claudio Jeker <claudio@openbsd.org>
@@ -46,7 +46,7 @@ ASN1_OBJECT	*rsc_oid;	/* id-ct-signedChecklist */
 ASN1_OBJECT	*aspa_oid;	/* id-ct-ASPA */
 ASN1_OBJECT	*tak_oid;	/* id-ct-SignedTAL */
 ASN1_OBJECT	*spl_oid;	/* id-ct-signedPrefixList */
-ASN1_OBJECT	*ccr_oid;	/* CanonicalCacheRepresentation PEN OID */
+ASN1_OBJECT	*ccr_oid;	/* id-ct-rpkiCanonicalCacheRepresentation */
 
 static const struct {
 	const char	 *oid;
@@ -217,7 +217,7 @@ x509_inherits(X509 *x)
 	addrblk = X509_get_ext_d2i(x, NID_sbgp_ipAddrBlock, &crit, NULL);
 	if (addrblk == NULL) {
 		if (crit != -1)
-			warnx("error parsing ipAddrBlock");
+			warnx("error parsing ipAddrBlocks");
 		goto out;
 	}
 
@@ -266,7 +266,7 @@ x509_any_inherits(X509 *x)
 
 	addrblk = X509_get_ext_d2i(x, NID_sbgp_ipAddrBlock, &crit, NULL);
 	if (addrblk == NULL && crit != -1)
-		warnx("error parsing ipAddrBlock");
+		warnx("error parsing ipAddrBlocks");
 	if (X509v3_addr_inherits(addrblk))
 		rc = 1;
 
@@ -298,8 +298,9 @@ x509_get_time(const ASN1_TIME *at, time_t *t)
 		return 0;
 	if (!ASN1_TIME_to_tm(at, &tm))
 		return 0;
-	if ((*t = timegm(&tm)) == -1)
-		errx(1, "timegm failed");
+	tm.tm_wday = -1;	/* sentinel for error */
+	if ((*t = timegm(&tm)) == -1 && tm.tm_wday == -1)
+		return 0;
 	return 1;
 }
 

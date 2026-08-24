@@ -1,4 +1,4 @@
-/*	$OpenBSD: rde_community.c,v 1.24 2026/03/17 09:29:29 claudio Exp $ */
+/*	$OpenBSD: rde_community.c,v 1.26 2026/05/27 08:38:43 claudio Exp $ */
 
 /*
  * Copyright (c) 2019 Claudio Jeker <claudio@openbsd.org>
@@ -153,6 +153,7 @@ fc2c(const struct community *fc, struct rde_peer *peer, struct community *c,
 			return 0;
 		case EXT_COMMUNITY_TRANS_OPAQUE:
 		case EXT_COMMUNITY_TRANS_EVPN:
+		default:
 			if ((fc->flags >> 8 & 0xff) == COMMUNITY_ANY)
 				break;
 
@@ -278,6 +279,9 @@ struct rde_peer *peer)
 	struct community test, mask;
 	int l;
 
+	if (comm->nentries == 0)
+		return 0;
+
 	if (fc->flags >> 8 == 0) {
 		/* fast path */
 		return (bsearch(fc, comm->communities, comm->nentries,
@@ -385,6 +389,9 @@ community_delete(struct rde_community *comm, const struct community *fc,
 	struct community *match;
 	int l = 0;
 
+	if (comm->nentries == 0)
+		return;
+
 	if (fc->flags >> 8 == 0) {
 		/* fast path */
 		match = bsearch(fc, comm->communities, comm->nentries,
@@ -397,7 +404,6 @@ community_delete(struct rde_community *comm, const struct community *fc,
 		    (char *)(match + 1));
 		comm->nentries--;
 		comm->flags |= PARTIAL_DIRTY;
-		return;
 	} else {
 		if (fc2c(fc, peer, &test, &mask) == -1)
 			return;
@@ -496,7 +502,8 @@ community_ext_add(struct rde_community *comm, int flags, int ebgp,
 		case EXT_COMMUNITY_TRANS_TWO_AS:
 		case EXT_COMMUNITY_TRANS_OPAQUE:
 		case EXT_COMMUNITY_TRANS_EVPN:
-			set.data1 = c >> 32 & 0xffff;
+		default:
+			set.data1 = (c >> 32) & 0xffff;
 			set.data2 = c;
 			break;
 		case EXT_COMMUNITY_TRANS_FOUR_AS:
@@ -599,6 +606,7 @@ community_writebuf(struct rde_community *comm, uint8_t type, int ebgp,
 			case EXT_COMMUNITY_TRANS_TWO_AS:
 			case EXT_COMMUNITY_TRANS_OPAQUE:
 			case EXT_COMMUNITY_TRANS_EVPN:
+			default:
 				ext |= ((uint64_t)cp->data1 & 0xffff) << 32;
 				ext |= (uint64_t)cp->data2;
 				break;
@@ -643,8 +651,9 @@ communities_calc_hash(struct rde_community *comm)
 	if (comm->flags & PARTIAL_DIRTY) {
 		comm->flags &= ~PARTIAL_DIRTY;
 		SipHash24_Init(&ctx, &commkey);
-		SipHash24_Update(&ctx, comm->communities,
-		    comm->nentries * sizeof(struct community));
+		if (comm->nentries != 0)
+			SipHash24_Update(&ctx, comm->communities,
+			    comm->nentries * sizeof(struct community));
 		SipHash24_Update(&ctx, &comm->flags, sizeof(comm->flags));
 		comm->hash = SipHash24_End(&ctx);
 	}
@@ -730,6 +739,8 @@ communities_equal(const struct rde_community *a, const struct rde_community *b)
 		return 0;
 	if (a->flags != b->flags)
 		return 0;
+	if (a->nentries == 0)
+		return 1;
 
 	return (memcmp(a->communities, b->communities,
 	    a->nentries * sizeof(struct community)) == 0);

@@ -1,4 +1,4 @@
-/*	$OpenBSD: cpu.c,v 1.146 2026/01/05 19:39:51 kettenis Exp $	*/
+/*	$OpenBSD: cpu.c,v 1.149 2026/06/23 11:45:54 kettenis Exp $	*/
 
 /*
  * Copyright (c) 2016 Dale Rahn <drahn@dalerahn.com>
@@ -32,8 +32,9 @@
 
 #include <uvm/uvm_extern.h>
 
-#include <machine/fdt.h>
+#include <machine/codepatch.h>
 #include <machine/elf.h>
+#include <machine/fdt.h>
 
 #include <dev/ofw/openfirm.h>
 #include <dev/ofw/ofw_clock.h>
@@ -60,9 +61,11 @@
 /* CPU Identification */
 #define CPU_IMPL_ARM		0x41
 #define CPU_IMPL_CAVIUM		0x43
+#define CPU_IMPL_NVIDIA		0x4e
 #define CPU_IMPL_AMCC		0x50
 #define CPU_IMPL_QCOM		0x51
 #define CPU_IMPL_APPLE		0x61
+#define CPU_IMPL_MICROSOFT	0x6d 
 #define CPU_IMPL_AMPERE		0xc0
 
 /* ARM */
@@ -115,6 +118,9 @@
 #define CPU_PART_THUNDERX_T81	0x0a2
 #define CPU_PART_THUNDERX_T83	0x0a3
 #define CPU_PART_THUNDERX2_T99	0x0af
+
+/* NVIDIA */
+#define CPU_PART_OLYMPUS	0x010
 
 /* Applied Micro */
 #define CPU_PART_X_GENE		0x000
@@ -210,6 +216,11 @@ struct cpu_cores cpu_cores_cavium[] = {
 	{ 0, NULL },
 };
 
+struct cpu_cores cpu_cores_nvidia[] = {
+	{ CPU_PART_OLYMPUS, "Olympus" },
+	{ 0, NULL },
+};
+
 struct cpu_cores cpu_cores_amcc[] = {
 	{ CPU_PART_X_GENE, "X-Gene" },
 	{ 0, NULL },
@@ -243,6 +254,11 @@ struct cpu_cores cpu_cores_ampere[] = {
 	{ 0, NULL },
 };
 
+struct cpu_cores cpu_cores_microsoft[] = {
+	{ CPU_PART_NEOVERSE_N2, "Azure Cobalt 100" },
+	{ 0, NULL },
+};
+
 /* arm cores makers */
 const struct implementers {
 	int			id;
@@ -251,10 +267,12 @@ const struct implementers {
 } cpu_implementers[] = {
 	{ CPU_IMPL_ARM,	"ARM", cpu_cores_arm },
 	{ CPU_IMPL_CAVIUM, "Cavium", cpu_cores_cavium },
+	{ CPU_IMPL_NVIDIA, "NVIDIA", cpu_cores_nvidia },
 	{ CPU_IMPL_AMCC, "Applied Micro", cpu_cores_amcc },
 	{ CPU_IMPL_QCOM, "Qualcomm", cpu_cores_qcom },
 	{ CPU_IMPL_APPLE, "Apple", cpu_cores_apple },
 	{ CPU_IMPL_AMPERE, "Ampere", cpu_cores_ampere },
+	{ CPU_IMPL_MICROSOFT, "Microsoft", cpu_cores_microsoft },
 	{ 0, NULL },
 };
 
@@ -276,6 +294,23 @@ int arm64_has_rng;
 #ifdef CRYPTO
 int arm64_has_aes;
 #endif
+
+struct opp {
+	uint64_t opp_hz;
+	uint32_t opp_microvolt;
+};
+
+struct opp_table {
+	LIST_ENTRY(opp_table) ot_list;
+	uint32_t ot_phandle;
+
+	struct opp *ot_opp;
+	u_int ot_nopp;
+	uint64_t ot_opp_hz_min;
+	uint64_t ot_opp_hz_max;
+
+	struct cpu_info *ot_master;
+};
 
 extern char trampoline_vectors_none[];
 extern char trampoline_vectors_loop_8[];
@@ -516,6 +551,90 @@ cpu_mitigate_spectre_v4(struct cpu_info *ci)
 	smccc_enable_arch_workaround_2();
 }
 
+/*
+ * Enable mitigation for TLB invalidation vulnerabilities
+ * (CVE-2025-10263).  The workaround for this vulnerability needs to
+ * be NOP-ed out on hardware that isn't vulnerable since the cost is
+ * too high.
+ */
+void
+cpu_mitigate_cve_2025_10263(struct cpu_info *ci)
+{
+	uint64_t midr = ci->ci_midr;
+
+	switch (CPU_IMPL(midr)) {
+	case CPU_IMPL_ARM:
+		switch (CPU_PART(midr)) {
+		case CPU_PART_C1_PREMIUM:
+		case CPU_PART_C1_ULTRA:
+		case CPU_PART_CORTEX_A76:
+		case CPU_PART_CORTEX_A76AE:
+		case CPU_PART_CORTEX_A77:
+		case CPU_PART_CORTEX_A78:
+		case CPU_PART_CORTEX_A78AE:
+		case CPU_PART_CORTEX_A78C:
+		case CPU_PART_CORTEX_X1:
+		case CPU_PART_CORTEX_X1C:
+		case CPU_PART_CORTEX_X2:
+		case CPU_PART_CORTEX_X3:
+		case CPU_PART_CORTEX_X4:
+		case CPU_PART_CORTEX_X925:
+		case CPU_PART_NEOVERSE_N1:
+		case CPU_PART_NEOVERSE_N2:
+		case CPU_PART_NEOVERSE_V1:
+		case CPU_PART_NEOVERSE_V2:
+		case CPU_PART_NEOVERSE_V3:
+		case CPU_PART_NEOVERSE_V3AE:
+			/* Vulnerable. */
+			return;
+		case CPU_PART_CORTEX_A55:
+			/*
+			 * Not vulnerable, but mitigation works around
+			 * ARM erratum #2441007.
+			 */
+			return;
+		case CPU_PART_CORTEX_A510:
+			/*
+			 * Not vulnerable, but mitigation works around
+			 * ARM erratum #2441009 (fixed in r1p2).
+			 */
+			if (CPU_VAR(midr) == 0 ||
+			    (CPU_VAR(midr) == 1 && CPU_REV(midr) < 2))
+				return;
+		}
+		break;
+	case CPU_IMPL_NVIDIA:
+		switch (CPU_PART(midr)) {
+		case CPU_PART_OLYMPUS:
+			/* Vulnerable. */
+			return;
+		}
+		break;
+	case CPU_IMPL_QCOM:
+		switch (CPU_PART(midr)) {
+		case CPU_PART_KRYO400_GOLD:
+			/* Cortex-A76 derived, so probably vulnerable. */
+			return;
+		case CPU_PART_KRYO400_SILVER:
+			/*
+			 * Cortex-A55 derived, so ARM erratum #2441007
+			 * probably applies.
+			 */
+			return;
+		}
+		break;
+	case CPU_IMPL_MICROSOFT:
+		switch (CPU_PART(midr)) {
+		case CPU_PART_NEOVERSE_N2:
+			/* Vulnerable. */
+			return;
+		}
+		break;
+	}
+
+ 	codepatch_nop(CPTAG_REPEAT_TLBI);
+}		
+
 void
 cpu_identify(struct cpu_info *ci)
 {
@@ -665,6 +784,7 @@ cpu_identify(struct cpu_info *ci)
 	cpu_mitigate_spectre_v2(ci);
 	cpu_mitigate_spectre_bhb(ci);
 	cpu_mitigate_spectre_v4(ci);
+	cpu_mitigate_cve_2025_10263(ci);
 
 	/*
 	 * Apple CPUs provide detailed information for SError.
@@ -1453,6 +1573,29 @@ cpu_identify_cleanup(void)
 		hwcap2 |= HWCAP2_HBC;
 }
 
+void
+cpu_classify(void)
+{
+	struct cpu_info *ci;
+	CPU_INFO_ITERATOR cii;
+	uint64_t max_capacity = 0;
+
+	CPU_INFO_FOREACH(cii, ci) {
+		max_capacity = MAX(max_capacity, ci->ci_capacity);
+	}
+
+	CPU_INFO_FOREACH(cii, ci) {
+		if (ci->ci_capacity == 0)
+			ci->ci_cputype = CPUTYP_P;
+		else if (100 * ci->ci_capacity > 80 * max_capacity)
+			ci->ci_cputype = CPUTYP_P;
+		else if (100 * ci->ci_capacity > 30 * max_capacity)
+			ci->ci_cputype = CPUTYP_E;
+		else
+			ci->ci_cputype = CPUTYP_L;
+	}
+}
+
 void	cpu_init(void);
 int	cpu_start_secondary(struct cpu_info *ci, int, uint64_t);
 int	cpu_clockspeed(int *);
@@ -1481,6 +1624,7 @@ cpu_attach(struct device *parent, struct device *dev, void *aux)
 	struct cpu_info *ci;
 	void *kstack;
 #ifdef MULTIPROCESSOR
+	struct cpu_info *ci_last;
 	uint64_t mpidr = READ_SPECIALREG(mpidr_el1);
 #endif
 	uint32_t opp;
@@ -1494,8 +1638,10 @@ cpu_attach(struct device *parent, struct device *dev, void *aux)
 	} else {
 		ci = malloc(sizeof(*ci), M_DEVBUF, M_WAITOK | M_ZERO);
 		cpu_info[dev->dv_unit] = ci;
-		ci->ci_next = cpu_info_list->ci_next;
-		cpu_info_list->ci_next = ci;
+		ci_last = cpu_info_list;
+		while (ci_last->ci_next != NULL)
+			ci_last = ci_last->ci_next;
+		ci_last->ci_next = ci;
 		ci->ci_flags |= CPUF_AP;
 		ncpus++;
 	}
@@ -1626,9 +1772,13 @@ cpu_attach(struct device *parent, struct device *dev, void *aux)
 	cpu_kstat_attach(ci);
 #endif
 
+	ci->ci_capacity = OF_getpropint(ci->ci_node, "capacity-dmips-mhz", 0);
 	opp = OF_getpropint(ci->ci_node, "operating-points-v2", 0);
-	if (opp)
+	if (opp) {
 		cpu_opp_init(ci, opp);
+		ci->ci_capacity *= ci->ci_opp_table->ot_opp_hz_max / 1000000;
+	}
+	cpu_classify();
 
 	cpu_psci_init(ci);
 
@@ -2121,23 +2271,6 @@ cpu_resume_secondary(struct cpu_info *ci)
 
 extern int perflevel;
 
-struct opp {
-	uint64_t opp_hz;
-	uint32_t opp_microvolt;
-};
-
-struct opp_table {
-	LIST_ENTRY(opp_table) ot_list;
-	uint32_t ot_phandle;
-
-	struct opp *ot_opp;
-	u_int ot_nopp;
-	uint64_t ot_opp_hz_min;
-	uint64_t ot_opp_hz_max;
-
-	struct cpu_info *ot_master;
-};
-
 LIST_HEAD(, opp_table) opp_tables = LIST_HEAD_INITIALIZER(opp_tables);
 struct task cpu_opp_task;
 
@@ -2623,7 +2756,18 @@ struct cpu_kstats {
 	struct kstat_kv		ck_impl;
 	struct kstat_kv		ck_part;
 	struct kstat_kv		ck_rev;
+	struct kstat_kv		ck_capacity;
 };
+
+int
+cpu_kstat_read(struct kstat *ks)
+{
+	struct cpu_info *ci = ks->ks_softc;
+	struct cpu_kstats *ck = ks->ks_data;
+
+	kstat_kv_u64(&ck->ck_capacity) = ci->ci_capacity;
+	return 0;
+}
 
 void
 cpu_kstat_attach(struct cpu_info *ci)
@@ -2680,10 +2824,12 @@ cpu_kstat_attach(struct cpu_info *ci)
 	snprintf(kstat_kv_istr(&ck->ck_rev), sizeof(kstat_kv_istr(&ck->ck_rev)),
 	    "r%llup%llu", CPU_VAR(ci->ci_midr), CPU_REV(ci->ci_midr));
 
+	kstat_kv_init(&ck->ck_capacity, "capacity", KSTAT_KV_T_UINT64);
+
 	ks->ks_softc = ci;
 	ks->ks_data = ck;
 	ks->ks_datalen = sizeof(*ck);
-	ks->ks_read = kstat_read_nop;
+	ks->ks_read = cpu_kstat_read;
 
 	kstat_install(ks);
 

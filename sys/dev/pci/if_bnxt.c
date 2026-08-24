@@ -1,4 +1,4 @@
-/*	$OpenBSD: if_bnxt.c,v 1.68 2026/03/12 10:29:46 jmatthew Exp $	*/
+/*	$OpenBSD: if_bnxt.c,v 1.70 2026/07/03 03:48:28 jmatthew Exp $	*/
 /*-
  * Broadcom NetXtreme-C/E network driver.
  *
@@ -323,6 +323,8 @@ const struct pci_matchid bnxt_devices[] = {
 	{ PCI_VENDOR_BROADCOM,	PCI_PRODUCT_BROADCOM_BCM57416_SFP },
 	{ PCI_VENDOR_BROADCOM,	PCI_PRODUCT_BROADCOM_BCM57417 },
 	{ PCI_VENDOR_BROADCOM,	PCI_PRODUCT_BROADCOM_BCM57417_SFP },
+	{ PCI_VENDOR_BROADCOM,	PCI_PRODUCT_BROADCOM_BCM57452 },
+	{ PCI_VENDOR_BROADCOM,	PCI_PRODUCT_BROADCOM_BCM57454 },
 	{ PCI_VENDOR_BROADCOM,	PCI_PRODUCT_BROADCOM_BCM57502 },
 	{ PCI_VENDOR_BROADCOM,	PCI_PRODUCT_BROADCOM_BCM57504 },
 	{ PCI_VENDOR_BROADCOM,	PCI_PRODUCT_BROADCOM_BCM57508 },
@@ -742,7 +744,7 @@ bnxt_attach(struct device *parent, struct device *self, void *aux)
 	strlcpy(ifp->if_xname, DEVNAME(sc), IFNAMSIZ);
 	ifp->if_softc = sc;
 	ifp->if_flags = IFF_BROADCAST | IFF_MULTICAST | IFF_SIMPLEX;
-	ifp->if_xflags = IFXF_MPSAFE;
+	ifp->if_xflags = IFXF_MPSAFE | IFXF_MBUF_64BIT;
 	ifp->if_ioctl = bnxt_ioctl;
 	ifp->if_qstart = bnxt_start;
 	ifp->if_watchdog = bnxt_watchdog;

@@ -1,4 +1,4 @@
-/*	$OpenBSD: vmm.c,v 1.136 2026/03/14 11:25:40 dv Exp $	*/
+/*	$OpenBSD: vmm.c,v 1.140 2026/08/04 19:12:14 claudio Exp $	*/
 
 /*
  * Copyright (c) 2015 Mike Larkin <mlarkin@openbsd.org>
@@ -271,15 +271,15 @@ vmm_dispatch_parent(int fd, struct privsep_proc *p, struct imsg *imsg)
 		    imsg_get_fd(imsg), &var, sizeof(var));
 		break;
 	case IMSG_VMDOP_RECEIVE_VMM_FD:
-		if (env->vmd_fd > -1)
+		if (env->vmd_vmm_fd != -1)
 			fatalx("already received vmm fd");
-		env->vmd_fd = imsg_get_fd(imsg);
+		env->vmd_vmm_fd = imsg_get_fd(imsg);
 
 		/* Get and terminate all running VMs */
 		get_info_vm(ps, NULL, 1);
 		break;
 	case IMSG_VMDOP_RECEIVE_PSP_FD:
-		if (env->vmd_psp_fd > -1)
+		if (env->vmd_psp_fd != -1)
 			fatalx("already received psp fd");
 		env->vmd_psp_fd = imsg_get_fd(imsg);
 		break;
@@ -455,7 +455,7 @@ vmm_dispatch_vm(int fd, short event, void *arg)
 	struct imsgev		*iev = &vm->vm_iev;
 	struct imsgbuf		*ibuf = &iev->ibuf;
 	struct imsg		 imsg;
-	ssize_t			 n;
+	int			 n;
 	unsigned int		 i;
 	uint32_t		 type;
 
@@ -481,8 +481,8 @@ vmm_dispatch_vm(int fd, short event, void *arg)
 	}
 
 	for (;;) {
-		if ((n = imsg_get(ibuf, &imsg)) == -1)
-			fatal("%s: imsg_get", __func__);
+		if ((n = imsgbuf_get(ibuf, &imsg)) == -1)
+			fatal("%s: imsgbuf_get", __func__);
 		if (n == 0)
 			break;
 
@@ -530,7 +530,7 @@ vmm_dispatch_vm(int fd, short event, void *arg)
 int
 terminate_vm(struct vm_terminate_params *vtp)
 {
-	if (ioctl(env->vmd_fd, VMM_IOC_TERM, vtp) == -1)
+	if (ioctl(env->vmd_vmm_fd, VMM_IOC_TERM, vtp) == -1)
 		return (errno);
 
 	return (0);
@@ -598,7 +598,7 @@ opentap(char *ifname)
 int
 vmm_start_vm(struct imsg *imsg, uint32_t *id, pid_t *pid)
 {
-	struct vmd_vm		*vm;
+	struct vmd_vm		*vm, vm_copy;
 	char			*nargv[10], num[32], vmm_fd[32], psp_fd[32];
 	int			 ret = EINVAL;
 	int			 fds[2];
@@ -635,8 +635,19 @@ vmm_start_vm(struct imsg *imsg, uint32_t *id, pid_t *pid)
 		close_fd(fds[1]);
 
 		/* Send the details over the pipe to the child. */
-		sz = atomicio(vwrite, fds[0], vm, sizeof(*vm));
-		if (sz != sizeof(*vm)) {
+		memcpy(&vm_copy, vm, sizeof(vm_copy));
+		vm_copy.vm_kernel_path = NULL;
+		bzero(&vm_copy.vm_entry, sizeof(vm_copy.vm_entry));
+		bzero(&vm_copy.vm_iev, sizeof(vm_copy.vm_iev));
+		for (i = 0; i < nitems(vm_copy.vm_ifs); i++) {
+			vm_copy.vm_ifs[i].vif_name = NULL;
+			vm_copy.vm_ifs[i].vif_switch = NULL;
+			vm_copy.vm_ifs[i].vif_group = NULL;
+			bzero(&vm_copy.vm_ifs[i].vif_entry,
+			    sizeof(vm_copy.vm_ifs[i].vif_entry));
+		}
+		sz = atomicio(vwrite, fds[0], &vm_copy, sizeof(vm_copy));
+		if (sz != sizeof(vm_copy)) {
 			log_warnx("%s: failed to send config for vm '%s'",
 			    __func__, vm->vm_params.vmc_name);
 			ret = EIO;
@@ -723,7 +734,7 @@ vmm_start_vm(struct imsg *imsg, uint32_t *id, pid_t *pid)
 		memset(num, 0, sizeof(num));
 		snprintf(num, sizeof(num), "%d", fds[1]);
 		memset(vmm_fd, 0, sizeof(vmm_fd));
-		snprintf(vmm_fd, sizeof(vmm_fd), "%d", env->vmd_fd);
+		snprintf(vmm_fd, sizeof(vmm_fd), "%d", env->vmd_vmm_fd);
 		memset(psp_fd, 0, sizeof(psp_fd));
 		snprintf(psp_fd, sizeof(psp_fd), "%d", env->vmd_psp_fd);
 
@@ -806,7 +817,7 @@ get_info_vm(struct privsep *ps, struct imsg *imsg, int terminate)
 	memset(&vir, 0, sizeof(vir));
 
 	/* First ioctl to see how many bytes needed (vip.vip_size) */
-	if (ioctl(env->vmd_fd, VMM_IOC_INFO, &vip) == -1)
+	if (ioctl(env->vmd_vmm_fd, VMM_IOC_INFO, &vip) == -1)
 		return (errno);
 
 	if (vip.vip_info_ct != 0)
@@ -818,7 +829,7 @@ get_info_vm(struct privsep *ps, struct imsg *imsg, int terminate)
 
 	/* Second ioctl to get the actual list */
 	vip.vip_info = info;
-	if (ioctl(env->vmd_fd, VMM_IOC_INFO, &vip) == -1) {
+	if (ioctl(env->vmd_vmm_fd, VMM_IOC_INFO, &vip) == -1) {
 		ret = errno;
 		free(info);
 		return (ret);

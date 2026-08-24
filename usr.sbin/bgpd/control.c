@@ -1,4 +1,4 @@
-/*	$OpenBSD: control.c,v 1.138 2026/03/17 15:12:05 claudio Exp $ */
+/*	$OpenBSD: control.c,v 1.143 2026/07/30 13:56:06 claudio Exp $ */
 
 /*
  * Copyright (c) 2003, 2004 Henning Brauer <henning@openbsd.org>
@@ -167,7 +167,8 @@ control_accept(int listenfd, int restricted)
 	    (struct sockaddr *)&sa_un, &len,
 	    SOCK_NONBLOCK | SOCK_CLOEXEC)) == -1) {
 		if (errno == ENFILE || errno == EMFILE) {
-			pauseaccept = getmonotime();
+			pauseaccept = monotime_add(getmonotime(),
+			    monotime_from_sec(PAUSEACCEPT_TIMEOUT));
 			return (0);
 		} else if (errno != EWOULDBLOCK && errno != EINTR &&
 		    errno != ECONNABORTED)
@@ -245,7 +246,7 @@ control_dispatch_msg(struct pollfd *pfd, struct peer_head *peers)
 	struct ctl_show_rib_request	ribreq;
 	struct ctl_conn		*c;
 	struct peer		*p;
-	ssize_t			 n;
+	int			 n;
 	uint32_t		 type;
 	pid_t			 pid;
 	int			 verbose, matched;
@@ -272,9 +273,8 @@ control_dispatch_msg(struct pollfd *pfd, struct peer_head *peers)
 		return control_close(c);
 
 	for (;;) {
-		if ((n = imsg_get(&c->imsgbuf, &imsg)) == -1)
+		if ((n = imsgbuf_get(&c->imsgbuf, &imsg)) == -1)
 			return control_close(c);
-
 		if (n == 0)
 			break;
 
@@ -318,9 +318,7 @@ control_dispatch_msg(struct pollfd *pfd, struct peer_head *peers)
 			break;
 		case IMSG_CTL_SHOW_TERSE:
 			RB_FOREACH(p, peer_head, peers)
-				imsg_compose(&c->imsgbuf,
-				    IMSG_CTL_SHOW_NEIGHBOR, 0, 0, -1,
-				    p, sizeof(struct peer));
+				imsg_send_ctl_peer(&c->imsgbuf, p, NULL);
 			imsg_compose(&c->imsgbuf, IMSG_CTL_END, 0, 0, -1,
 			    NULL, 0);
 			break;
@@ -343,9 +341,8 @@ control_dispatch_msg(struct pollfd *pfd, struct peer_head *peers)
 					monotime_t		 d;
 					struct ctl_timer	 ct;
 
-					imsg_compose(&c->imsgbuf,
-					    IMSG_CTL_SHOW_NEIGHBOR,
-					    0, 0, -1, p, sizeof(*p));
+					imsg_send_ctl_peer(&c->imsgbuf, p,
+					    NULL);
 					for (i = 1; i < Timer_Max; i++) {
 						if (!timer_running(&p->timers,
 						    i, &d))
@@ -391,9 +388,7 @@ control_dispatch_msg(struct pollfd *pfd, struct peer_head *peers)
 					bgp_fsm(p, EVNT_START, NULL);
 					p->conf.down = 0;
 					p->conf.reason[0] = '\0';
-					p->IdleHoldTime =
-					    INTERVAL_IDLE_HOLD_INITIAL;
-					p->errcnt = 0;
+					p->IdleHoldTime = 0;
 					control_result(c, CTL_RES_OK);
 					break;
 				case IMSG_CTL_NEIGHBOR_DOWN:
@@ -407,9 +402,7 @@ control_dispatch_msg(struct pollfd *pfd, struct peer_head *peers)
 				case IMSG_CTL_NEIGHBOR_CLEAR:
 					neighbor.reason[
 					    sizeof(neighbor.reason) - 1] = '\0';
-					p->IdleHoldTime =
-					    INTERVAL_IDLE_HOLD_INITIAL;
-					p->errcnt = 0;
+					p->IdleHoldTime = 0;
 					if (!p->conf.down) {
 						session_stop(p,
 						    ERR_CEASE_ADMIN_RESET,
@@ -558,7 +551,6 @@ control_imsg_relay(struct imsg *imsg, struct peer *p)
 	/* special handling for peers since only the stats are sent from RDE */
 	if (type == IMSG_CTL_SHOW_NEIGHBOR) {
 		struct rde_peer_stats stats;
-		struct peer peer;
 
 		if (p == NULL) {
 			errno = EINVAL;
@@ -567,26 +559,7 @@ control_imsg_relay(struct imsg *imsg, struct peer *p)
 		if (imsg_get_data(imsg, &stats, sizeof(stats)) == -1)
 			return (-1);
 
-		peer = *p;
-		explicit_bzero(&peer.auth_conf, sizeof(peer.auth_conf));
-		peer.auth_conf.method = p->auth_conf.method;
-		peer.stats.prefix_cnt = stats.prefix_cnt;
-		peer.stats.prefix_out_cnt = stats.prefix_out_cnt;
-		peer.stats.prefix_rcvd_update = stats.prefix_rcvd_update;
-		peer.stats.prefix_rcvd_withdraw = stats.prefix_rcvd_withdraw;
-		peer.stats.prefix_rcvd_eor = stats.prefix_rcvd_eor;
-		peer.stats.prefix_sent_update = stats.prefix_sent_update;
-		peer.stats.prefix_sent_withdraw = stats.prefix_sent_withdraw;
-		peer.stats.prefix_sent_eor = stats.prefix_sent_eor;
-		peer.stats.pending_update = stats.pending_update;
-		peer.stats.pending_withdraw = stats.pending_withdraw;
-		peer.stats.rib_entry_count = stats.rib_entry_count;
-		peer.stats.ibufq_msg_count = stats.ibufq_msg_count;
-		peer.stats.ibufq_payload_size = stats.ibufq_payload_size;
-		peer.stats.msg_queue_len = msgbuf_queuelen(p->wbuf);
-
-		return imsg_compose(&c->imsgbuf, type, 0, pid, -1,
-		    &peer, sizeof(peer));
+		return imsg_send_ctl_peer(&c->imsgbuf, p, &stats);
 	}
 
 	/* if command finished no need to send exit message */

@@ -212,7 +212,7 @@ int radeon_fbdev_driver_fbdev_probe(struct drm_fb_helper *fb_helper,
 	struct radeon_device *rdev = fb_helper->dev->dev_private;
 	const struct drm_format_info *format_info;
 	struct drm_mode_fb_cmd2 mode_cmd = { };
-	struct fb_info *info;
+	struct fb_info *info = fb_helper->info;
 	struct rasops_info *ri = &rdev->ro;
 	struct drm_gem_object *gobj;
 	struct radeon_bo *rbo;
@@ -253,13 +253,6 @@ int radeon_fbdev_driver_fbdev_probe(struct drm_fb_helper *fb_helper,
 	/* setup helper */
 	fb_helper->funcs = &radeon_fbdev_fb_helper_funcs;
 	fb_helper->fb = fb;
-
-	/* okay we have an object now allocate the framebuffer */
-	info = drm_fb_helper_alloc_info(fb_helper);
-	if (IS_ERR(info)) {
-		ret = PTR_ERR(info);
-		goto err_drm_framebuffer_unregister_private;
-	}
 
 	info->fbops = &radeon_fbdev_fb_ops;
 
@@ -311,10 +304,6 @@ int radeon_fbdev_driver_fbdev_probe(struct drm_fb_helper *fb_helper,
 
 	return 0;
 
-err_drm_framebuffer_unregister_private:
-	fb_helper->fb = NULL;
-	drm_framebuffer_unregister_private(fb);
-	drm_framebuffer_cleanup(fb);
 err_kfree:
 	kfree(fb);
 err_radeon_fbdev_destroy_pinned_object:
@@ -337,37 +326,4 @@ bool radeon_fbdev_robj_is_fb(struct radeon_device *rdev, struct radeon_bo *robj)
 		return false;
 
 	return true;
-}
-
-void
-radeondrm_burner(void *v, u_int on, u_int flags)
-{
-	struct rasops_info *ri = v;
-	struct radeon_device *rdev = ri->ri_hw;
-
-	task_del(systq, &rdev->burner_task);
-
-	if (on)
-		rdev->burner_fblank = FB_BLANK_UNBLANK;
-	else {
-		if (flags & WSDISPLAY_BURN_VBLANK)
-			rdev->burner_fblank = FB_BLANK_VSYNC_SUSPEND;
-		else
-			rdev->burner_fblank = FB_BLANK_NORMAL;
-	}
-
-	/*
-	 * Setting the DPMS mode may sleep while waiting for vblank so
-	 * hand things off to a taskq.
-	 */
-	task_add(systq, &rdev->burner_task);
-}
-
-void
-radeondrm_burner_cb(void *arg1)
-{
-	struct radeon_device *rdev = arg1;
-	struct drm_fb_helper *helper = rdev_to_drm(rdev)->fb_helper;
-
-	drm_fb_helper_blank(rdev->burner_fblank, helper->info);
 }

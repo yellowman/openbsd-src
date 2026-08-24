@@ -1,4 +1,4 @@
-/*	$OpenBSD: mroute6.c,v 1.27 2025/06/06 20:37:06 jan Exp $	*/
+/*	$OpenBSD: mroute6.c,v 1.29 2026/07/16 12:35:32 bluhm Exp $	*/
 
 /*
  * Copyright (C) 1998 WIDE Project.
@@ -79,8 +79,8 @@
 #include <util.h>
 #include "netstat.h"
 
-#define	WID_ORG	(lflag ? 39 : (nflag ? 29 : 18)) /* width of origin column */
-#define	WID_GRP	(lflag ? 18 : (nflag ? 16 : 18)) /* width of group column */
+#define	WID_ORG	(vflag ? 39 : (nflag ? 29 : 18)) /* width of origin column */
+#define	WID_GRP	(vflag ? 18 : (nflag ? 16 : 18)) /* width of group column */
 
 void
 mroute6pr(void)
@@ -221,4 +221,6 @@ mrt6_stats(void)
 	    mrt6stat.mrt6s_pkt2large, plural(mrt6stat.mrt6s_pkt2large));
 	printf("\t%llu datagram%s dropped due to full socket buffer\n",
 	    mrt6stat.mrt6s_upq_sockfull, plural(mrt6stat.mrt6s_upq_sockfull));
+	printf("\t%llu datagram%s exceeded hop-limit not forwarded\n",
+	    mrt6stat.mrt6s_hop_limit, plural(mrt6stat.mrt6s_hop_limit));
 }

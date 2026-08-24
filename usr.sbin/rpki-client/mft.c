@@ -1,4 +1,4 @@
-/*	$OpenBSD: mft.c,v 1.136 2026/01/16 11:25:27 job Exp $ */
+/*	$OpenBSD: mft.c,v 1.141 2026/06/25 07:51:58 tb Exp $ */
 /*
  * Copyright (c) 2022 Theo Buehler <tb@openbsd.org>
  * Copyright (c) 2019 Kristaps Dzonsons <kristaps@bsd.lv>
@@ -151,7 +151,8 @@ mft_parse_filehash(const char *fn, struct mft *mft, const FileAndHash *fh,
 {
 	const unsigned char	*data;
 	char			*file = NULL;
-	int			 length, rc = 0;
+	size_t			 len;
+	int			 length, unused_bits, rc = 0;
 	struct mftfile		*fent;
 	enum rtype		 type;
 	size_t			 new_idx = 0;
@@ -160,22 +161,28 @@ mft_parse_filehash(const char *fn, struct mft *mft, const FileAndHash *fh,
 	length = ASN1_STRING_length(fh->file);
 
 	if (!valid_mft_filename(data, length)) {
-		warnx("%s: RFC 9286 section 4.2.2: bad filename", fn);
+		warnx("%s: RFC 9286 section 4.2.2: FileAndHash with "
+		    "invalid filename", fn);
 		goto out;
 	}
+
 	file = strndup(data, length);
 	if (file == NULL)
 		err(1, NULL);
 
-	/* XXX - malleability: ensure unused bits are 0. */
 	data = ASN1_STRING_get0_data(fh->hash);
-	length = ASN1_STRING_length(fh->hash);
-
-	if (length != SHA256_DIGEST_LENGTH) {
+	if (!ASN1_BIT_STRING_get_length(fh->hash, &len, &unused_bits)) {
 		warnx("%s: RFC 9286 section 4.2.1: hash: "
 		    "invalid SHA256 length, have %d", fn, length);
 		goto out;
 	}
+	if (len != SHA256_DIGEST_LENGTH || unused_bits != 0) {
+		warnx("%s: RFC 9286 section 4.2.1: hash: "
+		    "invalid SHA256 length, have %zu (%d unused bits)",
+		    fn, len, unused_bits);
+		goto out;
+	}
+	length = len;
 
 	type = rtype_from_mftfile(file);
 	if (type == RTYPE_CRL) {
@@ -283,9 +290,10 @@ mft_has_unique_names_and_hashes(const char *fn, const Manifest *mft)
  * Returns 0 on failure and 1 on success.
  */
 static int
-mft_parse_econtent(const char *fn, struct mft *mft, const unsigned char *d,
+mft_parse_econtent(const char *fn, void *obj, const unsigned char *d,
     size_t dsz)
 {
+	struct mft		*mft = obj;
 	const unsigned char	*oder;
 	Manifest		*mft_asn1;
 	FileAndHash		*fh;
@@ -367,6 +375,89 @@ mft_parse_econtent(const char *fn, struct mft *mft, const unsigned char *d,
 	return rc;
 }
 
+static int
+mft_cert_info(const char *fn, void *obj, const struct cert *cert)
+{
+	struct mft *mft = obj;
+	char *crlfile;
+
+	if (!x509_inherits(cert->x509)) {
+		warnx("%s: RFC 3779 extensions not set to inherit", fn);
+		return 0;
+	}
+
+	if ((mft->aki = strdup(cert->aki)) == NULL)
+		err(1, NULL);
+	if ((mft->sia = strdup(cert->signedobj)) == NULL)
+		err(1, NULL);
+
+	crlfile = strrchr(cert->crl, '/');
+	if (crlfile == NULL) {
+		warnx("%s: RFC 6487 section 4.8.6: "
+		    "invalid CRL distribution point", fn);
+		return 0;
+	}
+	crlfile++;
+	if (!valid_mft_filename(crlfile, strlen(crlfile)) ||
+	    rtype_from_file_extension(crlfile) != RTYPE_CRL) {
+		warnx("%s: RFC 6487 section 4.8.6: CRL: "
+		    "bad CRL distribution point extension", fn);
+		return 0;
+	}
+	if ((mft->crl = strdup(crlfile)) == NULL)
+		err(1, NULL);
+
+	return 1;
+}
+
+static int
+mft_validate(const char *fn, void *obj, struct cert *cert)
+{
+	struct mft *mft = obj;
+
+	if (mft->signtime > mft->nextupdate) {
+		warnx("%s: dating issue: CMS signing-time after MFT nextUpdate",
+		    fn);
+		return 0;
+	}
+
+	return 1;
+}
+
+static void *
+mft_obj_new(size_t der_len, time_t signtime)
+{
+	struct mft *mft;
+
+	if ((mft = calloc(1, sizeof(*mft))) == NULL)
+		err(1, NULL);
+	mft->mftsize = der_len;
+	mft->signtime = signtime;
+
+	return mft;
+}
+
+static void
+mft_obj_free(void *obj)
+{
+	mft_free(obj);
+}
+
+static const struct signed_obj mft_signed_obj = {
+	.rtype = RTYPE_MFT,
+	.new = mft_obj_new,
+	.free = mft_obj_free,
+	.cert_info = mft_cert_info,
+	.parse_econtent = mft_parse_econtent,
+	.validate = mft_validate,
+};
+
+const struct signed_obj *
+mft_obj(void)
+{
+	return &mft_signed_obj;
+}
+
 /*
  * Parse the objects that have been published in the manifest.
  * Return mft if it conforms to RFC 9286, otherwise NULL.
@@ -380,7 +471,6 @@ mft_parse(struct cert **out_cert, const char *fn, int talid,
 	int		 rc = 0;
 	size_t		 cmsz;
 	unsigned char	*cms;
-	char		*crlfile;
 	time_t		 signtime = 0;
 
 	assert(*out_cert == NULL);
@@ -390,51 +480,19 @@ mft_parse(struct cert **out_cert, const char *fn, int talid,
 	if (cms == NULL)
 		return NULL;
 
-	if ((mft = calloc(1, sizeof(*mft))) == NULL)
-		err(1, NULL);
-	mft->signtime = signtime;
-	mft->mftsize = len;
-
-	if ((mft->aki = strdup(cert->aki)) == NULL)
-		err(1, NULL);
-	if ((mft->sia = strdup(cert->signedobj)) == NULL)
-		err(1, NULL);
-
-	if (!x509_inherits(cert->x509)) {
-		warnx("%s: RFC 3779 extension not set to inherit", fn);
+	mft = mft_obj_new(len, signtime);
+	if (!mft_cert_info(fn, mft, cert))
 		goto out;
-	}
-
-	crlfile = strrchr(cert->crl, '/');
-	if (crlfile == NULL) {
-		warnx("%s: RFC 6487 section 4.8.6: "
-		    "invalid CRL distribution point", fn);
+	if (!mft_parse_econtent(fn, mft, cms, cmsz))
 		goto out;
-	}
-	crlfile++;
-	if (!valid_mft_filename(crlfile, strlen(crlfile)) ||
-	    rtype_from_file_extension(crlfile) != RTYPE_CRL) {
-		warnx("%s: RFC 6487 section 4.8.6: CRL: "
-		    "bad CRL distribution point extension", fn);
+	if (!mft_validate(fn, mft, cert))
 		goto out;
-	}
-	if ((mft->crl = strdup(crlfile)) == NULL)
-		err(1, NULL);
-
-	if (mft_parse_econtent(fn, mft, cms, cmsz) == 0)
-		goto out;
-
-	if (mft->signtime > mft->nextupdate) {
-		warnx("%s: dating issue: CMS signing-time after MFT nextUpdate",
-		    fn);
-		goto out;
-	}
 
 	*out_cert = cert;
 	cert = NULL;
 
 	rc = 1;
-out:
+ out:
 	if (rc == 0) {
 		mft_free(mft);
 		mft = NULL;

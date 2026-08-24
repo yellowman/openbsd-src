@@ -1,4 +1,4 @@
-/*	$OpenBSD: httpd.c,v 1.77 2026/03/02 19:24:58 rsadowski Exp $	*/
+/*	$OpenBSD: httpd.c,v 1.82 2026/07/26 14:46:32 rsadowski Exp $	*/
 
 /*
  * Copyright (c) 2014 Reyk Floeter <reyk@openbsd.org>
@@ -55,9 +55,9 @@ void		 parent_reopen(struct httpd *);
 void		 parent_sig_handler(int, short, void *);
 void		 parent_shutdown(struct httpd *);
 int		 parent_dispatch_server(int, struct privsep_proc *,
-		    struct imsg *);
+    struct imsg *);
 int		 parent_dispatch_logger(int, struct privsep_proc *,
-		    struct imsg *);
+    struct imsg *);
 void		 parent_tls_ticket_rekey_start(struct server *);
 void		 parent_tls_ticket_rekey(int, short, void *);
 
@@ -179,7 +179,6 @@ main(int argc, char *argv[])
 	httpd_env = env;
 	env->sc_ps = ps;
 	ps->ps_env = env;
-	TAILQ_INIT(&ps->ps_rcsocks);
 	env->sc_conffile = conffile;
 	env->sc_opts = opts;
 
@@ -189,11 +188,8 @@ main(int argc, char *argv[])
 	if (geteuid())
 		errx(1, "need root privileges");
 
-	if ((ps->ps_pw =  getpwnam(HTTPD_USER)) == NULL)
+	if ((ps->ps_pw = getpwnam(HTTPD_USER)) == NULL)
 		errx(1, "unknown user %s", HTTPD_USER);
-
-	/* Configure the control socket */
-	ps->ps_csock.cs_name = NULL;
 
 	log_init(debug, LOG_DAEMON);
 	log_setverbose(verbose);
@@ -213,7 +209,7 @@ main(int argc, char *argv[])
 
 	if (env->sc_logdir == NULL) {
 		if (asprintf(&env->sc_logdir, "%s%s", env->sc_chroot,
-			HTTPD_LOGROOT) == -1)
+		    HTTPD_LOGROOT) == -1)
 			errx(1, "malloc failed");
 	}
 
@@ -395,10 +391,6 @@ parent_shutdown(struct httpd *env)
 	config_purge(env, CONFIG_ALL);
 
 	proc_kill(env->sc_ps);
-	control_cleanup(&env->sc_ps->ps_csock);
-	if (env->sc_ps->ps_csock.cs_name != NULL)
-		(void)unlink(env->sc_ps->ps_csock.cs_name);
-
 	free(env->sc_ps);
 	free(env);
 
@@ -691,7 +683,7 @@ url_encode(const char *src)
 		return (NULL);
 
 	for (dp = dst; *src != 0; src++) {
-		c = (unsigned char) *src;
+		c = (unsigned char)*src;
 		if (c == ' ' || c == '#' || c == '%' || c == '?' || c == '"' ||
 		    c == '&' || c == '<' || c <= 0x1f || c >= 0x7f) {
 			*dp++ = '%';
@@ -703,8 +695,8 @@ url_encode(const char *src)
 	return (dst);
 }
 
-char*
-escape_html(const char* src)
+char *
+escape_html(const char *src)
 {
 	char		*dp, *dst;
 
@@ -893,7 +885,7 @@ prefixlen2mask(uint8_t prefixlen)
 struct in6_addr *
 prefixlen2mask6(uint8_t prefixlen, uint32_t *mask)
 {
-	static struct in6_addr  s6;
+	static struct in6_addr	s6;
 	int			i;
 
 	if (prefixlen > 128)
@@ -924,13 +916,13 @@ accept_reserve(int sockfd, struct sockaddr *addr, socklen_t *addrlen,
 
 	if ((ret = accept4(sockfd, addr, addrlen, SOCK_NONBLOCK)) > -1) {
 		(*counter)++;
-		DPRINTF("%s: inflight incremented, now %d",__func__, *counter);
+		DPRINTF("%s: inflight incremented, now %d", __func__, *counter);
 	}
 	return (ret);
 }
 
 struct kv *
-kv_add(struct kvtree *keys, char *key, char *value)
+kv_add(struct kvtree *keys, const char *key, const char *value)
 {
 	struct kv	*kv, *oldkv;
 
@@ -961,10 +953,10 @@ kv_add(struct kvtree *keys, char *key, char *value)
 int
 kv_set(struct kv *kv, char *fmt, ...)
 {
-	va_list		  ap;
+	va_list		 ap;
 	char		*value = NULL;
 	struct kv	*ckv;
-	int		ret;
+	int		 ret;
 
 	va_start(ap, fmt);
 	ret = vasprintf(&value, fmt, ap);
@@ -989,9 +981,9 @@ kv_set(struct kv *kv, char *fmt, ...)
 int
 kv_setkey(struct kv *kv, char *fmt, ...)
 {
-	va_list  ap;
+	va_list	 ap;
 	char	*key = NULL;
-	int	ret;
+	int	 ret;
 
 	va_start(ap, fmt);
 	ret = vasprintf(&key, fmt, ap);
@@ -1021,25 +1013,6 @@ kv_delete(struct kvtree *keys, struct kv *kv)
 
 	kv_free(kv);
 	free(kv);
-}
-
-struct kv *
-kv_extend(struct kvtree *keys, struct kv *kv, char *value)
-{
-	char		*newvalue;
-
-	if (kv == NULL) {
-		return (NULL);
-	} else if (kv->kv_value != NULL) {
-		if (asprintf(&newvalue, "%s%s", kv->kv_value, value) == -1)
-			return (NULL);
-
-		free(kv->kv_value);
-		kv->kv_value = newvalue;
-	} else if ((kv->kv_value = strdup(value)) == NULL)
-		return (NULL);
-
-	return (kv);
 }
 
 void
@@ -1205,7 +1178,6 @@ auth_free(struct serverauth *serverauth, struct auth *auth)
 	TAILQ_REMOVE(serverauth, auth, auth_entry);
 }
 
-
 const char *
 print_host(struct sockaddr_storage *ss, char *buf, size_t len)
 {
@@ -1218,7 +1190,7 @@ print_host(struct sockaddr_storage *ss, char *buf, size_t len)
 }
 
 const char *
-printb_flags(const uint32_t v, const char *bits)
+printb_flags(const uint64_t v, const char *bits)
 {
 	static char	 buf[2][BUFSIZ];
 	static int	 idx = 0;
@@ -1231,13 +1203,15 @@ printb_flags(const uint32_t v, const char *bits)
 	if (bits) {
 		bits++;
 		while ((i = *bits++)) {
-			if (v & (1 << (i - 1))) {
+			if (v & (1ULL << (i - 1))) {
 				if (any) {
 					*p++ = ',';
 					*p++ = ' ';
 				}
 				any = 1;
-				for (; (c = *bits) > 32; bits++) {
+				for (; isalnum((unsigned char)*bits) ||
+				    *bits == '_'; bits++) {
+					c = *bits;
 					if (c == '_')
 						*p++ = ' ';
 					else
@@ -1245,7 +1219,8 @@ printb_flags(const uint32_t v, const char *bits)
 						    tolower((unsigned char)c);
 				}
 			} else
-				for (; *bits > 32; bits++)
+				for (; isalnum((unsigned char)*bits) ||
+				    *bits == '_'; bits++)
 					;
 		}
 	}
@@ -1262,4 +1237,45 @@ getmonotime(struct timeval *tv)
 		fatal("clock_gettime");
 
 	TIMESPEC_TO_TIMEVAL(tv, &ts);
+}
+
+void
+print_custom_header(const char *i, const struct custom_header *hdr)
+{
+	if (hdr == NULL) {
+		DPRINTF("%s: hdr=NULL", i);
+		return;
+	}
+	DPRINTF("%s: hdr (%s%s%s%s) %s: %s", i,
+	    (hdr->flags & HEADER_REMOVE) ? "remove " : "",
+	    (hdr->flags & HEADER_ADD) ? "add " : "",
+	    (hdr->flags & HEADER_SET) ? "set " : "",
+	    (hdr->flags & HEADER_ALWAYS) ? "always" : "",
+	    hdr->name, hdr->value);
+}
+
+int
+header_exists(struct server_config *srv_conf, const char *name)
+{
+	struct custom_header	*hdr;
+
+	TAILQ_FOREACH(hdr, &srv_conf->headers, entry) {
+		if (strcasecmp(hdr->name, name) == 0)
+			return (1);
+	}
+	return (0);
+}
+
+struct custom_header *
+header_dup(const struct custom_header *src)
+{
+	struct custom_header	*h;
+
+	if ((h = calloc(1, sizeof(*h))) == NULL)
+		fatal("out of memory");
+	if ((h->name = strdup(src->name)) == NULL ||
+	    (h->value = strdup(src->value)) == NULL)
+		fatal("out of memory");
+	h->flags = src->flags;
+	return (h);
 }

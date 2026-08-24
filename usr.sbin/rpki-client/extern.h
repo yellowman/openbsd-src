@@ -1,4 +1,4 @@
-/*	$OpenBSD: extern.h,v 1.277 2026/02/03 16:21:37 tb Exp $ */
+/*	$OpenBSD: extern.h,v 1.290 2026/07/15 07:53:06 tb Exp $ */
 /*
  * Copyright (c) 2019 Kristaps Dzonsons <kristaps@bsd.lv>
  *
@@ -28,6 +28,16 @@
 			    __attribute__((__unused__))
 
 #define MAX_MSG_SIZE	(50 * 1024 * 1024)
+
+struct strlistentry {
+	LIST_ENTRY(strlistentry) entry;
+	char *str;
+	size_t str_len;
+};
+LIST_HEAD(strlist, strlistentry);
+
+void strlist_insert(struct strlist *, const char *);
+int strlist_find(const struct strlist *, const char *, size_t);
 
 enum cert_as_type {
 	CERT_AS_ID, /* single identifier */
@@ -147,6 +157,20 @@ struct cert {
 	unsigned char	 mfthash[SHA256_DIGEST_LENGTH]; /* of the parent mft */
 };
 
+struct nca_hist {
+	RB_ENTRY(nca_hist)	 entry;
+	char			*aki;
+	char			*ski;
+	char			*location;
+	char			*mfturi;
+	char			*baseuri;
+	char			*notify;
+	time_t			 since;
+	time_t			 last_attempt;
+	unsigned int		 attempts;
+	int			 defer;
+};
+
 /*
  * Non-functional CA tree element.
  * Initially all CA and TA certs are added to this tree.
@@ -154,12 +178,19 @@ struct cert {
  */
 struct nonfunc_ca {
 	RB_ENTRY(nonfunc_ca)	 entry;
+	char			*aki;
+	char			*ski;
 	char			*location;
 	char			*carepo;
 	char			*mfturi;
-	char			*ski;
+	char			*notify;
 	int			 certid;
+	unsigned int		 repoid;
 	int			 talid;
+	time_t			 since;
+	time_t			 last_attempt;
+	unsigned int		 attempts;
+	int			 defer;
 };
 
 /*
@@ -209,6 +240,17 @@ enum location {
 	DIR_UNKNOWN,
 	DIR_TEMP,
 	DIR_VALID,
+};
+
+struct signed_obj {
+	enum rtype rtype;
+	void *(*new)(size_t, time_t);
+	void (*free)(void *);
+	int (*cert_info)(const char *, void *, const struct cert *);
+	int (*parse_econtent)(const char *, void *, const uint8_t *, size_t);
+	int (*parse_detached)(const char *, void *, BIO *, char *, size_t,
+	    uint8_t **, size_t *);
+	int (*validate)(const char *, void *, struct cert *);
 };
 
 /*
@@ -433,11 +475,11 @@ RB_HEAD(brk_tree, brk);
 RB_PROTOTYPE(brk_tree, brk, entry, brkcmp);
 
 struct ccr_mft_sub_ski {
-	SLIST_ENTRY(ccr_mft_sub_ski) entry;
+	SIMPLEQ_ENTRY(ccr_mft_sub_ski) entry;
 	unsigned char ski[SHA_DIGEST_LENGTH];
 };
 
-SLIST_HEAD(subordinates_head, ccr_mft_sub_ski);
+SIMPLEQ_HEAD(subordinates_head, ccr_mft_sub_ski);
 
 struct ccr_mft {
 	RB_ENTRY(ccr_mft) entry;
@@ -601,8 +643,6 @@ enum stype {
 	STYPE_PROVIDERS,
 	STYPE_OVERFLOW,
 	STYPE_SEQNUM_GAP,
-	STYPE_FUNC,
-	STYPE_NONFUNC,
 };
 
 struct repo;
@@ -617,6 +657,7 @@ struct repotalstats {
 	uint32_t	 certs; /* certificates */
 	uint32_t	 certs_fail; /* invalid certificate */
 	uint32_t	 certs_nonfunc; /* non-functional CA certificates */
+	uint32_t	 certs_nonfunc_deferred;
 	uint32_t	 mfts; /* total number of manifests */
 	uint32_t	 mfts_gap; /* manifests with sequence gaps */
 	uint32_t	 mfts_fail; /* failing syntactic parse */
@@ -698,6 +739,7 @@ extern int filemode;
 extern int excludeaspa;
 extern int experimental;
 extern int excludeas0;
+extern int retry_all_ncas;
 extern const char *tals[];
 extern const char *taldescs[];
 extern unsigned int talrepocnt[];
@@ -725,15 +767,18 @@ struct cert	*ta_validate(const char *, struct cert *, const unsigned char *,
 		    size_t);
 struct cert	*cert_read(struct ibuf *);
 void		 cert_insert_brks(struct brk_tree *, struct cert *);
-void		 cert_insert_nca(struct nca_tree *, const struct cert *,
-		    struct repo *);
-void		 cert_remove_nca(struct nca_tree *, int, struct repo *);
+
+void		 nca_history_load(void);
+void		 nca_history_save(struct nca_tree *, time_t);
+int		 nca_skip_sync(struct nca_tree *, const struct cert *);
+void		 nca_tree_remove_cert(struct nca_tree *, int);
 
 enum rtype	 rtype_from_file_extension(const char *);
 void		 mft_buffer(struct ibuf *, const struct mft *);
 void		 mft_free(struct mft *);
 struct mft	*mft_parse(struct cert **, const char *, int,
 		    const unsigned char *, size_t);
+const struct signed_obj *mft_obj(void);
 struct mft	*mft_read(struct ibuf *);
 int		 mft_compare_issued(const struct mft *, const struct mft *);
 int		 mft_compare_seqnum(const struct mft *, const struct mft *);
@@ -744,6 +789,7 @@ void		 roa_buffer(struct ibuf *, const struct roa *);
 void		 roa_free(struct roa *);
 struct roa	*roa_parse(struct cert **, const char *, int,
 		    const unsigned char *, size_t);
+const struct signed_obj *roa_obj(void);
 struct roa	*roa_read(struct ibuf *);
 void		 roa_insert_vrps(struct vrp_tree *, struct roa *,
 		    struct repo *);
@@ -752,6 +798,7 @@ void		 spl_buffer(struct ibuf *, const struct spl *);
 void		 spl_free(struct spl *);
 struct spl	*spl_parse(struct cert **, const char *, int,
 		    const unsigned char *, size_t);
+const struct signed_obj *spl_obj(void);
 struct spl	*spl_read(struct ibuf *);
 void		 spl_insert_vsps(struct vsp_tree *, struct spl *,
 		    struct repo *);
@@ -759,11 +806,13 @@ void		 spl_insert_vsps(struct vsp_tree *, struct spl *,
 void		 rsc_free(struct rsc *);
 struct rsc	*rsc_parse(struct cert **, const char *, int,
 		    const unsigned char *, size_t);
+const struct signed_obj *rsc_obj(void);
 
 void		 takey_free(struct takey *);
 void		 tak_free(struct tak *);
 struct tak	*tak_parse(struct cert **, const char *, int,
 		    const unsigned char *, size_t);
+const struct signed_obj *tak_obj(void);
 
 void		 aspa_buffer(struct ibuf *, const struct aspa *);
 void		 aspa_free(struct aspa *);
@@ -771,6 +820,7 @@ void		 aspa_insert_vaps(char *, struct vap_tree *, struct aspa *,
 		    struct repo *);
 struct aspa	*aspa_parse(struct cert **, const char *, int,
 		    const unsigned char *, size_t);
+const struct signed_obj *aspa_obj(void);
 struct aspa	*aspa_read(struct ibuf *);
 
 /* crl.c */
@@ -824,7 +874,7 @@ int		 sbgp_addr(const char *, struct cert_ip *, size_t *,
 int		 sbgp_addr_range(const char *, struct cert_ip *, size_t *,
 		    enum afi, const IPAddressRange *);
 
-int		 sbgp_parse_ipaddrblk(const char *, const IPAddrBlocks *,
+int		 sbgp_parse_ipaddrblocks(const char *, const IPAddrBlocks *,
 		    struct cert_ip **, size_t *);
 
 /* Work with RFC 3779 AS numbers, ranges. */
@@ -841,7 +891,7 @@ int		 sbgp_as_id(const char *, struct cert_as *, size_t *,
 int		 sbgp_as_range(const char *, struct cert_as *, size_t *,
 		    const ASRange *);
 
-int		 sbgp_parse_assysnum(const char *, const ASIdentifiers *,
+int		 sbgp_parse_asids(const char *, const ASIdentifiers *,
 		    struct cert_as **, size_t *);
 
 /* Constraints-specific */
@@ -859,7 +909,7 @@ void		 proc_filemode(int) __attribute__((noreturn));
 
 /* Rsync-specific. */
 
-char		*rsync_base_uri(const char *);
+int		 rsync_base_uri(const char *, char **);
 void		 proc_rsync(char *, char *, int) __attribute__((noreturn));
 
 /* HTTP and RRDP processes. */
@@ -895,6 +945,7 @@ void		 repo_cleanup(struct filepath_tree *, int);
 int		 repo_check_timeout(int);
 void		 repostats_new_files_inc(struct repo *, const char *);
 void		 repo_stat_inc(struct repo *, int, enum rtype, enum stype);
+void		 repo_stat_add_nca(struct nonfunc_ca *);
 void		 repo_tal_stats_collect(void (*)(const struct repo *,
 		    const struct repotalstats *, void *), int, void *);
 void		 repo_stats_collect(void (*)(const struct repo *,
@@ -994,7 +1045,7 @@ extern int	 outformats;
 #define FORMAT_OMETRIC	0x10
 #define FORMAT_CCR	0x20
 
-int		 outputfiles(struct validation_data *, struct stats *);
+int		 outputfiles(struct validation_data *, struct stats *, int);
 int		 outputheader(FILE *, struct validation_data *, struct stats *);
 int		 output_bgpd(FILE *, struct validation_data *, struct stats *);
 int		 output_bird(FILE *, struct validation_data *, struct stats *);
@@ -1037,8 +1088,8 @@ int	mkpathat(int, const char *);
 #define	CERTID_MAX		1000000
 
 /*
- * Maximum number of elements in the sbgp-ipAddrBlock (IP) and
- * sbgp-autonomousSysNum (AS) X.509v3 extension of CA/EE certificates.
+ * Maximum number of elements in the ipAddrBlocks (IP) and
+ * autonomousSysIds (AS) X.509v3 extension of certificates.
  */
 #define MAX_IP_SIZE		200000
 #define MAX_AS_SIZE		200000
@@ -1055,6 +1106,12 @@ int	mkpathat(int, const char *);
 
 /* Maximum number of FileAndHash entries per manifest. */
 #define MAX_MANIFEST_ENTRIES	100000
+
+/*
+ * Maximum allowable filename length in various fields.
+ * Based on IEEE Std 1003.1 limits.h _XOPEN_NAME_MAX.
+ */
+#define MAX_FN_LENGTH		255
 
 /* Maximum number of Providers per ASPA object. */
 #define MAX_ASPA_PROVIDERS	10000
@@ -1081,5 +1138,11 @@ int	mkpathat(int, const char *);
 #define HTTPS_PROTO_LEN		(sizeof(HTTPS_PROTO) - 1)
 #define RSYNC_PROTO		"rsync://"
 #define RSYNC_PROTO_LEN		(sizeof(RSYNC_PROTO) - 1)
+
+#define NCA_HISTORY		".nca_history"
+
+/* Compat helpers for OpenSSL < 4 and LibreSSL. */
+int	ASN1_BIT_STRING_get_length(const ASN1_BIT_STRING *, size_t *, int *);
+int	ASN1_BIT_STRING_set1(ASN1_BIT_STRING *, const uint8_t *, size_t, int);
 
 #endif /* ! EXTERN_H */

@@ -1,4 +1,4 @@
-#	$OpenBSD: RAMDISK,v 1.48 2025/12/07 23:02:25 kettenis Exp $
+#	$OpenBSD: RAMDISK,v 1.57 2026/07/24 10:51:01 kettenis Exp $
 
 machine		riscv64
 maxusers	4
@@ -63,6 +63,16 @@ sfclock*	at fdt? early 1 # PRCI
 sfcc*		at fdt? early 1	# L2 Cache Controller
 sfuart*		at fdt?
 
+# SpacemiT SoCs
+smtclock*	at fdt? early 1
+smtcomphy*	at fdt?
+smte*		at fdt?
+smtgpio*	at fdt?
+smtiic*		at fdt?
+iic*		at smtiic?
+smtpmic*	at iic?
+smtpinctrl*	at fdt? early 1
+
 # StarFive SoCs
 stfclock*	at fdt? early 1
 stfpcie*	at fdt?
@@ -82,6 +92,10 @@ viornd*		at virtio?	# Random Source
 simplebus*	at fdt?
 # Platform Level Interrupt Controller
 plic*		at fdt? early 1
+# Advanced Platform Level Interrupt Controller
+aplic*	   	at fdt? early 1
+# Incoming MSI Controller
+imsic*		at fdt? early 1
 
 syscon*		at fdt? early 1
 gfrtc*		at fdt?

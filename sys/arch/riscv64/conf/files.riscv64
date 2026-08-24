@@ -1,4 +1,4 @@
-#	$OpenBSD: files.riscv64,v 1.31 2025/12/02 19:57:29 kettenis Exp $
+#	$OpenBSD: files.riscv64,v 1.40 2026/07/24 10:51:01 kettenis Exp $
 
 # Standard stanzas config(8) can't run without
 maxpartitions 16
@@ -35,6 +35,7 @@ file	arch/riscv64/riscv64/pagezero.S
 file	arch/riscv64/riscv64/trap.c
 file	arch/riscv64/riscv64/sbi.c
 file	arch/riscv64/riscv64/fpu.c
+file	arch/riscv64/riscv64/vector.c
 
 file	arch/riscv64/riscv64/db_disasm.c	ddb
 file	arch/riscv64/riscv64/db_interface.c	ddb
@@ -79,6 +80,16 @@ file	arch/riscv64/dev/simplebus.c		simplebus
 device	plic
 attach	plic at fdt
 file	arch/riscv64/dev/plic.c			plic
+
+# APLIC
+device	aplic
+attach	aplic at fdt
+file	arch/riscv64/dev/aplic.c		aplic
+
+# IMSIC
+device	imsic
+attach	imsic at fdt
+file	arch/riscv64/dev/imsic.c		imsic
 
 # Allwinner timer
 device	sxitimer
@@ -125,6 +136,36 @@ device	sgmsi
 attach	sgmsi at fdt
 file	arch/riscv64/dev/sgmsi.c		sgmsi
 
+# SpacemiT clock controller
+device	smtclock
+attach	smtclock at fdt
+file	arch/riscv64/dev/smtclock.c		smtclock
+
+# SpacemiT PCIe/USB combo PHY
+device	smtcomphy
+attach	smtcomphy at fdt
+file	arch/riscv64/dev/smtcomphy.c		smtcomphy
+
+# SpacemiT EMAC
+device	smte: ether, ifnet, mii, ifmedia
+attach	smte at fdt
+file	arch/riscv64/dev/if_smte.c		smte
+
+# SpacemiT GPIO controller
+device	smtgpio
+attach	smtgpio at fdt
+file	arch/riscv64/dev/smtgpio.c		smtgpio
+
+# SpacemiT I2C controller
+device	smtiic: i2cbus
+attach	smtiic at fdt
+file	arch/riscv64/dev/smtiic.c		smtiic
+
+# SpacemiT  pinctrl
+device	smtpinctrl
+attach	smtpinctrl at fdt
+file	arch/riscv64/dev/smtpinctrl.c		smtpinctrl
+
 # StarFive clock controller
 device	stfclock
 attach	stfclock at fdt
@@ -168,6 +209,11 @@ include	"dev/hid/files.hid"
 
 # Machine-independent I2C drivers
 include "dev/i2c/files.i2c"
+
+# SpacemiT P1 PMIC
+device	smtpmic
+attach	smtpmic at i2c
+file	arch/riscv64/dev/smtpmic.c		smtpmic
 
 # FDT now requires drm (which is part of pci)
 include "dev/mii/files.mii"

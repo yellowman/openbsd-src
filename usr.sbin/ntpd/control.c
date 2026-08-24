@@ -1,4 +1,4 @@
-/*	$OpenBSD: control.c,v 1.27 2024/11/21 13:38:14 claudio Exp $ */
+/*	$OpenBSD: control.c,v 1.30 2026/08/04 19:05:21 claudio Exp $ */
 
 /*
  * Copyright (c) 2003, 2004 Henning Brauer <henning@openbsd.org>
@@ -39,19 +39,19 @@
 int
 control_check(char *path)
 {
-	struct sockaddr_un	 sun;
+	struct sockaddr_un	 sa;
 	int			 fd;
 
-	bzero(&sun, sizeof(sun));
-	sun.sun_family = AF_UNIX;
-	strlcpy(sun.sun_path, path, sizeof(sun.sun_path));
+	bzero(&sa, sizeof(sa));
+	sa.sun_family = AF_UNIX;
+	strlcpy(sa.sun_path, path, sizeof(sa.sun_path));
 
 	if ((fd = socket(AF_UNIX, SOCK_STREAM, 0)) == -1) {
 		log_debug("control_check: socket check");
 		return (-1);
 	}
 
-	if (connect(fd, (struct sockaddr *)&sun, sizeof(sun)) == 0) {
+	if (connect(fd, (struct sockaddr *)&sa, sizeof(sa)) == 0) {
 		log_debug("control_check: socket in use");
 		close(fd);
 		return (-1);
@@ -203,8 +203,7 @@ control_dispatch_msg(struct pollfd *pfd, u_int *ctl_cnt)
 	struct ctl_show_status	 c_status;
 	struct ctl_show_peer	 c_peer;
 	struct ctl_show_sensor	 c_sensor;
-	int			 cnt;
-	ssize_t			 n;
+	int			 n, cnt;
 
 	if ((c = control_connbyfd(pfd->fd)) == NULL) {
 		log_warn("control_dispatch_msg: fd %d: not found", pfd->fd);
@@ -226,7 +225,7 @@ control_dispatch_msg(struct pollfd *pfd, u_int *ctl_cnt)
 	}
 
 	for (;;) {
-		if ((n = imsg_get(&c->ibuf, &imsg)) == -1) {
+		if ((n = imsgbuf_get(&c->ibuf, &imsg)) == -1) {
 			*ctl_cnt -= control_close(pfd->fd);
 			return (1);
 		}

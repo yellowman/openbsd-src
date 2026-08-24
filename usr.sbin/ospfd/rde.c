@@ -1,4 +1,4 @@
-/*	$OpenBSD: rde.c,v 1.118 2024/11/21 13:38:14 claudio Exp $ */
+/*	$OpenBSD: rde.c,v 1.122 2026/08/17 08:58:47 claudio Exp $ */
 
 /*
  * Copyright (c) 2004, 2005 Claudio Jeker <claudio@openbsd.org>
@@ -260,9 +260,8 @@ rde_dispatch_imsg(int fd, short event, void *bula)
 	struct in_addr		 addr;
 	struct vertex		*v;
 	char			*buf;
-	ssize_t			 n;
 	time_t			 now;
-	int			 r, state, self, error, shut = 0, verbose;
+	int			 n, r, state, self, error, shut = 0, verbose;
 	u_int16_t		 l;
 
 	ibuf = &iev->ibuf;
@@ -286,8 +285,8 @@ rde_dispatch_imsg(int fd, short event, void *bula)
 	now = tp.tv_sec;
 
 	for (;;) {
-		if ((n = imsg_get(ibuf, &imsg)) == -1)
-			fatal("rde_dispatch_imsg: imsg_get error");
+		if ((n = imsgbuf_get(ibuf, &imsg)) == -1)
+			fatal("rde_dispatch_imsg: imsgbuf_get error");
 		if (n == 0)
 			break;
 
@@ -598,7 +597,8 @@ rde_dispatch_imsg(int fd, short event, void *bula)
 		case IMSG_CTL_SHOW_RIB:
 			LIST_FOREACH(area, &rdeconf->area_list, entry) {
 				imsg_compose_event(iev_ospfe, IMSG_CTL_AREA,
-				    0, imsg.hdr.pid, -1, area, sizeof(*area));
+				    0, imsg.hdr.pid, -1,
+				    area_txsan(area), sizeof(*area));
 
 				rt_dump(area->id, imsg.hdr.pid, RIB_RTR);
 				rt_dump(area->id, imsg.hdr.pid, RIB_NET);
@@ -617,9 +617,11 @@ rde_dispatch_imsg(int fd, short event, void *bula)
 			    imsg.hdr.pid, -1, NULL, 0);
 			break;
 		case IMSG_CTL_LOG_VERBOSE:
-			/* already checked by ospfe */
-			memcpy(&verbose, imsg.data, sizeof(verbose));
-			log_setverbose(verbose);
+			if (imsg_get_data(&imsg, &verbose, sizeof(verbose)) ==
+			    -1)
+				log_warn("wrong imsg len");
+			else
+				log_setverbose(verbose);
 			break;
 		default:
 			log_debug("rde_dispatch_imsg: unexpected imsg %d",
@@ -647,8 +649,7 @@ rde_dispatch_parent(int fd, short event, void *bula)
 	struct imsgev		*iev = bula;
 	struct imsgbuf		*ibuf;
 	struct redistribute	*nred;
-	ssize_t			 n;
-	int			 shut = 0;
+	int			 n, shut = 0;
 
 	ibuf = &iev->ibuf;
 
@@ -668,8 +669,8 @@ rde_dispatch_parent(int fd, short event, void *bula)
 	}
 
 	for (;;) {
-		if ((n = imsg_get(ibuf, &imsg)) == -1)
-			fatal("rde_dispatch_parent: imsg_get error");
+		if ((n = imsgbuf_get(ibuf, &imsg)) == -1)
+			fatal("rde_dispatch_parent: imsgbuf_get error");
 		if (n == 0)
 			break;
 
@@ -759,14 +760,13 @@ rde_dump_area(struct area *area, int imsg_type, pid_t pid)
 {
 	struct iface	*iface;
 
-	/* dump header */
-	imsg_compose_event(iev_ospfe, IMSG_CTL_AREA, 0, pid, -1,
-	    area, sizeof(*area));
+	imsg_compose_event(iev_ospfe, IMSG_CTL_AREA, 0, pid, -1, &area->id,
+	    sizeof(area->id));
 
 	/* dump link local lsa */
 	LIST_FOREACH(iface, &area->iface_list, entry) {
 		imsg_compose_event(iev_ospfe, IMSG_CTL_IFACE,
-		    0, pid, -1, iface, sizeof(*iface));
+		    0, pid, -1, iface->name, sizeof(iface->name));
 		lsa_dump(&iface->lsa_tree, imsg_type, pid);
 	}
 

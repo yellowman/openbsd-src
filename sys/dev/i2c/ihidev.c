@@ -1,4 +1,4 @@
-/* $OpenBSD: ihidev.c,v 1.41 2025/10/28 15:36:46 jcs Exp $ */
+/* $OpenBSD: ihidev.c,v 1.46 2026/07/04 16:22:47 kirill Exp $ */
 /*
  * HID-over-i2c driver
  *
@@ -76,7 +76,7 @@ int	ihidev_maxrepid(void *buf, int len);
 int	ihidev_print(void *aux, const char *pnp);
 int	ihidev_submatch(struct device *parent, void *cf, void *aux);
 
-#define IHIDEV_QUIRK_RE_POWER_ON	0x1
+#define IHIDEV_QUIRK_RETRY_GET_REPORT	0x1
 
 const struct ihidev_quirks {
 	uint16_t		ihq_vid;
@@ -84,7 +84,7 @@ const struct ihidev_quirks {
 	int			ihq_quirks;
 } ihidev_devs[] = {
 	/* HONOR MagicBook Art 14 Touchpad (QTEC0002) */
-	{ 0x35cc, 0x0104, IHIDEV_QUIRK_RE_POWER_ON },
+	{ 0x35cc, 0x0104, IHIDEV_QUIRK_RETRY_GET_REPORT },
 };
 
 const struct cfattach ihidev_ca = {
@@ -142,6 +142,7 @@ ihidev_attach(struct device *parent, struct device *self, void *aux)
 	sc->sc_tag = ia->ia_tag;
 	sc->sc_addr = ia->ia_addr;
 	sc->sc_hid_desc_addr = ia->ia_size;
+	sc->sc_lastrepid = -1;
 
 	if (ihidev_hid_command(sc, I2C_HID_CMD_DESCR, NULL) ||
 	    ihidev_hid_desc_parse(sc)) {
@@ -159,10 +160,13 @@ ihidev_attach(struct device *parent, struct device *self, void *aux)
 
 	/* find largest report size and allocate memory for input buffer */
 	sc->sc_isize = letoh16(sc->hid_desc.wMaxInputLength);
+	sc->sc_repsizes = mallocarray(sc->sc_nrepid, sizeof(int),
+	    M_DEVBUF, M_WAITOK | M_ZERO);
 	for (repid = 0; repid < sc->sc_nrepid; repid++) {
 		repsz = hid_report_size(sc->sc_report, sc->sc_reportlen,
 		    hid_input, repid);
 		repsizes[repid] = repsz;
+		sc->sc_repsizes[repid] = repsz;
 		if (repsz > sc->sc_isize)
 			sc->sc_isize = repsz;
 		if (repsz != 0)
@@ -255,6 +259,9 @@ ihidev_detach(struct device *self, int flags)
 	if (sc->sc_report != NULL)
 		free(sc->sc_report, M_DEVBUF, sc->sc_reportlen);
 
+	if (sc->sc_repsizes != NULL)
+		free(sc->sc_repsizes, M_DEVBUF, sc->sc_nrepid * sizeof(int));
+
 	return (0);
 }
 
@@ -265,6 +272,9 @@ ihidev_activate(struct device *self, int act)
 	int rv;
 
 	DPRINTF(("%s(%d)\n", __func__, act));
+
+	if (sc->sc_nrepid <= 0)
+		return (0);
 
 	switch (act) {
 	case DVACT_QUIESCE:
@@ -300,7 +310,7 @@ ihidev_sleep(struct ihidev_softc *sc, int ms)
 	if (cold)
 		delay(ms * 1000);
 	else
-		tsleep_nsec(&sc, PWAIT, "ihidev", MSEC_TO_NSEC(ms));
+		tsleep_nsec(&nowake, PWAIT, "ihidev", MSEC_TO_NSEC(ms));
 }
 
 int
@@ -368,6 +378,7 @@ ihidev_hid_command(struct ihidev_softc *sc, int hidcmd, void *arg)
 		int dataoff = 4;
 		int report_id = rreq->id;
 		int report_len = rreq->len + 2 + 1;
+		int attempt, ntries;
 		int d;
 		uint8_t *tmprep;
 
@@ -403,8 +414,22 @@ ihidev_hid_command(struct ihidev_softc *sc, int hidcmd, void *arg)
 		tmprep = malloc(report_len, M_DEVBUF, M_WAITOK | M_ZERO);
 
 		/* type 3 id 8: 22 00 38 02 23 00 */
-		res = iic_exec(sc->sc_tag, I2C_OP_READ_WITH_STOP, sc->sc_addr,
-		    &cmd, cmdlen, tmprep, report_len, 0);
+		ntries = (sc->sc_quirks & IHIDEV_QUIRK_RETRY_GET_REPORT) ?
+		    5 : 1;
+		for (attempt = 0; attempt < ntries; attempt++) {
+			memset(tmprep, 0, report_len);
+			res = iic_exec(sc->sc_tag, I2C_OP_READ_WITH_STOP,
+			    sc->sc_addr, &cmd, cmdlen, tmprep, report_len, 0);
+
+			d = tmprep[0] | tmprep[1] << 8;
+			if (res == 0 &&
+			    d == report_len &&
+			    tmprep[2] == rreq->id)
+				break;
+
+			if (attempt + 1 < ntries)
+				ihidev_sleep(sc, 100);
+		}
 
 		d = tmprep[0] | tmprep[1] << 8;
 		if (d != report_len)
@@ -655,23 +680,6 @@ ihidev_hid_desc_parse(struct ihidev_softc *sc)
 		return (1);
 	}
 
-	if (sc->sc_quirks & IHIDEV_QUIRK_RE_POWER_ON) {
-		if (ihidev_poweron(sc))
-			return (1);
-
-		/*
-		 * 7.2.8 states that a device shall not respond back
-		 * after receiving the power on command, and must ensure
-		 * that it transitions to power on state in less than 1
-		 * second. The ihidev_poweron function uses a shorter
-		 * sleep, sufficient for the ON-RESET sequence. Here,
-		 * however, it sleeps for the full second to accommodate
-		 * cold boot scenarios on affected devices.
-		 */
-
-		ihidev_sleep(sc, 1000);
-	}
-
 	return (0);
 }
 
@@ -718,10 +726,21 @@ ihidev_intr(void *arg)
 	psize = sc->sc_ibuf[0] | sc->sc_ibuf[1] << 8;
 	if (psize <= 2 || psize > sc->sc_isize) {
 		if (sc->sc_poll) {
-			/*
-			 * TODO: all fingers are up, should we pass to hid
-			 * layer?
-			 */
+			/* empty packet: hand the last subdev a zeroed report
+			 * once so it releases its contacts (polled finger-up) */
+			int lrep = sc->sc_lastrepid;
+			int rsz;
+
+			if (lrep >= 0 && lrep < sc->sc_nrepid &&
+			    (scd = sc->sc_subdevs[lrep]) != NULL &&
+			    (scd->sc_state & IHIDEV_OPEN) && !sc->sc_dying) {
+				rsz = sc->sc_repsizes[lrep];
+				if (rsz > 0 && rsz <= sc->sc_isize) {
+					memset(sc->sc_ibuf, 0, rsz);
+					scd->sc_intr(scd, sc->sc_ibuf, rsz);
+				}
+				sc->sc_lastrepid = -1;
+			}
 			sc->sc_fastpoll = 0;
 			goto more_polling;
 		} else
@@ -770,8 +789,10 @@ ihidev_intr(void *arg)
 		return (1);
 	}
 
-	if (!sc->sc_dying)
+	if (!sc->sc_dying) {
+		sc->sc_lastrepid = rep;
 		scd->sc_intr(scd, p, psize);
+	}
 
 	if (sc->sc_poll && (fast != sc->sc_fastpoll)) {
 		DPRINTF(("%s: %s->%s polling\n", sc->sc_dev.dv_xname,

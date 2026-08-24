@@ -29,6 +29,7 @@
 #include "rrl.h"
 #include "bitset.h"
 #include "xfrd.h"
+#include "metrics.h"
 
 #include "configparser.h"
 config_parser_state_type* cfg_parser = 0;
@@ -65,8 +66,8 @@ nsd_options_create(region_type* region)
 	opt->ip_addresses = NULL;
 	opt->ip_transparent = 0;
 	opt->ip_freebind = 0;
-	opt->send_buffer_size = 0;
-	opt->receive_buffer_size = 0;
+	opt->send_buffer_size = 4*1024*1024;
+	opt->receive_buffer_size = 1*1024*1024;
 	opt->debug_mode = 0;
 	opt->verbosity = 0;
 	opt->hide_version = 0;
@@ -94,6 +95,7 @@ nsd_options_create(region_type* region)
 	opt->tcp_timeout = TCP_TIMEOUT;
 	opt->tcp_mss = 0;
 	opt->outgoing_tcp_mss = 0;
+	opt->tcp_listen_queue = TCP_BACKLOG;
 	opt->ipv4_edns_size = EDNS_MAX_MESSAGE_LEN;
 	opt->ipv6_edns_size = EDNS_MAX_MESSAGE_LEN;
 	opt->pidfile = PIDFILE;
@@ -332,6 +334,9 @@ parse_options_file(struct nsd_options* opt, const char* file,
 			                tls_auth_options_find(opt, acl->tls_auth_name)))
 				    c_error("tls_auth %s in pattern %s could not be found",
 						acl->tls_auth_name, pat->pname);
+				else if (!opt->tls_auth_port)
+				    c_warning("provide-xfr has a tls-auth-name,"
+				         " but no tls-auth-port is configured");
 			}
 			if(acl->nokey || acl->blocked)
 				continue;
@@ -958,10 +963,11 @@ zone_list_close(struct nsd_options* opt)
 }
 
 static void
-c_error_va_list_pos(int showpos, const char* fmt, va_list args)
+c_error_va_list_pos(int showpos, int is_error, const char* fmt, va_list args)
 {
 	char* at = NULL;
-	cfg_parser->errors++;
+	if(is_error)
+		cfg_parser->errors++;
 	if(showpos && c_text && c_text[0]!=0) {
 		at = c_text;
 	}
@@ -974,7 +980,8 @@ c_error_va_list_pos(int showpos, const char* fmt, va_list args)
 			snprintf(m, sizeof(m), "at '%s': ", at);
 			(*cfg_parser->err)(cfg_parser->err_arg, m);
 		}
-		(*cfg_parser->err)(cfg_parser->err_arg, "error: ");
+		(*cfg_parser->err)(cfg_parser->err_arg,
+			is_error ? "error: " : "warning: ");
 		vsnprintf(m, sizeof(m), fmt, args);
 		(*cfg_parser->err)(cfg_parser->err_arg, m);
 		(*cfg_parser->err)(cfg_parser->err_arg, "\n");
@@ -982,7 +989,7 @@ c_error_va_list_pos(int showpos, const char* fmt, va_list args)
 	}
         fprintf(stderr, "%s:%d: ", cfg_parser->filename, cfg_parser->line);
 	if(at) fprintf(stderr, "at '%s': ", at);
-	fprintf(stderr, "error: ");
+	fprintf(stderr, is_error ? "error: " : "warning: ");
 	vfprintf(stderr, fmt, args);
 	fprintf(stderr, "\n");
 }
@@ -998,7 +1005,22 @@ c_error(const char *fmt, ...)
 	}
 
 	va_start(ap, fmt);
-	c_error_va_list_pos(showpos, fmt, ap);
+	c_error_va_list_pos(showpos, 1, fmt, ap);
+	va_end(ap);
+}
+
+void
+c_warning(const char *fmt, ...)
+{
+	va_list ap;
+	int showpos = 0;
+
+	if (strcmp(fmt, "syntax error") == 0 || strcmp(fmt, "parse error") == 0) {
+		showpos = 1;
+	}
+
+	va_start(ap, fmt);
+	c_error_va_list_pos(showpos, 0, fmt, ap);
 	va_end(ap);
 }
 
@@ -1993,6 +2015,16 @@ acl_check_incoming(struct acl_options* acl, struct query* q,
 			acl->ip_address_spec, acl->nokey?"NOKEY":
 			(acl->blocked?"BLOCKED":acl->key_name)));
 #endif
+#ifdef HAVE_SSL
+		if (acl->tls_auth_name && !q->tls_auth) {
+			/* the acl requires a TLS client cert with name, but
+			 * the connection did not came over a "tls-auth-port:"
+			 */
+			number++;
+			acl = acl->next;
+			continue;
+		}
+#endif
 		if(acl_addr_matches(acl, q) && acl_key_matches(acl, q)) {
 			if(!match)
 			{
@@ -2007,7 +2039,7 @@ acl_check_incoming(struct acl_options* acl, struct query* q,
 		}
 #ifdef HAVE_SSL
 		/* we are in a acl with tls_auth */
-		if (acl->tls_auth_name && q->tls_auth) {
+		if (acl->tls_auth_name) {
 			/* we have auth_domain_name in tls_auth */
 			if (acl->tls_auth_options && acl->tls_auth_options->auth_domain_name) {
 				if (!acl_tls_hostname_matches(q->tls_auth, acl->tls_auth_options->auth_domain_name)) {
@@ -2526,6 +2558,20 @@ replace_str(char* str, size_t len, const char* one, const char* two)
 	}
 }
 
+/* replace occurences of '/' with "\047", as a way to escape the '/'.
+ * This is to escape the slash character when it is part of the domain
+ * name string. It can be used normally when it is in the config string. */
+const char*
+escape_slash_zonefile(const char* input)
+{
+	static char f[1024];
+	if(!strchr(input, '/'))
+		return input;
+	strlcpy(f, input, sizeof(f));
+	replace_str(f, sizeof(f), "/", "\\047");
+	return f;
+}
+
 const char*
 config_cook_string(struct zone_options* zone, const char* input)
 {
@@ -2548,7 +2594,8 @@ config_cook_string(struct zone_options* zone, const char* input)
 	if(strstr(f, "%x"))
 		replace_str(f, sizeof(f), "%x", get_end_label(zone, 3));
 	if(strstr(f, "%s"))
-		replace_str(f, sizeof(f), "%s", zone->name);
+		replace_str(f, sizeof(f), "%s", escape_slash_zonefile(
+		zone->name));
 	return f;
 }
 
@@ -2581,7 +2628,8 @@ config_make_zonefile(struct zone_options* zone, struct nsd* nsd)
 	if(strstr(f, "%x"))
 		replace_str(f, sizeof(f), "%x", get_end_label(zone, 3));
 	if(strstr(f, "%s"))
-		replace_str(f, sizeof(f), "%s", zone->name);
+		replace_str(f, sizeof(f), "%s", escape_slash_zonefile(
+		zone->name));
 	if (nsd->chrootdir && nsd->chrootdir[0] && f[0] == '/' &&
 		strncmp(f, nsd->chrootdir, strlen(nsd->chrootdir)) == 0)
 		/* -1 because chrootdir ends in trailing slash */
@@ -2924,12 +2972,30 @@ unsigned getzonestatid(struct nsd_options* opt, struct zone_options* zopt)
 {
 #ifdef USE_ZONE_STATS
 	const char* statname;
+	char* statname_valid;
+	int name_was_modified;
 	struct zonestatname* n;
 	rbnode_type* res;
 	/* try to find the instantiated zonestat name */
 	if(!zopt->pattern->zonestats || zopt->pattern->zonestats[0]==0)
 		return 0; /* no zone stats */
 	statname = config_cook_string(zopt, zopt->pattern->zonestats);
+
+	#ifdef USE_METRICS
+	/* warn when we will lossily change the zonestat name in metrics */
+	statname_valid = strdup(statname);
+	if(!statname_valid) {
+		log_msg(LOG_ERR, "malloc failed: %s", strerror(errno));
+		exit(1);
+	}
+	name_was_modified = metrics_make_label_value_valid(statname_valid);
+	if (name_was_modified) {
+		log_msg(LOG_WARNING, "zonestats name \"%s\" contains disallowed characters, using \"%s\" in metrics",
+			statname, statname_valid);
+	}
+	free(statname_valid);
+	#endif /* USE_METRICS */
+
 	res = rbtree_search(opt->zonestatnames, statname);
 	if(res)
 		return ((struct zonestatname*)res)->id;

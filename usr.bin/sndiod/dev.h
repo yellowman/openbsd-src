@@ -1,4 +1,4 @@
-/*	$OpenBSD: dev.h,v 1.53 2026/03/15 14:24:43 ratchov Exp $	*/
+/*	$OpenBSD: dev.h,v 1.60 2026/08/04 09:43:23 ratchov Exp $	*/
 /*
  * Copyright (c) 2008-2012 Alexandre Ratchov <alex@caoua.org>
  *
@@ -124,6 +124,9 @@ struct ctl {
 #define CTL_DEV_MASTER	1
 #define CTL_OPT_DEV	2
 #define CTL_APP_LEVEL	3
+#define CTL_OPT_MODE	4
+#define CTL_MIDI_PORT	5
+#define CTL_MIDI_THRU	6
 	unsigned int scope;
 	union {
 		struct {
@@ -145,11 +148,17 @@ struct ctl {
 			struct opt *opt;
 			struct dev *dev;
 		} opt_dev;
+		struct {
+			struct opt *opt;
+			int idx;
+		} opt_mode;
+		struct {
+			struct midithru *midithru;
+			struct port *port;
+		} midi;
 	} u;
 
 	unsigned int addr;		/* slot side control address */
-#define CTL_NAMEMAX	12		/* max name length */
-#define CTL_DISPLAYMAX	24		/* max name length */
 	char func[CTL_NAMEMAX];		/* parameter function name */
 	char group[CTL_NAMEMAX];	/* group aka namespace */
 	char display[CTL_DISPLAYMAX];	/* free-format hint */
@@ -171,6 +180,7 @@ struct ctlslot {
 	struct ctlops *ops;
 	void *arg;
 	struct opt *opt;
+	struct midithru *midithru;
 	unsigned int self;		/* equal to (1 << index) */
 	unsigned int mode;
 };
@@ -240,12 +250,8 @@ struct dev {
 	/*
 	 * desired parameters
 	 */
-	unsigned int reqmode;			/* mode */
 	struct aparams reqpar;			/* parameters */
 	int reqpchan, reqrchan;			/* play & rec chans */
-	unsigned int reqbufsz;			/* buffer size */
-	unsigned int reqround;			/* block size */
-	unsigned int reqrate;			/* sample rate */
 	unsigned int hold;			/* hold the device open ? */
 	unsigned int autovol;			/* auto adjust playvol ? */
 	unsigned int refcnt;			/* number of openers */
@@ -274,17 +280,17 @@ extern struct ctl *ctl_list;
 extern struct slot slot_array[DEV_NSLOT];
 extern struct ctlslot ctlslot_array[DEV_NCTLSLOT];
 extern struct mtc mtc_array[1];
+extern int dev_rate, dev_bufsz, dev_round;
 
 size_t chans_fmt(char *, size_t, int, int, int, int, int);
 int dev_open(struct dev *);
 void dev_close(struct dev *);
 void dev_abort(struct dev *);
 void dev_migrate(struct dev *);
-struct dev *dev_new(char *, struct aparams *, unsigned int, unsigned int,
-    unsigned int, unsigned int, unsigned int, unsigned int);
+struct dev *dev_new(char *, struct aparams *, unsigned int, unsigned int);
 struct dev *dev_bynum(int);
 void dev_del(struct dev *);
-void dev_adjpar(struct dev *, int, int, int);
+void dev_adjpar(struct dev *, int, int);
 int  dev_init(struct dev *);
 void dev_done(struct dev *);
 int dev_ref(struct dev *);
@@ -344,7 +350,7 @@ struct ctl *ctl_find(int, void *, void *);
 void ctl_update(struct ctl *);
 int ctl_onval(int, void *, void *, int);
 
-struct ctlslot *ctlslot_new(struct opt *, struct ctlops *, void *);
+struct ctlslot *ctlslot_new(struct opt *, struct midithru *, struct ctlops *, void *);
 void ctlslot_del(struct ctlslot *);
 int ctlslot_visible(struct ctlslot *, struct ctl *);
 struct ctl *ctlslot_lookup(struct ctlslot *, int);

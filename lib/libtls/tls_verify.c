@@ -1,4 +1,4 @@
-/* $OpenBSD: tls_verify.c,v 1.32 2024/12/10 08:40:30 tb Exp $ */
+/* $OpenBSD: tls_verify.c,v 1.34 2026/05/30 17:06:09 jsing Exp $ */
 /*
  * Copyright (c) 2014 Jeremie Courreges-Anglas <jca@openbsd.org>
  *
@@ -58,6 +58,9 @@ tls_match_name(const char *cert_name, const char *name)
 		next_dot = strchr(&cert_domain[1], '.');
 		/* Disallow "*.bar" */
 		if (next_dot == NULL)
+			return -1;
+		/* Disallow "*.bar." */
+		if (next_dot[1] == '\0')
 			return -1;
 		/* Disallow "*.bar.." */
 		if (next_dot[1] == '.')
@@ -214,10 +217,10 @@ tls_get_common_name_internal(X509 *cert, char **out_common_name,
     unsigned int *out_tlserr, const char **out_errstr)
 {
 	unsigned char *utf8_bytes = NULL;
-	X509_NAME *subject_name;
+	const X509_NAME *subject_name;
 	char *common_name = NULL;
 	int common_name_len;
-	ASN1_STRING *data;
+	const ASN1_STRING *data;
 	int lastpos = -1;
 	int rv = -1;
 

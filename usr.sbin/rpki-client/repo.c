@@ -1,4 +1,4 @@
-/*	$OpenBSD: repo.c,v 1.80 2025/11/13 15:18:53 job Exp $ */
+/*	$OpenBSD: repo.c,v 1.91 2026/07/28 18:58:22 claudio Exp $ */
 /*
  * Copyright (c) 2021 Claudio Jeker <claudio@openbsd.org>
  * Copyright (c) 2019 Kristaps Dzonsons <kristaps@bsd.lv>
@@ -16,9 +16,9 @@
  * OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
  */
 
+#include <sys/types.h>
 #include <sys/queue.h>
 #include <sys/tree.h>
-#include <sys/types.h>
 #include <sys/stat.h>
 
 #include <assert.h>
@@ -62,6 +62,7 @@ struct rrdprepo {
 	struct filepath_tree	 deleted;
 	unsigned int		 id;
 	enum repo_state		 state;
+	int			 file_failed;
 	time_t			 last_reset;
 	time_t			 mtime;
 };
@@ -203,7 +204,7 @@ static void
 filepath_put(struct filepath_tree *tree, struct filepath *fp)
 {
 	RB_REMOVE(filepath_tree, tree, fp);
-	free((void *)fp->file);
+	free(fp->file);
 	free(fp);
 }
 
@@ -480,9 +481,9 @@ static struct rsyncrepo *
 rsync_get(const char *uri, const char *validdir)
 {
 	struct rsyncrepo *rr;
-	char *repo;
+	char *repo = NULL;
 
-	if ((repo = rsync_base_uri(uri)) == NULL)
+	if (!rsync_base_uri(uri, &repo))
 		errx(1, "bad caRepository URI: %s", uri);
 
 	SLIST_FOREACH(rr, &rsyncrepos, entry)
@@ -630,12 +631,16 @@ static int
 rrdp_uri_valid(struct rrdprepo *rr, const char *uri)
 {
 	struct repo *rp;
+	size_t len;
 
 	SLIST_FOREACH(rp, &repos, entry) {
 		if (rp->rrdp != rr)
 			continue;
-		if (strncmp(uri, rp->repouri, strlen(rp->repouri)) == 0)
-			return 1;
+		len = strlen(rp->repouri);
+		if (strncmp(uri, rp->repouri, len) == 0) {
+			if (uri[len] == '/')
+				return 1;
+		}
 	}
 	return 0;
 }
@@ -705,10 +710,14 @@ rrdp_session_parse(struct rrdprepo *rr)
 			line[n - 1] = '\0';
 		switch (ln) {
 		case 0:
+			if (!valid_uri(line, strlen(line), HTTPS_PROTO))
+				goto reset;
+			break;
+		case 1:
 			if ((state->session_id = strdup(line)) == NULL)
 				err(1, NULL);
 			break;
-		case 1:
+		case 2:
 			state->serial = strtonum(line, 1, LLONG_MAX, &errstr);
 			if (errstr) {
 				warnx("%s: state file: serial is %s: %s",
@@ -716,7 +725,7 @@ rrdp_session_parse(struct rrdprepo *rr)
 				goto reset;
 			}
 			break;
-		case 2:
+		case 3:
 			rr->last_reset = strtonum(line, 1, LLONG_MAX, &errstr);
 			if (errstr) {
 				warnx("%s: state file: last_reset is %s: %s",
@@ -724,7 +733,7 @@ rrdp_session_parse(struct rrdprepo *rr)
 				goto reset;
 			}
 			break;
-		case 3:
+		case 4:
 			if (strcmp(line, "-") == 0)
 				break;
 			if ((state->last_mod = strdup(line)) == NULL)
@@ -801,7 +810,7 @@ rrdp_session_save(unsigned int id, struct rrdp_session *state)
 		err(1, "fdopen");
 
 	/* write session state file out */
-	if (fprintf(f, "%s\n%lld\n%lld\n", state->session_id,
+	if (fprintf(f, "%s\n%s\n%lld\n%lld\n", rr->notifyuri, state->session_id,
 	    state->serial, (long long)rr->last_reset) < 0)
 		goto fail;
 
@@ -944,7 +953,7 @@ rrdp_clear(unsigned int id)
 
 	/* remove rrdp repository contents */
 	remove_contents(rr->basedir);
-	rr->state = REPO_LOADING;
+	rr->file_failed = 0;
 }
 
 /*
@@ -967,7 +976,7 @@ rrdp_handle_file(unsigned int id, enum publish_type pt, char *uri,
 	rr = rrdp_find(id);
 	if (rr == NULL)
 		errx(1, "non-existent rrdp repo %u", id);
-	if (rr->state == REPO_FAILED)
+	if (rr->file_failed)
 		return -1;
 
 	/* check hash of original file for updates and deletes */
@@ -1037,7 +1046,7 @@ rrdp_handle_file(unsigned int id, enum publish_type pt, char *uri,
 	return 1;
 
 fail:
-	rr->state = REPO_FAILED;
+	rr->file_failed = 1;
 	if (fd != -1)
 		close(fd);
 	free(fn);
@@ -1110,7 +1119,7 @@ rrdp_finish(unsigned int id, int ok)
 	if (rr->state != REPO_LOADING)
 		return;
 
-	if (ok) {
+	if (ok && !rr->file_failed) {
 		logx("%s: loaded from network", rr->notifyuri);
 		if (time(NULL) - rr->mtime > 24 * 60 * 60) {
 			warnx("%s: notification file not modified since %s",
@@ -1217,9 +1226,9 @@ struct repo *
 repo_lookup(int talid, const char *uri, const char *notify)
 {
 	struct repo	*rp;
-	char		*repouri;
+	char		*repouri = NULL;
 
-	if ((repouri = rsync_base_uri(uri)) == NULL)
+	if (!rsync_base_uri(uri, &repouri))
 		errx(1, "bad caRepository URI: %s", uri);
 
 	/* Look up in repository table. */
@@ -1533,6 +1542,23 @@ repostats_new_files_inc(struct repo *rp, const char *file)
 		rp->repostats.new_files++;
 }
 
+void
+repo_stat_add_nca(struct nonfunc_ca *nca)
+{
+	struct repo *rp;
+
+	SLIST_FOREACH(rp, &repos, entry) {
+		if (rp->id == nca->repoid) {
+			rp->stats[nca->talid].certs_nonfunc++;
+
+			if (nca->defer)
+				rp->stats[nca->talid].certs_nonfunc_deferred++;
+
+			break;
+		}
+	}
+}
+
 /*
  * Update stats object of repository depending on rtype and subtype.
  */
@@ -1548,10 +1574,6 @@ repo_stat_inc(struct repo *rp, int talid, enum rtype type, enum stype subtype)
 			rp->stats[talid].certs++;
 		if (subtype == STYPE_FAIL)
 			rp->stats[talid].certs_fail++;
-		if (subtype == STYPE_NONFUNC)
-			rp->stats[talid].certs_nonfunc++;
-		if (subtype == STYPE_FUNC)
-			rp->stats[talid].certs_nonfunc--;
 		if (subtype == STYPE_BGPSEC) {
 			rp->stats[talid].certs--;
 			rp->stats[talid].brks++;
@@ -1795,21 +1817,25 @@ repo_move_valid(struct filepath_tree *tree)
 		if ((fp->file = strdup(fn)) == NULL)
 			err(1, NULL);
 
- again:
 		if ((ofp = RB_INSERT(filepath_tree, tree, fp)) != NULL) {
-			if (ofp->talmask == 0) {
-				/* conflicting path is not valid, drop it */
-				filepath_put(tree, ofp);
-				goto again;
+			if (ofp->talmask != 0) {
+				/* conflicting filepath is valid, keep it */
+				if (fp->talmask != 0) {
+					warnx("%s: file already present in "
+					    "validated cache", fp->file);
+				}
+				free(fp->file);
+				free(fp);
+				free(base);
+				continue;
 			}
-			if (fp->talmask != 0) {
-				warnx("%s: file already present in "
-				    "validated cache", fp->file);
-			}
+
+			/* conflicting filepath is not valid, replace it */
+			ofp->talmask = fp->talmask;
+			ofp->mtime = fp->mtime;
 			free(fp->file);
 			free(fp);
-			free(base);
-			continue;
+			fp = ofp;
 		}
 
 		if (rename(base, fp->file) == -1)
@@ -1850,6 +1876,9 @@ repo_cleanup_entry(FTSENT *e, struct filepath_tree *tree, int cachefd)
 	path = skip_dotslash(e->fts_path);
 	switch (e->fts_info) {
 	case FTS_NSOK:
+		if (e->fts_level == 1 && fts_state.type == BASE_DIR &&
+		    strcmp(e->fts_name, NCA_HISTORY) == 0)
+			break;
 		if (filepath_exists(tree, path)) {
 			e->fts_parent->fts_number++;
 			break;

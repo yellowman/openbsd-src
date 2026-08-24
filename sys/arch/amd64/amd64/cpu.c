@@ -1,4 +1,4 @@
-/*	$OpenBSD: cpu.c,v 1.203 2025/12/30 10:59:08 jsg Exp $	*/
+/*	$OpenBSD: cpu.c,v 1.206 2026/05/14 01:39:38 jsg Exp $	*/
 /* $NetBSD: cpu.c,v 1.1 2003/04/26 18:39:26 fvdl Exp $ */
 
 /*-
@@ -729,8 +729,11 @@ cpu_attach(struct device *parent, struct device *self, void *aux)
 		sched_init_cpu(ci);
 		ncpus++;
 		if (ci->ci_flags & CPUF_PRESENT) {
-			ci->ci_next = cpu_info_list->ci_next;
-			cpu_info_list->ci_next = ci;
+			struct cpu_info *ci_last = cpu_info_list;
+
+			while (ci_last->ci_next != NULL)
+				ci_last = ci_last->ci_next;
+			ci_last->ci_next = ci;
 		}
 #else
 		printf("%s: not started\n", sc->sc_dev.dv_xname);
@@ -1289,12 +1292,29 @@ cpu_fix_msrs(struct cpu_info *ci)
 			if (msr != nmsr)
 				wrmsr(MSR_DE_CFG, nmsr);
 		}
+		/* Zen 2 mitigations: Zenbleed, op cache corruption */
 		if (family == 0x17 && ci->ci_model >= 0x31 &&
 		    (cpu_ecxfeature & CPUIDECX_HV) == 0) {
 			nmsr = msr = rdmsr(MSR_DE_CFG);
 			nmsr |= DE_CFG_SERIALIZE_9;
 			if (msr != nmsr)
 				wrmsr(MSR_DE_CFG, nmsr);
+
+			nmsr = msr = rdmsr(MSR_BP_CFG);
+			nmsr |= BP_CFG_33;
+			if (msr != nmsr)
+				wrmsr(MSR_BP_CFG, nmsr);
+		}
+		/*
+		 * Mitigation for Floating Point Divider State Sampling
+		 * from AMD-SB-7053
+		 */
+		if (family == 0x17 && ci->ci_model <= 0x2f &&
+		    (cpu_ecxfeature & CPUIDECX_HV) == 0) {
+			nmsr = msr = rdmsr(MSR_FP_CFG);
+			nmsr |= FP_CFG_9;
+			if (msr != nmsr)
+				wrmsr(MSR_FP_CFG, nmsr);
 		}
 	}
 

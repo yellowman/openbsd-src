@@ -1,4 +1,4 @@
-/*	$OpenBSD: engine.c,v 1.29 2025/04/27 16:23:04 florian Exp $	*/
+/*	$OpenBSD: engine.c,v 1.32 2026/08/04 19:06:54 claudio Exp $	*/
 
 /*
  * Copyright (c) 2018 Florian Obser <florian@openbsd.org>
@@ -189,9 +189,8 @@ engine_dispatch_frontend(int fd, short event, void *bula)
 	struct imsgbuf		*ibuf;
 	struct imsg		 imsg;
 	struct imsg_ra_rs	 ra_rs;
-	ssize_t			 n;
 	uint32_t		 if_index;
-	int			 shut = 0, verbose;
+	int			 n, shut = 0, verbose;
 
 	ibuf = &iev->ibuf;
 
@@ -211,8 +210,8 @@ engine_dispatch_frontend(int fd, short event, void *bula)
 	}
 
 	for (;;) {
-		if ((n = imsg_get(ibuf, &imsg)) == -1)
-			fatal("%s: imsg_get error", __func__);
+		if ((n = imsgbuf_get(ibuf, &imsg)) == -1)
+			fatal("%s: imsgbuf_get error", __func__);
 		if (n == 0)	/* No more messages. */
 			break;
 
@@ -274,8 +273,7 @@ engine_dispatch_main(int fd, short event, void *bula)
 	struct ra_rdnss_conf		*ra_rdnss_conf;
 	struct ra_dnssl_conf		*ra_dnssl_conf;
 	struct ra_pref64_conf		*pref64;
-	ssize_t				 n;
-	int				 shut = 0;
+	int				 n, shut = 0;
 
 	ibuf = &iev->ibuf;
 
@@ -295,8 +293,8 @@ engine_dispatch_main(int fd, short event, void *bula)
 	}
 
 	for (;;) {
-		if ((n = imsg_get(ibuf, &imsg)) == -1)
-			fatal("%s: imsg_get error", __func__);
+		if ((n = imsgbuf_get(ibuf, &imsg)) == -1)
+			fatal("%s: imsgbuf_get error", __func__);
 		if (n == 0)	/* No more messages. */
 			break;
 
@@ -541,6 +539,8 @@ parse_rs(struct imsg_ra_rs *rs)
 	while ((size_t)len >= sizeof(struct nd_opt_hdr)) {
 		struct nd_opt_hdr *nd_opt_hdr = (struct nd_opt_hdr *)p;
 
+		if (nd_opt_hdr->nd_opt_len == 0)
+			return;
 		len -= sizeof(struct nd_opt_hdr);
 		p += sizeof(struct nd_opt_hdr);
 

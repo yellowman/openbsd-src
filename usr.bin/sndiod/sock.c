@@ -1,4 +1,4 @@
-/*	$OpenBSD: sock.c,v 1.57 2026/02/27 08:31:01 ratchov Exp $	*/
+/*	$OpenBSD: sock.c,v 1.69 2026/08/12 10:58:19 ratchov Exp $	*/
 /*
  * Copyright (c) 2008-2012 Alexandre Ratchov <alex@caoua.org>
  *
@@ -103,31 +103,6 @@ unsigned int sock_sesrefs = 0;		/* connections to the session */
 uint8_t sock_sescookie[AMSG_COOKIELEN];	/* owner of the session */
 
 /*
- * Old clients used to send dev number and opt name. This routine
- * finds proper opt pointer for the given device.
- */
-static struct opt *
-legacy_opt(int devnum, char *optname)
-{
-	struct dev *d;
-	struct opt *o;
-
-	d = dev_bynum(devnum);
-	if (d == NULL)
-		return NULL;
-	if (strcmp(optname, "default") == 0) {
-		for (o = opt_list; o != NULL; o = o->next) {
-			if (strcmp(o->name, d->name) == 0)
-				return o;
-		}
-		return NULL;
-	} else {
-		o = opt_byname(optname);
-		return (o != NULL && o->dev == d) ? o : NULL;
-	}
-}
-
-/*
  * If control slot is associated to a particular opt, then
  * remove the unused group part of the control name to make mixer
  * look nicer
@@ -147,9 +122,7 @@ ctlgroup(struct sock *f, struct ctl *c)
 void
 sock_close(struct sock *f)
 {
-	struct opt *o;
 	struct sock **pf;
-	unsigned int tags, i;
 
 	for (pf = &sock_list; *pf != f; pf = &(*pf)->next) {
 #ifdef DEBUG
@@ -171,17 +144,16 @@ sock_close(struct sock *f)
 		f->slot = NULL;
 	}
 	if (f->midi) {
-		tags = midi_tags(f->midi);
-		for (i = 0; i < DEV_NMAX; i++) {
-			if ((tags & (1 << i)) && (o = opt_bynum(i)) != NULL)
-				opt_unref(o);
-		}
 		midi_del(f->midi);
 		f->midi = NULL;
-	}
-	if (f->port) {
-		port_unref(f->port);
-		f->port = NULL;
+		if (f->opt) {
+			opt_unref(f->opt);
+			f->opt = NULL;
+		}
+		if (f->midithru) {
+			midithru_unref(f->midithru);
+			f->midithru = NULL;
+		}
 	}
 	if (f->ctlslot) {
 		ctlslot_del(f->ctlslot);
@@ -313,10 +285,11 @@ sock_new(int fd)
 
 	f = xmalloc(sizeof(struct sock));
 	f->pstate = SOCK_AUTH;
+	f->midithru = NULL;
 	f->slot = NULL;
-	f->port = NULL;
 	f->midi = NULL;
 	f->ctlslot = NULL;
+	f->opt = NULL;
 	f->tickpending = 0;
 	f->xrunpending = 0;
 	f->fillpending = 0;
@@ -709,10 +682,12 @@ sock_auth(struct sock *f)
 int
 sock_hello(struct sock *f)
 {
+	char name[CTL_NAMEMAX];
 	struct amsg_hello *p = &f->rmsg.u.hello;
-	struct port *c;
 	struct opt *opt;
+	struct midithru *midithru;
 	unsigned int mode;
+	unsigned int type;
 	unsigned int id;
 
 	mode = ntohs(p->mode);
@@ -742,51 +717,87 @@ sock_hello(struct sock *f)
 #endif
 		return 0;
 	}
+	if (strnlen(p->opt, sizeof(p->opt)) >= sizeof(p->opt)) {
+#ifdef DEBUG
+		logx(1, "sock %d: malformed opt", f->fd);
+#endif
+		return 0;
+	}
+	if (strnlen(p->who, sizeof(p->who)) >= sizeof(p->who)) {
+#ifdef DEBUG
+		logx(1, "sock %d: malformed program name", f->fd);
+#endif
+		return 0;
+	}
+
+	/*
+	 * Old audio clients don't set p->type.
+	 */
+	type = AMSG_ISSET(p->type) ? p->type : AMSG_TYPE_MAGIC | AMSG_TYPE_SND;
+
+	/*
+	 * New clients set the AMSG_TYPE_MAGIC bit. Older ones encode
+	 * the (type, device number) pair in the type field, in the MSB
+	 * and LSB nibbles respectively.
+	 */
+	if (type & AMSG_TYPE_MAGIC) {
+		type = type & ~AMSG_TYPE_MAGIC;
+		snprintf(name, sizeof(name), "%s%s",
+		    type == AMSG_TYPE_MIDITHRU ? "default-" : "",
+		    p->opt);
+	} else {
+		type = type >> 4;
+		snprintf(name, sizeof(name), "%s%d",
+		    type == AMSG_TYPE_MIDITHRU ? "default-" : "",
+		    type & 0xf);
+	}
+
+	switch (type) {
+	case AMSG_TYPE_SND:
+		opt = opt_byname(name);
+		if (opt == NULL)
+			return 0;
+		break;
+	case AMSG_TYPE_MIDITHRU:
+	case AMSG_TYPE_MIDI:
+		midithru = midithru_byname(name);
+		if (midithru == NULL)
+			return 0;
+		break;
+	default:
+		return 0;
+	}
 	f->pstate = SOCK_INIT;
-	f->port = NULL;
 	if (mode & MODE_MIDIMASK) {
-		f->slot = NULL;
 		f->midi = midi_new(&sock_midiops, f, mode);
 		if (f->midi == NULL)
 			return 0;
-		/* XXX: add 'devtype' to libsndio */
-		if (p->devnum == AMSG_NODEV) {
-			opt = opt_byname(p->opt);
-			if (opt == NULL)
-				return 0;
+		switch (type) {
+		case AMSG_TYPE_SND:
 			if (!opt_ref(opt))
 				return 0;
-			midi_tag(f->midi, opt->num);
-		} else if (p->devnum < 16) {
-			opt = legacy_opt(p->devnum, p->opt);
-			if (opt == NULL)
+			f->opt = opt;
+			midithru_addprog(f->opt->midithru, f->midi);
+			break;
+		case AMSG_TYPE_MIDITHRU:
+		case AMSG_TYPE_MIDI:
+			if (!midithru_ref(midithru))
 				return 0;
-			if (!opt_ref(opt))
-				return 0;
-			midi_tag(f->midi, opt->num);
-		} else if (p->devnum < 32) {
-			midi_tag(f->midi, p->devnum);
-		} else if (p->devnum < 48) {
-			c = port_alt_ref(p->devnum - 32);
-			if (c == NULL)
-				return 0;
-			f->port = c;
-			midi_link(f->midi, c->midi);
-		} else
-			return 0;
-		return 1;
-	}
-	if (mode & MODE_CTLMASK) {
-		if (p->devnum == AMSG_NODEV) {
-			opt = opt_byname(p->opt);
-			if (opt == NULL)
-				return 0;
-		} else {
-			opt = legacy_opt(p->devnum, p->opt);
-			if (opt == NULL)
-				return 0;
+			f->midithru = midithru;
+			midithru_addprog(f->midithru, f->midi);
+			break;
 		}
-		f->ctlslot = ctlslot_new(opt, &sock_ctlops, f);
+	} else if (mode & MODE_CTLMASK) {
+		switch (type) {
+		case AMSG_TYPE_SND:
+			midithru = NULL;
+			break;
+		case AMSG_TYPE_MIDITHRU:
+		case AMSG_TYPE_MIDI:
+			opt = NULL;
+			break;
+		}
+		f->ctlslot = ctlslot_new(opt, midithru, &sock_ctlops, f);
 		if (f->ctlslot == NULL) {
 			logx(2, "sock %d: couldn't get ctlslot", f->fd);
 			return 0;
@@ -794,16 +805,11 @@ sock_hello(struct sock *f)
 		f->ctldesc = xmalloc(SOCK_CTLDESC_SIZE);
 		f->ctlops = 0;
 		f->ctlsyncpending = 0;
-		return 1;
+	} else {
+		f->slot = slot_new(opt, id, p->who, &sock_slotops, f, mode);
+		if (f->slot == NULL)
+			return 0;
 	}
-	opt = (p->devnum == AMSG_NODEV) ?
-	    opt_byname(p->opt) : legacy_opt(p->devnum, p->opt);
-	if (opt == NULL)
-		return 0;
-	f->slot = slot_new(opt, id, p->who, &sock_slotops, f, mode);
-	if (f->slot == NULL)
-		return 0;
-	f->midi = NULL;
 	return 1;
 }
 

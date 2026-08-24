@@ -1,4 +1,4 @@
-/*	$OpenBSD: util.c,v 1.99 2026/03/18 15:00:20 sthen Exp $ */
+/*	$OpenBSD: util.c,v 1.104 2026/08/04 08:11:05 job Exp $ */
 
 /*
  * Copyright (c) 2006 Claudio Jeker <claudio@openbsd.org>
@@ -95,9 +95,11 @@ log_evpnaddr(const struct bgpd_addr *addr, struct sockaddr *sa,
 
 	switch (addr->evpn.type) {
 	case EVPN_ROUTE_TYPE_2:
-		memcpy(&vni, addr->labelstack, addr->labellen);
+		vni = addr->labelstack[0];
+		vni = vni << 8 | addr->labelstack[1];
+		vni = vni << 8 | addr->labelstack[2];
 		snprintf(buf, sizeof(buf), "[2]:[%s]:[%s]:[%d]:[48]:[%s]",
-		    log_rd(addr->rd), log_esi(addr->evpn.esi), htonl(vni) >> 8,
+		    log_rd(addr->rd), log_esi(addr->evpn.esi), vni,
 		    log_mac(addr->evpn.mac));
 		if (sa != NULL) {
 			len = strlen(buf);
@@ -108,7 +110,6 @@ log_evpnaddr(const struct bgpd_addr *addr, struct sockaddr *sa,
 		break;
 	case EVPN_ROUTE_TYPE_3:
 		if (sa != NULL) {
-			memcpy(&vni, addr->labelstack, addr->labellen);
 			snprintf(buf, sizeof(buf), "[3]:[%s]:[%d]:[%s]",
 			    log_rd(addr->rd),
 			    sa->sa_family == AF_INET ? 32 : 128,
@@ -272,7 +273,7 @@ log_aspa(struct aspa_set *aspa)
 	uint32_t i;
 
 	/* include enough space for header and trailer */
-	if ((uint64_t)aspa->num > (SIZE_MAX / sizeof(asbuf) - 72))
+	if (aspa->num > MAX_ASPA_SPAS_COUNT)
 		goto fail;
 	needed = aspa->num * sizeof(asbuf) + 72;
 	if (needed > len) {
@@ -319,6 +320,8 @@ log_aspath_error(int error)
 		return "invalid encoding";
 	case AS_ERR_SOFT:
 		return "soft failure";
+	case AS_ERR_MAX:
+		return "too large";
 	default:
 		snprintf(buf, sizeof(buf), "unknown %d", error);
 		return buf;
@@ -351,6 +354,16 @@ log_rtr_error(enum rtr_error err)
 		return "Duplicate Announcement Received";
 	case UNEXP_PROTOCOL_VERS:
 		return "Unexpected Protocol Version";
+	case ASPA_LIST_ERR:
+		return "ASPA Provider List Error";
+	case TRANSPORT_ERR:
+		return "Transport Error";
+	case ORDERING_ERR:
+		return "Ordering Error";
+	case CACHE_RESTART:
+		return "Cache Restart";
+	case CACHE_SHUTDOWN:
+		return "Cache Shutdown";
 	default:
 		snprintf(buf, sizeof(buf), "unknown %u", err);
 		return buf;
@@ -572,6 +585,7 @@ aspath_verify(struct ibuf *in, int as4byte, int permit_set)
 	struct ibuf	 buf;
 	int		 pos, error = 0;
 	uint8_t		 seg_len, seg_type;
+	unsigned int	 count = 0;
 
 	ibuf_from_ibuf(&buf, in);
 	if (ibuf_size(&buf) & 1) {
@@ -632,8 +646,13 @@ aspath_verify(struct ibuf *in, int as4byte, int permit_set)
 			}
 			if (as == 0)
 				error = AS_ERR_SOFT;
+
+			count++;
 		}
 	}
+
+	if (count > MAX_ASPATH_COUNT)
+		error = AS_ERR_MAX;
 
  done:
 	return (error);	/* aspath is valid but probably not loop free */
@@ -1132,7 +1151,7 @@ aid2afi(uint8_t aid, uint16_t *afi, uint8_t *safi)
 int
 afi2aid(uint16_t afi, uint8_t safi, uint8_t *aid)
 {
-	uint8_t i;
+	u_int i;
 
 	for (i = AID_MIN; i < AID_MAX; i++)
 		if (aid_vals[i].afi == afi && aid_vals[i].safi == safi) {
@@ -1154,7 +1173,7 @@ aid2af(uint8_t aid)
 int
 af2aid(sa_family_t af, uint8_t safi, uint8_t *aid)
 {
-	uint8_t i;
+	u_int i;
 
 	if (safi == 0) /* default to unicast subclass */
 		safi = SAFI_UNICAST;

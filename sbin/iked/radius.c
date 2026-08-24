@@ -1,4 +1,4 @@
-/*	$OpenBSD: radius.c,v 1.14 2025/06/24 00:05:42 yasuoka Exp $	*/
+/*	$OpenBSD: radius.c,v 1.16 2026/07/08 10:57:33 hshoexer Exp $	*/
 
 /*
  * Copyright (c) 2024 Internet Initiative Japan Inc.
@@ -46,6 +46,8 @@ void	 iked_radius_request_send(struct iked *, void *);
 void	 iked_radius_fill_attributes(struct iked_sa *, RADIUS_PACKET *);
 void	 iked_radius_config(struct iked_radserver_req *, const RADIUS_PACKET *,
 	    int, uint32_t, uint8_t);
+struct iked_addr
+	*iked_radius_req_cfgaddr(struct iked_radserver_req *, int);
 void	 iked_radius_acct_request(struct iked *, struct iked_sa *, uint8_t);
 
 const struct iked_radcfgmap radius_cfgmaps[] = {
@@ -547,7 +549,8 @@ iked_radius_config(struct iked_radserver_req *req, const RADIUS_PACKET *pkt,
 	for (i = 0; i < sa->sa_policy->pol_ncfg; i++) {
 		ikecfg = &sa->sa_policy->pol_cfg[i];
 		if (ikecfg->cfg_type == cfg_type &&
-		    ikecfg->cfg_type != IKEV2_CFG_INTERNAL_IP4_ADDRESS)
+		    ikecfg->cfg_type != IKEV2_CFG_INTERNAL_IP4_ADDRESS &&
+		    ikecfg->cfg_type != IKEV2_CFG_INTERNAL_IP6_ADDRESS)
 			return;	/* use config rather than radius */
 	}
 	switch (cfg_type) {
@@ -597,12 +600,9 @@ iked_radius_config(struct iked_radserver_req *req, const RADIUS_PACKET *pkt,
 				return;
 			}
 			sa->sa_rad_addr = addr;
-		} else {
-			req->rr_cfg[req->rr_ncfg].cfg_action = IKEV2_CP_REPLY;
-			req->rr_cfg[req->rr_ncfg].cfg_type = cfg_type;
-			addr = &req->rr_cfg[req->rr_ncfg].cfg.address;
-			req->rr_ncfg++;
-		}
+		} else if ((addr = iked_radius_req_cfgaddr(req, cfg_type)) ==
+		    NULL)
+			return;
 		addr->addr_af = AF_INET;
 		sin4 = (struct sockaddr_in *)&addr->addr;
 		sin4->sin_family = AF_INET;
@@ -628,14 +628,11 @@ iked_radius_config(struct iked_radserver_req *req, const RADIUS_PACKET *pkt,
 				log_warn("%s: calloc", __func__);
 				return;
 			}
-			sa->sa_rad_addr = addr;
-		} else {
-			req->rr_cfg[req->rr_ncfg].cfg_action = IKEV2_CP_REPLY;
-			req->rr_cfg[req->rr_ncfg].cfg_type = cfg_type;
-			addr = &req->rr_cfg[req->rr_ncfg].cfg.address;
-			req->rr_ncfg++;
-		}
-		addr->addr_af = AF_INET;
+			sa->sa_rad_addr6 = addr;
+		} else if ((addr = iked_radius_req_cfgaddr(req, cfg_type)) ==
+		    NULL)
+			return;
+		addr->addr_af = AF_INET6;
 		sin6 = (struct sockaddr_in6 *)&addr->addr;
 		sin6->sin6_family = AF_INET6;
 		sin6->sin6_len = sizeof(struct sockaddr_in6);
@@ -643,6 +640,25 @@ iked_radius_config(struct iked_radserver_req *req, const RADIUS_PACKET *pkt,
 		break;
 	}
 	return;
+}
+
+struct iked_addr *
+iked_radius_req_cfgaddr(struct iked_radserver_req *req, int cfg_type)
+{
+	struct iked_addr	*addr;
+
+	if (req->rr_ncfg >= IKED_CFG_MAX) {
+		log_warnx("%s: too many RADIUS configuration attributes",
+		    __func__);
+		return (NULL);
+	}
+
+	req->rr_cfg[req->rr_ncfg].cfg_action = IKEV2_CP_REPLY;
+	req->rr_cfg[req->rr_ncfg].cfg_type = cfg_type;
+	addr = &req->rr_cfg[req->rr_ncfg].cfg.address;
+	req->rr_ncfg++;
+
+	return (addr);
 }
 
 void

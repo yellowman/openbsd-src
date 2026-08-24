@@ -1,4 +1,4 @@
-/*	$OpenBSD: rde_rib.c,v 1.290 2026/03/17 09:29:29 claudio Exp $ */
+/*	$OpenBSD: rde_rib.c,v 1.303 2026/07/20 13:25:49 claudio Exp $ */
 
 /*
  * Copyright (c) 2003, 2004 Claudio Jeker <claudio@openbsd.org>
@@ -44,8 +44,8 @@ struct rib flowrib = { .id = 1, .tree = RB_INITIALIZER(&flowrib.tree) };
 struct rib_entry *rib_add(struct rib *, struct pt_entry *);
 static inline int rib_compare(const struct rib_entry *,
 			const struct rib_entry *);
-static void rib_remove(struct rib_entry *);
 static inline int rib_empty(struct rib_entry *);
+static void rib_remove(struct rib_entry *);
 static void rib_dump_abort(uint16_t);
 
 RB_PROTOTYPE(rib_tree, rib_entry, rib_e, rib_compare);
@@ -321,6 +321,7 @@ rib_add(struct rib *rib, struct pt_entry *pte)
 		fatal("rib_add");
 
 	TAILQ_INIT(&re->prefix_h);
+	TAILQ_INIT(&re->pq_head);
 	re->prefix = pt_ref(pte);
 	re->rib_id = rib->id;
 	re->pq_mode = EVAL_NONE;
@@ -336,6 +337,86 @@ rib_add(struct rib *rib, struct pt_entry *pte)
 	return (re);
 }
 
+static inline int
+rib_empty(struct rib_entry *re)
+{
+	return TAILQ_EMPTY(&re->prefix_h);
+}
+
+static void
+rib_pq_remove_entry(struct rib_entry *re, uint32_t path_id_tx)
+{
+	struct pq_entry *pq;
+
+	TAILQ_FOREACH(pq, &re->pq_head, entry) {
+		if (pq->path_id_tx == path_id_tx) {
+			TAILQ_REMOVE(&re->pq_head, pq, entry);
+			free(pq);
+			return;
+		}
+	}
+}
+
+static void
+rib_pq_add_entry(struct rib_entry *re, uint32_t path_id_tx, struct prefix *p)
+{
+	struct pq_entry *pq;
+
+	if ((pq = calloc(1, sizeof(*pq))) == NULL)
+		fatal(NULL);
+
+	pq->path_id_tx = path_id_tx;
+	pq->p = p;
+	TAILQ_INSERT_TAIL(&re->pq_head, pq, entry);
+}
+
+/*
+ * Enqueue prefix entry into the rib pending queue and enqueue the
+ * rib entry on the peer if needed. If p is NULL the entry is a withdraw.
+ */
+void
+rib_pq_enqueue(struct rib_entry *re, struct rde_peer *peer,
+    uint32_t path_id_tx, struct prefix *p)
+{
+	/* only store paths if add-path or 'rde evaluate all' is used */
+	if (rde_evaluate_all()) {
+		rib_pq_remove_entry(re, path_id_tx);
+		rib_pq_add_entry(re, path_id_tx, p);
+	}
+
+	/*
+	 * Enqueue only once, may need some reconsideration if queue
+	 * length of individual peers becomes excessively long.
+	 */
+	if (re->pq_mode == EVAL_NONE) {
+		re->pq_peer_id = peer->conf.id;
+		TAILQ_INSERT_TAIL(&peer->rib_pq_head, re, rib_queue);
+		rdemem.rde_rib_entry_count++;
+		peer->stats.rib_entry_count++;
+	}
+
+}
+
+static void
+rib_pq_free(struct rib_entry *re)
+{
+	struct pq_entry *pq;
+
+	while ((pq = TAILQ_FIRST(&re->pq_head)) != NULL) {
+		TAILQ_REMOVE(&re->pq_head, pq, entry);
+		free(pq);
+	}
+	re->pq_mode = EVAL_NONE;
+}
+
+void
+rib_pq_dequeue(struct rib_entry *re)
+{
+	rib_pq_free(re);
+	if (rib_empty(re))
+		rib_remove(re);
+}
+
 static void
 rib_remove(struct rib_entry *re)
 {
@@ -346,27 +427,15 @@ rib_remove(struct rib_entry *re)
 		/* entry is locked or queued, don't free it. */
 		return;
 
-	pt_unref(re->prefix);
-
 	if (RB_REMOVE(rib_tree, rib_tree(re_rib(re)), re) == NULL)
 		log_warnx("rib_remove: remove failed.");
 
+	pt_unref(re->prefix);
+	if (!TAILQ_EMPTY(&re->pq_head))
+		fatalx("rib entry removed with pending updates");
+
 	free(re);
 	rdemem.rib_cnt--;
-}
-
-static inline int
-rib_empty(struct rib_entry *re)
-{
-	return TAILQ_EMPTY(&re->prefix_h);
-}
-
-void
-rib_dequeue(struct rib_entry *re)
-{
-	re->pq_mode = EVAL_NONE;
-	if (rib_empty(re))
-		rib_remove(re);
 }
 
 static struct rib_entry *
@@ -507,9 +576,8 @@ rib_dump_abort(uint16_t id)
 	struct rib_context *ctx, *next;
 
 	LIST_FOREACH_SAFE(ctx, &rib_dumps, entry, next) {
-		if (id != ctx->ctx_id)
-			continue;
-		rib_dump_free(ctx);
+		if (id == ctx->ctx_id && ctx->ctx_re != NULL)
+			rib_dump_free(ctx);
 	}
 }
 
@@ -610,11 +678,17 @@ static uint64_t
 path_calc_hash(const struct rde_aspath *p)
 {
 	SIPHASH_CTX ctx;
+	unsigned int l;
 
 	SipHash24_Init(&ctx, &pathkey);
-	SipHash24_Update(&ctx, PATH_HASHSTART(p), PATH_HASHSIZE);
+	for (l = 0; l < p->others_len && p->others[l] != NULL; l++)
+		SipHash24_Update(&ctx, &p->others[l]->hash,
+		    sizeof(p->others[l]->hash));
 	SipHash24_Update(&ctx, aspath_dump(p->aspath),
 	    aspath_length(p->aspath));
+	SipHash24_Update(&ctx, &p->path_starthash,
+	    (const char *)&p->path_endhash - (const char *)&p->path_starthash);
+	
 	return SipHash24_End(&ctx);
 }
 
@@ -750,6 +824,9 @@ path_copy(struct rde_aspath *dst, const struct rde_aspath *src)
 	dst->pftableid = pftable_ref(src->pftableid);
 	dst->origin = src->origin;
 
+	dst->aspa_state = src->aspa_state;
+	dst->aspa_generation = src->aspa_generation;
+
 	attr_copy(dst, src);
 
 	return (dst);
@@ -862,6 +939,8 @@ prefix_update(struct rib *rib, struct rde_peer *peer, uint32_t path_id,
 	struct rde_community	*comm, *ncomm = &state->communities;
 	struct prefix		*p;
 
+	filtered = !!filtered;	/* normalize value for later */
+
 	/*
 	 * First try to find a prefix in the specified RIB.
 	 */
@@ -872,13 +951,24 @@ prefix_update(struct rib *rib, struct rde_peer *peer, uint32_t path_id,
 		    prefix_nhflags(p) == state->nhflags &&
 		    communities_equal(ncomm, prefix_communities(p)) &&
 		    path_equal(nasp, prefix_aspath(p))) {
+			int p_filtered;
+
 			/* no change, update last change */
 			p->lastchange = getmonotime();
 			p->validation_state = state->vstate;
-			if (filtered)
-				p->flags |= PREFIX_FLAG_FILTERED;
-			else
-				p->flags &= ~PREFIX_FLAG_FILTERED;
+			p_filtered = (p->flags & PREFIX_FLAG_FILTERED) != 0;
+			/* check if filtered flag changed */
+			if (p_filtered != filtered) {
+				struct rib_entry	*re;
+
+				re = rib_get_addr(rib, prefix, prefixlen);
+				/* remove prefix from rib */
+				prefix_evaluate(re, NULL, p);
+				/* toggle filtered flag */
+				p->flags ^= PREFIX_FLAG_FILTERED;
+				/* redo route decision */
+				prefix_evaluate(re, p, NULL);
+			}
 			return (0);
 		}
 	}
@@ -1044,7 +1134,7 @@ prefix_flowspec_update(struct rde_peer *peer, struct filterstate *state,
 
 	if (old != NULL)
 		old_pathid_tx = old->path_id_tx;
-	rde_generate_updates(re, new, old_pathid_tx, EVAL_DEFAULT);
+	rde_enqueue_updates(re, peer, new, old_pathid_tx, EVAL_DEFAULT);
 
 	if (old != NULL) {
 		TAILQ_REMOVE(&re->prefix_h, old, rib_l);
@@ -1070,7 +1160,7 @@ prefix_flowspec_withdraw(struct rde_peer *peer, struct pt_entry *pte)
 	p = prefix_bypeer(re, peer, 0);
 	if (p == NULL)
 		return 0;
-	rde_generate_updates(re, NULL, p->path_id_tx, EVAL_DEFAULT);
+	rde_enqueue_updates(re, peer, NULL, p->path_id_tx, EVAL_DEFAULT);
 	TAILQ_REMOVE(&re->prefix_h, p, rib_l);
 	prefix_unlink(p);
 	prefix_free(p);
@@ -1452,6 +1542,7 @@ static inline int
 nexthop_cmp(struct nexthop *na, struct nexthop *nb)
 {
 	struct bgpd_addr	*a, *b;
+	int r;
 
 	if (na == nb)
 		return (0);
@@ -1472,13 +1563,22 @@ nexthop_cmp(struct nexthop *na, struct nexthop *nb)
 			return (1);
 		if (ntohl(a->v4.s_addr) < ntohl(b->v4.s_addr))
 			return (-1);
-		return (0);
+		break;
 	case AID_INET6:
-		return (memcmp(&a->v6, &b->v6, sizeof(struct in6_addr)));
+		r = memcmp(&a->v6, &b->v6, sizeof(a->v6));
+		if (r != 0)
+			return r;
+		if (IN6_IS_ADDR_LINKLOCAL(&a->v6)) {
+			if (a->scope_id > b->scope_id)
+				return (1);
+			if (a->scope_id < b->scope_id)
+				return (-1);
+		}
+		break;
 	default:
-		fatalx("nexthop_cmp: %s is unsupported", aid2str(a->aid));
+		fatalx("%s: %s is unsupported", __func__, aid2str(a->aid));
 	}
-	return (-1);
+	return (0);
 }
 
 static struct nexthop *

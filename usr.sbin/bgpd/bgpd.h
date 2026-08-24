@@ -1,4 +1,4 @@
-/*	$OpenBSD: bgpd.h,v 1.538 2026/03/19 12:44:22 claudio Exp $ */
+/*	$OpenBSD: bgpd.h,v 1.547 2026/08/04 08:11:05 job Exp $ */
 
 /*
  * Copyright (c) 2003, 2004 Henning Brauer <henning@openbsd.org>
@@ -49,12 +49,14 @@
 
 #define	MAX_PKTSIZE			4096
 #define	MAX_EXT_PKTSIZE			65535
+#define	MAX_ASPATH_COUNT		750	/* max # of asn in a path */
 #define	MAX_BGPD_IMSGSIZE		(128 * 1024)
 #define	MAX_SOCK_BUF			(4 * IBUF_READ_SIZE)
 #define	RT_BUF_SIZE			16384
 #define	MAX_RTSOCK_BUF			(2 * 1024 * 1024)
 #define	MAX_COMM_MATCH			3
 #define	MAX_ASPA_SPAS_COUNT		10000
+#define	MAX_ADDPATH_COUNT		100
 #define	MIN_HOLDTIME			3
 
 #define	BGPD_OPT_VERBOSE		0x0001
@@ -436,10 +438,10 @@ struct auth_config {
 
 struct capabilities {
 	struct {
-		int16_t	timeout;	/* graceful restart timeout */
-		int8_t	flags[AID_MAX];	/* graceful restart per AID flags */
-		int8_t	restart;	/* graceful restart, RFC 4724 */
-		int8_t	grnotification;	/* graceful notification, RFC 8538 */
+		uint16_t	timeout;	/* gr restart timeout */
+		int8_t		flags[AID_MAX];	/* gr restart per AID flags */
+		int8_t		restart;	/* gr restart, RFC 4724 */
+		int8_t		grnotification;	/* gr notification, RFC 8538 */
 	}	grestart;
 	int8_t	mp[AID_MAX];		/* multiprotocol extensions, RFC 4760 */
 	int8_t	add_path[AID_MAX];	/* ADD_PATH, RFC 7911 */
@@ -505,8 +507,8 @@ struct peer_config {
 	uint32_t		 groupid;
 	uint32_t		 remote_as;
 	uint32_t		 local_as;
-	uint32_t		 max_prefix;
-	uint32_t		 max_out_prefix;
+	unsigned int		 max_prefix;
+	unsigned int		 max_out_prefix;
 	enum export_type	 export_type;
 	enum enforce_as		 enforce_as;
 	enum enforce_as		 enforce_local_as;
@@ -541,20 +543,109 @@ struct peer_config {
 #define PEERFLAG_EVALUATE_ALL	0x04
 #define PEERFLAG_PERMIT_AS_SET	0x08
 
+enum session_state {
+	STATE_NONE,
+	STATE_IDLE,
+	STATE_CONNECT,
+	STATE_ACTIVE,
+	STATE_OPENSENT,
+	STATE_OPENCONFIRM,
+	STATE_ESTABLISHED
+};
+
+enum Timer {
+	Timer_None,
+	Timer_ConnectRetry,
+	Timer_Keepalive,
+	Timer_Hold,
+	Timer_SendHold,
+	Timer_IdleHold,
+	Timer_IdleHoldReset,
+	Timer_CarpUndemote,
+	Timer_RestartTimeout,
+	Timer_SessionDown,
+	Timer_Rtr_Refresh,
+	Timer_Rtr_Retry,
+	Timer_Rtr_Expire,
+	Timer_Rtr_Active,
+	Timer_Mrt_Reopen,
+	Timer_Max
+};
+
+struct timer {
+	TAILQ_ENTRY(timer)	entry;
+	enum Timer		type;
+	monotime_t		val;
+};
+
+struct peer_stats {
+	unsigned long long	 msg_rcvd_open;
+	unsigned long long	 msg_rcvd_update;
+	unsigned long long	 msg_rcvd_notification;
+	unsigned long long	 msg_rcvd_keepalive;
+	unsigned long long	 msg_rcvd_rrefresh;
+	unsigned long long	 msg_sent_open;
+	unsigned long long	 msg_sent_update;
+	unsigned long long	 msg_sent_notification;
+	unsigned long long	 msg_sent_keepalive;
+	unsigned long long	 msg_sent_rrefresh;
+	unsigned long long	 refresh_rcvd_req;
+	unsigned long long	 refresh_rcvd_borr;
+	unsigned long long	 refresh_rcvd_eorr;
+	unsigned long long	 refresh_sent_req;
+	unsigned long long	 refresh_sent_borr;
+	unsigned long long	 refresh_sent_eorr;
+	monotime_t		 last_updown;
+	monotime_t		 last_read;
+	monotime_t		 last_write;
+	unsigned int		 msg_queue_len;
+	uint8_t			 last_sent_errcode;
+	uint8_t			 last_sent_suberr;
+	uint8_t			 last_rcvd_errcode;
+	uint8_t			 last_rcvd_suberr;
+	char			 last_reason[REASON_LEN];
+};
+
 struct rde_peer_stats {
-	uint64_t			 prefix_rcvd_update;
-	uint64_t			 prefix_rcvd_withdraw;
-	uint64_t			 prefix_rcvd_eor;
-	uint64_t			 prefix_sent_update;
-	uint64_t			 prefix_sent_withdraw;
-	uint64_t			 prefix_sent_eor;
-	uint64_t			 rib_entry_count;
-	uint64_t			 ibufq_msg_count;
-	uint64_t			 ibufq_payload_size;
-	uint32_t			 prefix_cnt;
-	uint32_t			 prefix_out_cnt;
-	uint32_t			 pending_update;
-	uint32_t			 pending_withdraw;
+	unsigned long long		 prefix_rcvd_update;
+	unsigned long long		 prefix_rcvd_withdraw;
+	unsigned long long		 prefix_rcvd_eor;
+	unsigned long long		 prefix_sent_update;
+	unsigned long long		 prefix_sent_withdraw;
+	unsigned long long		 prefix_sent_eor;
+	unsigned long long		 rib_entry_count;
+	unsigned long long		 ibufq_msg_count;
+	unsigned long long		 ibufq_payload_size;
+	unsigned int			 prefix_cnt;
+	unsigned int			 prefix_out_cnt;
+	unsigned int			 pending_update;
+	unsigned int			 pending_withdraw;
+};
+
+struct ctl_peer {
+	struct peer_config	conf;
+	struct peer_stats	stats;
+	struct rde_peer_stats	rde_stats;
+	struct {
+		struct capabilities	ann;
+		struct capabilities	peer;
+		struct capabilities	neg;
+	}			 capa;
+	struct bgpd_addr	local;
+	struct bgpd_addr	remote;
+	uint32_t		remote_bgpid;
+	enum auth_method	auth_method;
+	enum session_state	state;
+	enum role		remote_role;
+	uint16_t		local_port;
+	uint16_t		remote_port;
+	uint16_t		holdtime;
+	uint8_t			template;
+};
+
+struct ctl_timer {
+	enum Timer	type;
+	monotime_t	val;
 };
 
 enum network_type {
@@ -592,6 +683,7 @@ struct flowspec {
 	uint8_t			data[1];
 };
 #define FLOWSPEC_SIZE	(offsetof(struct flowspec, data))
+#define FLOWSPEC_SIZE_MAX	4000
 
 struct flowspec_config {
 	RB_ENTRY(flowspec_config)	 entry;
@@ -612,6 +704,11 @@ enum rtr_error {
 	UNK_REC_WDRAWL,
 	DUP_REC_RECV,
 	UNEXP_PROTOCOL_VERS,
+	ASPA_LIST_ERR,
+	TRANSPORT_ERR,
+	ORDERING_ERR,
+	CACHE_RESTART,
+	CACHE_SHUTDOWN,
 };
 
 struct rtr_config {
@@ -1057,13 +1154,13 @@ struct ctl_kroute_req {
 	sa_family_t		af;
 };
 
-enum filter_actions {
+enum filter_action {
 	ACTION_NONE,
 	ACTION_ALLOW,
 	ACTION_DENY
 };
 
-enum directions {
+enum direction {
 	DIR_IN = 1,
 	DIR_OUT
 };
@@ -1277,8 +1374,8 @@ struct filter_rule {
 #define RDE_FILTER_SKIP_REMOTE_AS	2
 #define RDE_FILTER_SKIP_COUNT		3
 	struct filter_rule		*skip[RDE_FILTER_SKIP_COUNT];
-	enum filter_actions		action;
-	enum directions			dir;
+	enum filter_action		action;
+	enum direction			dir;
 	uint8_t				quick;
 };
 
@@ -1675,6 +1772,7 @@ int		 aspath_verify(struct ibuf *, int, int);
 #define		 AS_ERR_TYPE	-2
 #define		 AS_ERR_BAD	-3
 #define		 AS_ERR_SOFT	-4
+#define		 AS_ERR_MAX	-5
 struct ibuf	*aspath_inflate(struct ibuf *);
 int		 extract_prefix(const u_char *, int, void *, uint8_t, uint8_t);
 int		 nlri_get_prefix(struct ibuf *, struct bgpd_addr *, uint8_t *);
@@ -1704,6 +1802,9 @@ unsigned int	 bin_of_communities(unsigned int);
 unsigned int	 bin_of_adjout_prefixes(unsigned int);
 
 /* bgpd_imsg.c */
+int	imsg_send_ctl_peer(struct imsgbuf *, struct peer *,
+	    struct rde_peer_stats *);
+int	imsg_recv_ctl_peer(struct imsg *, struct ctl_peer *);
 int	imsg_send_filterset(struct imsgbuf *, struct filter_set_head *);
 int	ibuf_recv_filterset_count(struct ibuf *, uint16_t *);
 int	ibuf_recv_one_filterset(struct ibuf *, struct filter_set *);

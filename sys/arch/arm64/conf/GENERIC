@@ -1,4 +1,4 @@
-# $OpenBSD: GENERIC,v 1.313 2026/01/29 23:02:35 kettenis Exp $
+# $OpenBSD: GENERIC,v 1.317 2026/05/26 03:54:14 mglocker Exp $
 #
 # GENERIC machine description file
 #
@@ -334,6 +334,7 @@ rkgpio*		at fdt?
 rkiic*		at fdt?
 iic*		at rkiic?
 rkiis*		at fdt?
+rkotp*		at fdt?
 rkpcie*		at fdt?
 pci*		at rkpcie?
 rkpwm*		at fdt?
@@ -429,7 +430,7 @@ iwn*		at pci?			# Intel WiFi Link 4965/5000/1000/6000
 iwm*		at pci?			# Intel WiFi Link 7xxx
 iwx*		at pci?			# Intel WiFi Link 22xxx
 qwx*		at pci?			# Qualcomm 802.11ax
-#qwz*		at pci?			# Qualcomm 802.11be
+qwz*		at pci?			# Qualcomm 802.11be
 
 # PCI SCSI
 ahci*		at pci? flags 0x0000	# AHCI SATA controllers
@@ -626,6 +627,8 @@ tascodec*	at iic?			# TAS2770 audio codec
 tcpci*		at iic?			# USB Type-C controller
 tipd*		at iic?			# TPS6598x Type-C controller
 pijuice*	at iic?			# PiJuice HAT
+sambat*		at iic?			# Samsung SAM060B battery monitor
+samsabi*	at iic?			# Samsung Advance BIOS Interface
 
 # GPIO "pin bus" drivers
 gpioiic*	at gpio?		# I2C bus bit-banging

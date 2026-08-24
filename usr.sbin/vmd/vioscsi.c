@@ -1,4 +1,4 @@
-/*	$OpenBSD: vioscsi.c,v 1.29 2026/02/22 22:54:54 dv Exp $  */
+/*	$OpenBSD: vioscsi.c,v 1.33 2026/08/04 19:12:14 claudio Exp $  */
 
 /*
  * Copyright (c) 2017 Carlos Cardenas <ccardenas@openbsd.org>
@@ -426,9 +426,8 @@ dev_dispatch_vm(int fd, short event, void *arg)
 	struct imsgev		*iev = &dev->async_iev;
 	struct imsgbuf		*ibuf = &iev->ibuf;
 	struct imsg		 imsg;
-	ssize_t			 n = 0;
+	int			 n, verbose;
 	uint32_t		 type;
-	int			 verbose;
 
 	if (event & EV_READ) {
 		if ((n = imsgbuf_read(ibuf)) == -1)
@@ -456,8 +455,8 @@ dev_dispatch_vm(int fd, short event, void *arg)
 	}
 
 	for (;;) {
-		if ((n = imsg_get(ibuf, &imsg)) == -1)
-			fatal("%s: imsg_get", __func__);
+		if ((n = imsgbuf_get(ibuf, &imsg)) == -1)
+			fatal("%s: imsgbuf_get", __func__);
 		if (n == 0)
 			break;
 
@@ -493,8 +492,7 @@ handle_sync_io(int fd, short event, void *arg)
 	struct imsgbuf *ibuf = &iev->ibuf;
 	struct viodev_msg msg;
 	struct imsg imsg;
-	ssize_t n;
-	int deassert = 0;
+	int n, deassert = 0;
 
 	if (event & EV_READ) {
 		if ((n = imsgbuf_read(ibuf)) == -1)
@@ -522,8 +520,8 @@ handle_sync_io(int fd, short event, void *arg)
 	}
 
 	for (;;) {
-		if ((n = imsg_get(ibuf, &imsg)) == -1)
-			fatalx("%s: imsg_get (n=%ld)", __func__, n);
+		if ((n = imsgbuf_get(ibuf, &imsg)) == -1)
+			fatal("%s: imsgbuf_get", __func__);
 		if (n == 0)
 			break;
 
@@ -1501,6 +1499,11 @@ vioscsi_handle_read_10(struct virtio_dev *dev,
 		    __func__, acct->resp_desc->addr, acct->resp_desc->len,
 		    acct->resp_idx, acct->req_idx, acct->idx);
 
+		if (acct->resp_desc->len == 0) {
+			log_warnx("%s: zero-length read_buf descriptor", __func__);
+			goto free_read_10;
+		}
+
 		/* Check we don't read beyond read_buf boundaries. */
 		if (acct->resp_desc->len > info->len - chunk_offset) {
 			log_warnx("%s: descriptor length beyond read_buf len",
@@ -1509,6 +1512,11 @@ vioscsi_handle_read_10(struct virtio_dev *dev,
 		} else
 			chunk_len = acct->resp_desc->len;
 
+		if (chunk_len == 0 && chunk_offset < info->len) {
+			log_warnx("%s: zero-length read_buf descriptor", __func__);
+			goto free_read_10;
+		}
+
 		if (write_mem(acct->resp_desc->addr, read_buf + chunk_offset,
 			chunk_len)) {
 			log_warnx("%s: unable to write read_buf"
@@ -1516,7 +1524,7 @@ vioscsi_handle_read_10(struct virtio_dev *dev,
 			    acct->resp_desc->addr);
 			goto free_read_10;
 		}
-		chunk_offset += acct->resp_desc->len;
+		chunk_offset += chunk_len;
 	} while (chunk_offset < info->len);
 
 	ret = 1;
@@ -2189,7 +2197,17 @@ vioscsi_notifyq(struct virtio_dev *dev, uint16_t vq_idx)
 	struct virtio_vq_acct acct;
 	struct virtio_vq_info *vq_info;
 
+	if (vq_idx >= dev->num_queues) {
+		log_warnx("%s: invalid virtqueue index %u", __func__, vq_idx);
+		return (0);
+	}
+
 	vq_info = &dev->vq[vq_idx];
+	if (!vq_info->vq_enabled) {
+		log_warnx("%s: virtqueue not enabled", __func__);
+		return (0);
+	}
+
 	vr = vq_info->q_hva;
 	if (vr == NULL)
 		fatalx("%s: null vring", __func__);

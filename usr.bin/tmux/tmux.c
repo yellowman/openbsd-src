@@ -1,4 +1,4 @@
-/* $OpenBSD: tmux.c,v 1.216 2025/10/28 10:51:30 nicm Exp $ */
+/* $OpenBSD: tmux.c,v 1.223 2026/08/17 14:47:41 nicm Exp $ */
 
 /*
  * Copyright (c) 2007 Nicholas Marriott <nicholas.marriott@gmail.com>
@@ -34,6 +34,7 @@
 #include <time.h>
 #include <unistd.h>
 #include <util.h>
+#include <vis.h>
 
 #include "tmux.h"
 
@@ -285,6 +286,31 @@ get_timer(void)
 	return ((ts.tv_sec * 1000ULL) + (ts.tv_nsec / 1000000ULL));
 }
 
+char *
+clean_name(const char *name, int untrusted)
+{
+	char	*copy, *cp, *new_name;
+
+	if (!utf8_isvalid(name))
+		return (NULL);
+	copy = xstrdup(name);
+	for (cp = copy; *cp != '\0'; cp++) {
+		if (untrusted && cp[0] == '#' && cp[1] == '(')
+			*cp = '_';
+	}
+	utf8_stravis(&new_name, copy, VIS_OCTAL|VIS_CSTYLE|VIS_TAB|VIS_NL);
+	free(copy);
+	return (new_name);
+}
+
+int
+check_name(const char *name)
+{
+	if (!utf8_isvalid(name))
+		return (0);
+	return (1);
+}
+
 const char *
 sig2name(int signo)
 {
@@ -334,7 +360,7 @@ find_home(void)
 	if (home == NULL || *home == '\0') {
 		pw = getpwuid(getuid());
 		if (pw != NULL)
-			home = pw->pw_dir;
+			home = xstrdup(pw->pw_dir);
 		else
 			home = NULL;
 	}
@@ -392,7 +418,7 @@ main(int argc, char **argv)
 	while ((opt = getopt(argc, argv, "2c:CDdf:hlL:NqS:T:uUvV")) != -1) {
 		switch (opt) {
 		case '2':
-			tty_add_features(&feat, "256", ":,");
+			tty_parse_features("256", ":,", &feat, NULL);
 			break;
 		case 'c':
 			shell_command = optarg;
@@ -440,7 +466,7 @@ main(int argc, char **argv)
 			path = xstrdup(optarg);
 			break;
 		case 'T':
-			tty_add_features(&feat, optarg, ":,");
+			tty_parse_features(optarg, ":,", &feat, NULL);
 			break;
 		case 'u':
 			flags |= CLIENT_UTF8;

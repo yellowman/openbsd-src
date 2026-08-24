@@ -1,4 +1,4 @@
-#	$OpenBSD: Makefile.inc,v 1.105 2026/02/06 23:31:29 dtucker Exp $
+#	$OpenBSD: Makefile.inc,v 1.107 2026/07/27 12:28:52 markus Exp $
 
 .include <bsd.own.mk>
 
@@ -66,6 +66,7 @@ SRCS_KEX+=	kexecdh.c
 SRCS_KEX+=	kexgex.c
 SRCS_KEXC+=	kexgexc.c
 SRCS_KEXS+=	kexgexs.c
+SRCS_KEX+=	kexmlkem768ecdh.c
 .endif
 SRCS_KEX+=	kexc25519.c
 SRCS_KEX+=	smult_curve25519_ref.c
@@ -93,6 +94,8 @@ SRCS_KEY+=	cipher-chachapoly.c
 .endif
 SRCS_KEY+=	ssh-ed25519.c
 SRCS_KEY+=	ssh-ed25519-sk.c
+SRCS_KEY+=	libcrux-mlkem-mldsa.c
+SRCS_KEY+=	ssh-mldsa-eddsa.c
 SRCS_KEY+=	ssherr-libcrypto.c
 
 .if (${OPENSSL:L} == "yes")

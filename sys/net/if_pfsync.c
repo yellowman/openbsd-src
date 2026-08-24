@@ -1,4 +1,4 @@
-/*	$OpenBSD: if_pfsync.c,v 1.332 2025/07/07 02:28:50 jsg Exp $	*/
+/*	$OpenBSD: if_pfsync.c,v 1.335 2026/08/12 18:23:14 bluhm Exp $	*/
 
 /*
  * Copyright (c) 2002 Michael Shalayeff
@@ -856,7 +856,7 @@ pfsync_encap(struct pfsync_softc *sc, struct mbuf *m)
 	mlen += sizeof(h->ph);
 	h->ph.version = PFSYNC_VERSION;
 	h->ph.len = htons(mlen);
-	/* h->ph.pfcksum */
+	/* h->ph.spare is all zero */
 
 	mlen += sizeof(h->ip);
 	h->ip = sc->sc_template;
@@ -2381,6 +2381,8 @@ pfsync_out_tdb(struct tdb *tdb, void *buf)
 {
 	struct pfsync_tdb *ut = buf;
 
+	MUTEX_ASSERT_LOCKED(&tdb->tdb_mtx);
+
 	memset(ut, 0, sizeof(*ut));
 	ut->spi = tdb->tdb_spi;
 	memcpy(&ut->dst, &tdb->tdb_dst, sizeof(ut->dst));
@@ -2956,7 +2958,8 @@ pfsync_in_updates(struct pfsync_softc *sc, struct pf_state *st,
 	st->pfsync_time = getuptime();
 	if (sync < 2) {
 		st->expire = st->pfsync_time;
-		st->timeout = timeout;
+		if (st->timeout != PFTM_UNLINKED)
+			st->timeout = timeout;
 	}
 
 	mtx_leave(&st->mtx);

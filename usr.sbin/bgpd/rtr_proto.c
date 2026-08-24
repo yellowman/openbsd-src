@@ -1,4 +1,4 @@
-/*	$OpenBSD: rtr_proto.c,v 1.52 2025/04/14 14:50:29 claudio Exp $ */
+/*	$OpenBSD: rtr_proto.c,v 1.55 2026/08/04 08:11:05 job Exp $ */
 
 /*
  * Copyright (c) 2020 Claudio Jeker <claudio@openbsd.org>
@@ -431,12 +431,19 @@ rtr_reader_callback(struct ibuf *hdr, void *arg, int *fd)
 	struct rtr_session *rs = arg;
 	struct rtr_header rh;
 	struct ibuf *b;
-	ssize_t len;
+	size_t len;
 
 	if (ibuf_get(hdr, &rh, sizeof(rh)) == -1)
 		return NULL;
 
 	len = ntohl(rh.length);
+
+	if (len < sizeof(rh)) {
+		rtr_send_error(rs, hdr, CORRUPT_DATA, "%s: too small: "
+		    "%zu bytes", log_rtr_type(rh.type), len);
+		errno = ERANGE;
+		return NULL;
+	}
 
 	if (len > RTR_MAX_PDU_SIZE) {
 		rtr_send_error(rs, hdr, CORRUPT_DATA, "%s: too big: %zu bytes",
@@ -464,6 +471,7 @@ rtr_parse_header(struct rtr_session *rs, struct ibuf *msg,
 	struct ibuf hdr;
 	size_t len;
 	uint16_t errcode;
+	int neg_done = 0;
 
 	len = ibuf_size(msg);
 
@@ -475,12 +483,14 @@ rtr_parse_header(struct rtr_session *rs, struct ibuf *msg,
 		switch (rh.type) {
 		case CACHE_RESPONSE:
 		case CACHE_RESET:
-			/* implicit downgrade */
+			/* implicit downgrade if allowed */
 			if (rh.version < rs->version) {
+				if (rh.version < rs->min_version)
+					goto badversion;
 				rs->prev_version = rs->version;
 				rs->version = rh.version;
 			}
-			rtr_fsm(rs, RTR_EVNT_NEGOTIATION_DONE);
+			neg_done = 1;
 			break;
 		case ERROR_REPORT:
 			errcode = ntohs(rh.session_id);
@@ -556,8 +566,10 @@ rtr_parse_header(struct rtr_session *rs, struct ibuf *msg,
 		return -1;
 	}
 
-	*msgtype = rh.type;
+	if (neg_done)
+		rtr_fsm(rs, RTR_EVNT_NEGOTIATION_DONE);
 
+	*msgtype = rh.type;
 	return 0;
 
  badlen:
@@ -566,8 +578,8 @@ rtr_parse_header(struct rtr_session *rs, struct ibuf *msg,
 	return -1;
 
  badversion:
-	rtr_send_error(rs, msg, UNEXP_PROTOCOL_VERS, "%s: version %d",
-	    log_rtr_type(rh.type), rh.version);
+	rtr_send_error(rs, msg, UNEXP_PROTOCOL_VERS, "%s: version %d want %d",
+	    log_rtr_type(rh.type), rh.version, rs->version);
 	return -1;
 }
 
@@ -831,6 +843,12 @@ rtr_parse_aspa(struct rtr_session *rs, struct ibuf *pdu)
 				free_aspa(aspa);
 				goto badlen;
 			}
+			if (i > 0 && aspa->tas[i] <= aspa->tas[i - 1]) {
+				rtr_send_error(rs, NULL, ASPA_LIST_ERR,
+				    "incorrect ASPA providers list");
+				free_aspa(aspa);
+				return -1;
+			}
 		}
 	}
 
@@ -1012,14 +1030,23 @@ rtr_parse_error(struct rtr_session *rs, struct ibuf *pdu)
 	log_warnx("rtr %s: received error: %s%s%s", log_rtr(rs),
 	    log_rtr_error(errcode), str ? ": " : "", str ? str : "");
 
-	if (errcode == NO_DATA_AVAILABLE) {
+	switch (errcode) {
+	case CACHE_RESTART:
+		rv = 0;
+		break;
+	case NO_DATA_AVAILABLE:
 		rtr_fsm(rs, RTR_EVNT_NO_DATA);
 		rv = 0;
-	} else if (errcode == UNSUPP_PROTOCOL_VERS) {
+		break;
+	case UNSUPP_PROTOCOL_VERS:
 		rtr_fsm(rs, RTR_EVNT_UNSUPP_PROTO_VERSION);
 		rv = 0;
-	} else
+		break;
+	case CACHE_SHUTDOWN:
+	default:
 		rtr_fsm(rs, RTR_EVNT_RESET_AND_CLOSE);
+		break;
+	}
 
 	rs->last_recv_error = errcode;
 	if (str)
@@ -1126,10 +1153,20 @@ rtr_fsm(struct rtr_session *rs, enum rtr_event event)
 			rtr_send_serial_query(rs);
 		break;
 	case RTR_EVNT_RESET_AND_CLOSE:
-		rtr_reset_cache(rs);
-		rtr_recalc();
-		/* FALLTHROUGH */
 	case RTR_EVNT_CON_CLOSE:
+		/*
+		 * Reset cache after an error or if the connection is reset
+		 * during a delta exchange. The internal state in that moment
+		 * is possibly corrupt and should not be used.
+		 */
+		if (event == RTR_EVNT_RESET_AND_CLOSE ||
+		    rs->active_lock) {
+			rtr_reset_cache(rs);
+			rtr_sem_release(rs->active_lock);
+			rs->active_lock = 0;
+			rtr_recalc();
+		}
+
 		if (rs->fd != -1) {
 			/* flush buffers */
 			msgbuf_clear(rs->w);

@@ -1,4 +1,4 @@
-/*	$OpenBSD: print.c,v 1.74 2026/01/20 16:49:03 tb Exp $ */
+/*	$OpenBSD: print.c,v 1.79 2026/07/07 13:38:54 claudio Exp $ */
 /*
  * Copyright (c) 2021 Claudio Jeker <claudio@openbsd.org>
  * Copyright (c) 2019 Kristaps Dzonsons <kristaps@bsd.lv>
@@ -378,7 +378,7 @@ crl_print(const struct crl *p)
 {
 	STACK_OF(X509_REVOKED)	*revlist;
 	X509_REVOKED *rev;
-	X509_NAME *xissuer;
+	const X509_NAME *xissuer;
 	int i;
 	char *issuer, *serial;
 	time_t t;
@@ -424,10 +424,12 @@ crl_print(const struct crl *p)
 	revlist = X509_CRL_get_REVOKED(p->x509_crl);
 	for (i = 0; i < sk_X509_REVOKED_num(revlist); i++) {
 		rev = sk_X509_REVOKED_value(revlist, i);
+		if (!x509_get_time(X509_REVOKED_get0_revocationDate(rev), &t)) {
+			warnx("x509_get_time() failed - malformed ASN.1?");
+			continue;
+		}
 		serial = x509_convert_seqnum(__func__, "serial number",
 		    X509_REVOKED_get0_serialNumber(rev));
-		if (!x509_get_time(X509_REVOKED_get0_revocationDate(rev), &t))
-			errx(1, "x509_get_time() failed - malformed ASN.1?");
 		if (serial != NULL) {
 			if (outformats & FORMAT_JSON) {
 				json_do_object("cert", 1);
@@ -577,7 +579,7 @@ spl_print(const struct cert *c, const struct spl *s)
 		json_do_int("valid_until", c->notafter);
 		if (s->expires)
 			json_do_int("expires", s->expires);
-		json_do_int("asid", s->asid);
+		json_do_uint("asid", s->asid);
 	} else {
 		printf("Subject key identifier:   %s\n", pretty_key_id(c->ski));
 		x509_print(c->x509);
@@ -802,12 +804,22 @@ tak_print(const struct cert *c, const struct tak *p)
 		json_do_end();
 }
 
+static int
+ccr_mft_aki_cmp(const void *a, const void *b)
+{
+	struct ccr_mft *ma = *(struct ccr_mft **)a;
+	struct ccr_mft *mb = *(struct ccr_mft **)b;
+
+	return memcmp(ma->aki, mb->aki, SHA_DIGEST_LENGTH);
+}
+
 static void
 print_ccr_mftstate(struct ccr *ccr)
 {
 	char *aki, *hash, *ski;
-	struct ccr_mft *ccr_mft;
+	struct ccr_mft *ccr_mft, **ccr_mfts = NULL;
 	struct ccr_mft_sub_ski *sub;
+	size_t ccr_mfts_num = 0, idx = 0;
 
 	if (outformats & FORMAT_JSON) {
 		json_do_object("manifest_state", 0);
@@ -821,7 +833,23 @@ print_ccr_mftstate(struct ccr *ccr)
 		printf("Manifest instances:\n");
 	}
 
-	RB_FOREACH(ccr_mft, ccr_mft_tree, &ccr->mfts) {
+	if (RB_EMPTY(&ccr->mfts))
+		goto out;
+
+	RB_FOREACH(ccr_mft, ccr_mft_tree, &ccr->mfts)
+		ccr_mfts_num++;
+
+	if ((ccr_mfts = calloc(ccr_mfts_num, sizeof(ccr_mfts[0]))) == NULL)
+		err(1, NULL);
+
+	RB_FOREACH(ccr_mft, ccr_mft_tree, &ccr->mfts)
+		ccr_mfts[idx++] = ccr_mft;
+
+	qsort(ccr_mfts, ccr_mfts_num, sizeof(ccr_mfts[0]), ccr_mft_aki_cmp);
+
+	for (idx = 0; idx < ccr_mfts_num; idx++) {
+		ccr_mft = ccr_mfts[idx];
+
 		if (base64_encode(ccr_mft->hash, SHA256_DIGEST_LENGTH, &hash)
 		    == -1)
 			errx(1, "base64_encode");
@@ -838,7 +866,7 @@ print_ccr_mftstate(struct ccr *ccr)
 			json_do_string("sia", ccr_mft->sia);
 
 			json_do_array("subordinates");
-			SLIST_FOREACH(sub, &ccr_mft->subordinates, entry) {
+			SIMPLEQ_FOREACH(sub, &ccr_mft->subordinates, entry) {
 				ski = hex_encode(sub->ski, SHA_DIGEST_LENGTH);
 				json_do_string("ski", ski);
 				free(ski);
@@ -856,7 +884,7 @@ print_ccr_mftstate(struct ccr *ccr)
 			    (long long)ccr_mft->thisupdate, ccr_mft->sia);
 
 			i = 0;
-			SLIST_FOREACH(sub, &ccr_mft->subordinates, entry) {
+			SIMPLEQ_FOREACH(sub, &ccr_mft->subordinates, entry) {
 				if (i++ == 0)
 					printf(" subordinates:");
 				else
@@ -874,10 +902,14 @@ print_ccr_mftstate(struct ccr *ccr)
 		free(aki);
 		free(hash);
 	}
+
+ out:
 	if (outformats & FORMAT_JSON) {
 		json_do_end(); /* mft_instances */
 		json_do_end(); /* manifest_state */
 	}
+
+	free(ccr_mfts);
 }
 
 static void
@@ -901,7 +933,7 @@ print_ccr_roastate(struct ccr *ccr)
 		if (outformats & FORMAT_JSON) {
 			json_do_object("vrp", 1);
 			json_do_string("prefix", buf);
-			json_do_int("asn", vrp->asid);
+			json_do_uint("asn", vrp->asid);
 			if (vrp->maxlength)
 				json_do_int("maxlen", vrp->maxlength);
 			json_do_end();
@@ -941,7 +973,7 @@ print_ccr_aspastate(struct ccr *ccr)
 			json_do_array("providers");
 		} else {
 			printf("%26s", "");
-			printf("customer: %d providers: ", vap->custasid);
+			printf("customer: %u providers: ", vap->custasid);
 		}
 
 		for (i = 0; i < vap->num_providers; i++) {
@@ -1015,7 +1047,7 @@ print_ccr_rkstate(struct ccr *ccr)
 		json_do_array("routerkeys");
 		RB_FOREACH(brk, brk_tree, &ccr->brks) {
 			json_do_object("brk", 0);
-			json_do_int("asn", brk->asid);
+			json_do_uint("asn", brk->asid);
 			json_do_string("ski", brk->ski);
 			json_do_string("pubkey", brk->pubkey);
 			json_do_end(); /* brk */
@@ -1027,7 +1059,7 @@ print_ccr_rkstate(struct ccr *ccr)
 		printf("Router keys:\n");
 		RB_FOREACH(brk, brk_tree, &ccr->brks) {
 			printf("%26s", "");
-			printf("asid:%d ", brk->asid);
+			printf("asid:%u ", brk->asid);
 			printf("ski:%s ", brk->ski);
 			printf("pubkey:%s\n", brk->pubkey);
 		}

@@ -1,7 +1,6 @@
 ./sys
 ./usr/bin/addr2line
 ./usr/bin/c++filt
-./usr/bin/cpp
 ./usr/bin/ctfdump
 ./usr/bin/flex
 ./usr/bin/flex++
@@ -1031,7 +1030,6 @@
 ./usr/include/net/rtable.h
 ./usr/include/net/slcompress.h
 ./usr/include/net/toeplitz.h
-./usr/include/net/trunklacp.h
 ./usr/include/net/wg_cookie.h
 ./usr/include/net/wg_noise.h
 ./usr/include/net80211
@@ -2740,8 +2738,6 @@
 ./usr/share/man/man3/login.3
 ./usr/share/man/man3/login_cap.3
 ./usr/share/man/man3/login_fbtab.3
-./usr/share/man/man3/loongson/cacheflush.3
-./usr/share/man/man3/loongson/get_fpc_csr.3
 ./usr/share/man/man3/lrint.3
 ./usr/share/man/man3/lround.3
 ./usr/share/man/man3/lsearch.3

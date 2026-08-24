@@ -1,4 +1,4 @@
-# $OpenBSD: Makefile,v 1.20 2025/06/11 17:46:32 robert Exp $
+# $OpenBSD: Makefile,v 1.22 2026/07/05 21:23:53 naddy Exp $
 
 .include <bsd.own.mk>
 
@@ -18,7 +18,7 @@ LINKS=	${BINDIR}/clang ${BINDIR}/clang++ \
 .if ${COMPILER_VERSION:L} == "clang"
 LINKS+=	${BINDIR}/clang ${BINDIR}/cc \
 	${BINDIR}/clang ${BINDIR}/c++ \
-	${BINDIR}/clang ${LIBEXECDIR}/cpp
+	${BINDIR}/clang ${BINDIR}/cpp
 
 maninstall:
 .if !defined(NOMAN)
@@ -45,6 +45,7 @@ LLVM_LIBDEPS=	LLVM \
 		clangRewriteFrontend \
 		clangRewrite \
 		clangAnalysis \
+		clangAnalysisLifetimeSafety \
 		clangEdit \
 		clangAST \
 		clangASTMatchers \
@@ -54,6 +55,7 @@ LLVM_LIBDEPS=	LLVM \
 		clangSupport \
 		clangIndex \
 		clangAPINotes \
-		clangInstallAPI
+		clangInstallAPI \
+		clangOptions
 
 .include <bsd.prog.mk>

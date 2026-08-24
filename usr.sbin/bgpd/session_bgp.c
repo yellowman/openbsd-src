@@ -1,4 +1,4 @@
-/*	$OpenBSD: session_bgp.c,v 1.7 2026/03/18 15:16:29 sthen Exp $ */
+/*	$OpenBSD: session_bgp.c,v 1.12 2026/07/23 11:29:55 claudio Exp $ */
 
 /*
  * Copyright (c) 2004 - 2025 Claudio Jeker <claudio@openbsd.org>
@@ -182,7 +182,7 @@ session_open(struct peer *p)
 {
 	struct ibuf		*buf, *opb;
 	size_t			 len, optparamlen;
-	uint8_t			 i;
+	u_int			 i;
 	int			 errs = 0, extlen = 0;
 	int			 mpcapa = 0;
 
@@ -519,7 +519,7 @@ session_notification(struct peer *p, uint8_t errcode, uint8_t subcode,
 int
 session_neighbor_rrefresh(struct peer *p)
 {
-	uint8_t	i;
+	u_int	i;
 
 	if (!(p->capa.neg.refresh || p->capa.neg.enhanced_rr))
 		return (-1);
@@ -1186,7 +1186,6 @@ parse_notification(struct peer *peer, struct ibuf *msg)
 		}
 	}
 
-	peer->errcnt++;
 	peer->stats.last_rcvd_errcode = errcode;
 	peer->stats.last_rcvd_suberr = subcode;
 
@@ -1280,7 +1279,8 @@ static int
 capa_neg_calc(struct peer *p)
 {
 	struct ibuf *ebuf;
-	uint8_t	i, hasmp = 0, capa_code, capa_len, capa_aid = 0;
+	u_int	i;
+	uint8_t	hasmp = 0, capa_code, capa_len, capa_aid = 0;
 
 	/* a capability is accepted only if both sides announced it */
 
@@ -1554,19 +1554,26 @@ bgp_fsm(struct peer *peer, enum session_events event, struct ibuf *msg)
 			timer_stop(&peer->timers, Timer_Keepalive);
 			timer_stop(&peer->timers, Timer_IdleHold);
 
-			if (!peer->depend_ok)
+			if (!peer->depend_ok) {
 				timer_stop(&peer->timers, Timer_ConnectRetry);
-			else if (peer->passive || peer->conf.passive ||
-			    peer->conf.template) {
+			} else if (peer->conf.passive || peer->conf.template) {
 				change_state(peer, STATE_ACTIVE, event);
 				timer_stop(&peer->timers, Timer_ConnectRetry);
+			} else if (peer->prev_state == STATE_NONE ||
+			    peer->IdleHoldTime == INTERVAL_IDLE_HOLD_INITIAL) {
+				u_int holdtime = INTERVAL_IDLE_HOLD_INITIAL;
+
+				if (peer->prev_state == STATE_NONE)
+					holdtime = SESSION_CLEAR_DELAY;
+				change_state(peer, STATE_ACTIVE, event);
+				timer_set(&peer->timers, Timer_ConnectRetry,
+				    holdtime);
 			} else {
 				change_state(peer, STATE_CONNECT, event);
 				timer_set(&peer->timers, Timer_ConnectRetry,
 				    peer->conf.connectretry);
 				session_connect(peer);
 			}
-			peer->passive = 0;
 			break;
 		case EVNT_STOP:
 			timer_stop(&peer->timers, Timer_IdleHold);
@@ -1608,7 +1615,12 @@ bgp_fsm(struct peer *peer, enum session_events event, struct ibuf *msg)
 	case STATE_ACTIVE:
 		switch (event) {
 		case EVNT_START:
-			/* ignore */
+			if (!peer->depend_ok || peer->conf.template)
+				break;
+			timer_set(&peer->timers, Timer_ConnectRetry,
+			    peer->holdtime);
+			change_state(peer, STATE_CONNECT, event);
+			session_connect(peer);
 			break;
 		case EVNT_CON_OPEN:
 			session_tcp_established(peer);
@@ -1828,8 +1840,6 @@ change_state(struct peer *peer, enum session_state state,
 		 * session was not established successfully before, the
 		 * starttimerinterval needs to be exponentially increased
 		 */
-		if (peer->IdleHoldTime == 0)
-			peer->IdleHoldTime = INTERVAL_IDLE_HOLD_INITIAL;
 		peer->holdtime = INTERVAL_HOLD_INITIAL;
 		timer_stop(&peer->timers, Timer_ConnectRetry);
 		timer_stop(&peer->timers, Timer_Keepalive);
@@ -1843,7 +1853,22 @@ change_state(struct peer *peer, enum session_state state,
 		memset(&peer->capa.peer, 0, sizeof(peer->capa.peer));
 		session_md5_reload(peer);
 
+		if (peer->prev_state == STATE_NONE ||
+		    peer->prev_state == STATE_ESTABLISHED) {
+			/* initialize capability negotiation structures */
+			memcpy(&peer->capa.ann, &peer->conf.capabilities,
+			    sizeof(peer->capa.ann));
+		}
+
+		/* called from init_peer for basic setup. */
+		if (peer->prev_state == STATE_NONE)
+			break;
+
 		if (peer->prev_state == STATE_ESTABLISHED) {
+			if (event == EVNT_STOP) {
+				session_down(peer);
+				break;
+			}
 			if (peer->capa.neg.grestart.restart == 2 &&
 			    (event == EVNT_CON_CLOSED ||
 			    event == EVNT_CON_FATAL ||
@@ -1854,30 +1879,22 @@ change_state(struct peer *peer, enum session_state state,
 				/* don't punish graceful restart */
 				timer_set(&peer->timers, Timer_IdleHold, 0);
 				session_graceful_restart(peer);
-			} else if (event != EVNT_STOP) {
+				break;
+			} else {
 				timer_set(&peer->timers, Timer_IdleHold,
 				    peer->IdleHoldTime);
-				if (event != EVNT_NONE &&
-				    peer->IdleHoldTime < MAX_IDLE_HOLD/2)
-					peer->IdleHoldTime *= 2;
-				session_down(peer);
-			} else {
 				session_down(peer);
 			}
 		} else if (event != EVNT_STOP) {
 			timer_set(&peer->timers, Timer_IdleHold,
 			    peer->IdleHoldTime);
-			if (event != EVNT_NONE &&
-			    peer->IdleHoldTime < MAX_IDLE_HOLD / 2)
-				peer->IdleHoldTime *= 2;
 		}
 
-		if (peer->prev_state == STATE_NONE ||
-		    peer->prev_state == STATE_ESTABLISHED) {
-			/* initialize capability negotiation structures */
-			memcpy(&peer->capa.ann, &peer->conf.capabilities,
-			    sizeof(peer->capa.ann));
-		}
+		peer->IdleHoldTime *= 2;
+		if (peer->IdleHoldTime == 0)
+			peer->IdleHoldTime = INTERVAL_IDLE_HOLD_INITIAL;
+		if (peer->IdleHoldTime > MAX_IDLE_HOLD)
+			peer->IdleHoldTime = MAX_IDLE_HOLD;
 		break;
 	case STATE_CONNECT:
 		if (peer->prev_state == STATE_ESTABLISHED &&

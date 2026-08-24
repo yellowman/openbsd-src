@@ -1,4 +1,4 @@
-/*	$OpenBSD: ospfctl.c,v 1.73 2024/11/21 13:38:14 claudio Exp $ */
+/*	$OpenBSD: ospfctl.c,v 1.75 2026/07/28 11:48:32 claudio Exp $ */
 
 /*
  * Copyright (c) 2005 Claudio Jeker <claudio@openbsd.org>
@@ -228,8 +228,8 @@ main(int argc, char *argv[])
 				errx(1, "pipe closed");
 
 			while (!done) {
-				if ((n = imsg_get(ibuf, &imsg)) == -1)
-					errx(1, "imsg_get error");
+				if ((n = imsgbuf_get(ibuf, &imsg)) == -1)
+					errx(1, "imsgbuf_get error");
 				if (n == 0)
 					break;
 
@@ -258,10 +258,8 @@ show(struct imsg *imsg, struct parse_result *res)
 	struct kroute		*k;
 	struct kif		*kif;
 	static struct in_addr	 area_id;
-	struct area		*area;
 	static u_int8_t		 lasttype;
 	static char		 ifname[IF_NAMESIZE];
-	struct iface		*iface;
 	struct lsa		*lsa;
 	struct lsa_hdr		*lsa_hdr;
 
@@ -322,13 +320,13 @@ show(struct imsg *imsg, struct parse_result *res)
 		lasttype = lsa_hdr->type;
 		break;
 	case IMSG_CTL_AREA:
-		area = imsg->data;
-		area_id = area->id;
+		if (imsg_get_data(imsg, &area_id, sizeof(area_id)) == -1)
+			errx(1, "IMSG_CTL_AREA: imsg_get_data() faied");
 		lasttype = 0;
 		break;
 	case IMSG_CTL_IFACE:
-		iface = imsg->data;
-		strlcpy(ifname, iface->name, sizeof(ifname));
+		if (imsg_get_data(imsg, ifname, sizeof(ifname)) == -1)
+			errx(1, "IMSG_CTL_IFACE: imsg_get_data() faied");
 		lasttype = 0;
 		break;
 	case IMSG_CTL_END:

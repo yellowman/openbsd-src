@@ -25,6 +25,7 @@
  *
  */
 
+#include <drm/drm_drv.h>
 #include <drm/drm_gpuvm.h>
 
 #include <linux/export.h>
@@ -943,9 +944,56 @@ __drm_gpuvm_bo_list_del(struct drm_gpuvm *gpuvm, spinlock_t *lock,
 /* We do not actually use drm_gpuva_it_next(), tell the compiler to not complain
  * about this.
  */
+#ifdef notyet
 INTERVAL_TREE_DEFINE(struct drm_gpuva, rb.node, u64, rb.__subtree_last,
 		     GPUVA_START, GPUVA_LAST, static __maybe_unused,
 		     drm_gpuva_it)
+#else
+static struct drm_gpuva *
+drm_gpuva_it_iter_first(struct rb_root_cached *root, uint64_t start,
+    uint64_t last)
+{
+	struct drm_gpuva *node;
+	struct rb_node *rb;
+
+	for (rb = rb_first_cached(root); rb; rb = rb_next(rb)) {
+		node = rb_entry(rb, typeof(*node), rb.node);
+		if (GPUVA_LAST(node) >= start &&
+		    GPUVA_START(node) <= last)
+			return node;
+	}
+	return NULL;
+}
+
+static void
+drm_gpuva_it_remove(struct drm_gpuva *node,
+    struct rb_root_cached *root) 
+{
+	rb_erase_cached(&node->rb.node, root);
+}
+
+static void
+drm_gpuva_it_insert(struct drm_gpuva *node,
+    struct rb_root_cached *root)
+{
+	struct rb_node **iter = &root->rb_root.rb_node;
+	struct rb_node *parent = NULL;
+	struct drm_gpuva *iter_node;
+
+	while (*iter) {
+		parent = *iter;
+		iter_node = rb_entry(*iter, struct drm_gpuva, rb.node);
+
+		if (GPUVA_START(node) < GPUVA_START(iter_node))
+			iter = &(*iter)->rb_left;
+		else
+			iter = &(*iter)->rb_right;
+	}
+
+	rb_link_node(&node->rb.node, parent, iter);
+	rb_insert_color_cached(&node->rb.node, root, false);
+}
+#endif
 
 static int __drm_gpuva_insert(struct drm_gpuvm *gpuvm,
 			      struct drm_gpuva *va);
@@ -1076,10 +1124,10 @@ drm_gpuvm_init(struct drm_gpuvm *gpuvm, const char *name,
 	INIT_LIST_HEAD(&gpuvm->rb.list);
 
 	INIT_LIST_HEAD(&gpuvm->extobj.list);
-	spin_lock_init(&gpuvm->extobj.lock);
+	mtx_init(&gpuvm->extobj.lock, IPL_NONE);
 
 	INIT_LIST_HEAD(&gpuvm->evict.list);
-	spin_lock_init(&gpuvm->evict.lock);
+	mtx_init(&gpuvm->evict.lock, IPL_NONE);
 
 	kref_init(&gpuvm->kref);
 
@@ -1089,6 +1137,7 @@ drm_gpuvm_init(struct drm_gpuvm *gpuvm, const char *name,
 	gpuvm->drm = drm;
 	gpuvm->r_obj = r_obj;
 
+	drm_dev_get(drm);
 	drm_gem_object_get(r_obj);
 
 	drm_gpuvm_warn_check_overflow(gpuvm, start_offset, range);
@@ -1130,13 +1179,15 @@ static void
 drm_gpuvm_free(struct kref *kref)
 {
 	struct drm_gpuvm *gpuvm = container_of(kref, struct drm_gpuvm, kref);
+	struct drm_device *drm = gpuvm->drm;
 
 	drm_gpuvm_fini(gpuvm);
 
-	if (drm_WARN_ON(gpuvm->drm, !gpuvm->ops->vm_free))
+	if (drm_WARN_ON(drm, !gpuvm->ops->vm_free))
 		return;
 
 	gpuvm->ops->vm_free(gpuvm);
+	drm_dev_put(drm);
 }
 
 /**
@@ -1192,7 +1243,7 @@ __drm_gpuvm_prepare_objects(struct drm_gpuvm *gpuvm,
 			    unsigned int num_fences)
 {
 	struct drm_gpuvm_bo *vm_bo;
-	LIST_HEAD(extobjs);
+	DRM_LIST_HEAD(extobjs);
 	int ret = 0;
 
 	for_each_vm_bo_in_list(gpuvm, extobj, &extobjs, vm_bo) {
@@ -1288,6 +1339,9 @@ drm_gpuvm_prepare_range(struct drm_gpuvm *gpuvm, struct drm_exec *exec,
 
 	drm_gpuvm_for_each_va_range(va, gpuvm, addr, end) {
 		struct drm_gem_object *obj = va->gem.obj;
+
+		if (unlikely(!obj))
+			continue;
 
 		ret = exec_prepare_obj(exec, obj, num_fences);
 		if (ret)
@@ -1434,7 +1488,7 @@ __drm_gpuvm_validate(struct drm_gpuvm *gpuvm, struct drm_exec *exec)
 {
 	const struct drm_gpuvm_ops *ops = gpuvm->ops;
 	struct drm_gpuvm_bo *vm_bo;
-	LIST_HEAD(evict);
+	DRM_LIST_HEAD(evict);
 	int ret = 0;
 
 	for_each_vm_bo_in_list(gpuvm, evict, &evict, vm_bo) {
@@ -1514,9 +1568,8 @@ drm_gpuvm_resv_add_fence(struct drm_gpuvm *gpuvm,
 			 enum dma_resv_usage extobj_usage)
 {
 	struct drm_gem_object *obj;
-	unsigned long index;
 
-	drm_exec_for_each_locked_object(exec, index, obj) {
+	drm_exec_for_each_locked_object(exec, obj) {
 		dma_resv_assert_held(obj->resv);
 		dma_resv_add_fence(obj->resv, fence,
 				   drm_gpuvm_is_extobj(gpuvm, obj) ?

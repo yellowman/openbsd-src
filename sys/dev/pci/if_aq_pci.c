@@ -1,4 +1,4 @@
-/* $OpenBSD: if_aq_pci.c,v 1.35 2026/03/13 02:47:31 bcook Exp $ */
+/* $OpenBSD: if_aq_pci.c,v 1.37 2026/07/24 02:31:43 bcook Exp $ */
 /*	$NetBSD: if_aq.c,v 1.27 2021/06/16 00:21:18 riastradh Exp $	*/
 
 /*
@@ -1274,7 +1274,7 @@ aq_attach(struct device *parent, struct device *self, void *aux)
 	pcitag_t tag;
 	struct ifnet *ifp = &sc->sc_arpcom.ac_if;
 	int txmin, txmax, rxmin, rxmax;
-	int irqmode, irqnum;
+	int irqmode, irqnum, multivec;
 	int i;
 
 	mtx_init(&sc->sc_mpi_mutex, IPL_NET);
@@ -1305,6 +1305,7 @@ aq_attach(struct device *parent, struct device *self, void *aux)
 	sc->sc_linkstat_irq = AQ_LINKSTAT_IRQ;
 	isr = aq_intr;
 	irqnum = 0;
+	multivec = 0;
 
 	if (pci_intr_map_msix(pa, 0, &ih) == 0) {
 		int nmsix = pci_intr_msix_count(pa);
@@ -1318,6 +1319,7 @@ aq_attach(struct device *parent, struct device *self, void *aux)
 
 			sc->sc_linkstat_irq = 0;
 			isr = aq_intr_link;
+			multivec = 1;
 			irqnum++;
 		}
 		irqmode = AQ_INTR_CTRL_IRQMODE_MSIX;
@@ -1362,7 +1364,7 @@ aq_attach(struct device *parent, struct device *self, void *aux)
 	if (aq_init_rss(sc))
 		return;
 
-	if (aq_hw_init(sc, irqmode, (sc->sc_nqueues > 1)))
+	if (aq_hw_init(sc, irqmode, multivec))
 		return;
 
 	sc->sc_media_type = aqp->aq_media_type;
@@ -1375,7 +1377,7 @@ aq_attach(struct device *parent, struct device *self, void *aux)
 	strlcpy(ifp->if_xname, self->dv_xname, IFNAMSIZ);
 	ifp->if_softc = sc;
 	ifp->if_flags = IFF_BROADCAST | IFF_MULTICAST | IFF_SIMPLEX;
-	ifp->if_xflags = IFXF_MPSAFE;
+	ifp->if_xflags = IFXF_MPSAFE | IFXF_MBUF_64BIT;
 	ifp->if_ioctl = aq_ioctl;
 	ifp->if_qstart = aq_start;
 	ifp->if_watchdog = aq_watchdog;
@@ -1469,7 +1471,7 @@ aq_attach(struct device *parent, struct device *self, void *aux)
 		snprintf(aq->q_name, sizeof(aq->q_name), "%s:%u",
 		    DEVNAME(sc), i);
 
-		if (sc->sc_nqueues > 1) {
+		if (multivec) {
 			if (pci_intr_map_msix(pa, irqnum, &ih)) {
 				printf(": unable to map msi-x vector %d\n",
 				    irqnum);

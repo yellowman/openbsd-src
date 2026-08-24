@@ -1,4 +1,4 @@
-/*	$OpenBSD: qwxvar.h,v 1.32 2025/12/01 16:57:36 stsp Exp $	*/
+/*	$OpenBSD: qwxvar.h,v 1.39 2026/07/18 09:47:52 stsp Exp $	*/
 
 /*
  * Copyright (c) 2018-2019 The Linux Foundation.
@@ -266,9 +266,7 @@ struct ath11k_hw_ops {
 			       struct hal_tcl_data_cmd *tcl_cmd);
 #endif
 	int (*rx_desc_get_first_msdu)(struct hal_rx_desc *desc);
-#if notyet
-	bool (*rx_desc_get_last_msdu)(struct hal_rx_desc *desc);
-#endif
+	int (*rx_desc_get_last_msdu)(struct hal_rx_desc *desc);
 	uint8_t (*rx_desc_get_l3_pad_bytes)(struct hal_rx_desc *desc);
 	uint8_t *(*rx_desc_get_hdr_status)(struct hal_rx_desc *desc);
 	int (*rx_desc_encrypt_valid)(struct hal_rx_desc *desc);
@@ -288,9 +286,7 @@ struct ath11k_hw_ops {
 	uint32_t (*rx_desc_get_msdu_freq)(struct hal_rx_desc *desc);
 	uint8_t (*rx_desc_get_msdu_pkt_type)(struct hal_rx_desc *desc);
 	uint8_t (*rx_desc_get_msdu_nss)(struct hal_rx_desc *desc);
-#ifdef notyet
 	uint8_t (*rx_desc_get_mpdu_tid)(struct hal_rx_desc *desc);
-#endif
 	uint16_t (*rx_desc_get_mpdu_peer_id)(struct hal_rx_desc *desc);
 #if 0
 	void (*rx_desc_copy_attn_end_tlv)(struct hal_rx_desc *fdesc,
@@ -416,6 +412,8 @@ enum ath11k_dev_flags {
 	ATH11K_FLAG_FIXED_MEM_RGN,
 	ATH11K_FLAG_DEVICE_INIT_DONE,
 	ATH11K_FLAG_MULTI_MSI_VECTORS,
+
+	QWX_FLAG_ROAMING,
 };
 
 enum ath11k_scan_state {
@@ -1012,7 +1010,7 @@ struct qwx_hp_update_timer {
 
 struct dp_rx_tid {
 	uint8_t tid;
-	struct qwx_dmamem *mem;
+	const struct qwx_dmamem *mem;
 	uint32_t *vaddr;
 	uint64_t paddr;
 	uint32_t size;
@@ -1131,6 +1129,17 @@ struct qwx_dp {
 #endif
 	struct qwx_hp_update_timer reo_cmd_timer;
 	struct qwx_hp_update_timer tx_ring_timer[DP_TCL_NUM_RING_MAX];
+
+	/*
+	 * Cache of DMA memory regions used for Rx aggregation.
+	 * We used to free these DMA allocations in interrupt context but
+	 * destroying DMA memory in interrupt context is not allowed.
+	 *
+	 * This array contains enough entries for client station mode.
+	 * It will need to grow in order to support multiple clients if
+	 * support for HostAP mode gets added to the driver.
+	 */
+	struct qwx_dmamem *rx_tid_mem[HAL_DESC_REO_NON_QOS_TID + 1];
 };
 
 #define ATH11K_SHADOW_DP_TIMER_INTERVAL 20
@@ -1659,11 +1668,8 @@ struct qwx_vif {
 	uint8_t hal_addr_search_flags;
 	uint8_t search_type;
 
-	struct qwx_softc *sc;
-
 	uint16_t tx_seq_no;
 	struct wmi_wmm_params_all_arg wmm_params;
-	TAILQ_ENTRY(qwx_vif) entry;
 	union {
 		struct {
 			uint32_t uapsd;
@@ -1710,8 +1716,6 @@ struct qwx_vif {
 
 	struct qwx_txmgmt_queue txmgmt;
 };
-
-TAILQ_HEAD(qwx_vif_list, qwx_vif);
 
 struct qwx_survey_info {
 	int8_t noise;
@@ -1858,6 +1862,10 @@ struct qwx_softc {
 	struct task		ba_task;
 	struct qwx_ba_task_data	ba_rx;
 
+	/* Task for firmware country code updates. */
+	uint8_t new_alpha2[3];
+	struct task set_cc_task;
+
 	enum ath11k_11d_state	state_11d;
 	int			completed_11d_scan;
 	uint32_t		vdev_id_11d_scan;
@@ -1875,6 +1883,9 @@ struct qwx_softc {
 	u_int			scan_channel;
 	struct qwx_survey_info	survey[IEEE80211_CHAN_MAX];
 	struct task		bgscan_task;
+	struct task		bgscan_done_task;
+	struct ieee80211_node_switch_bss_arg *bgscan_unref_arg;
+	size_t bgscan_unref_arg_size;
 
 	int			attached;
 	struct {
@@ -1937,7 +1948,7 @@ struct qwx_softc {
 
 	uint32_t pktlog_defs_checksum;
 
-	struct qwx_vif_list vif_list;
+	struct qwx_vif	sc_vif;
 	struct qwx_pdev pdevs[MAX_RADIOS];
 	struct {
 		enum WMI_HOST_WLAN_BAND supported_bands;
@@ -2006,7 +2017,9 @@ int	qwx_ext_intr(void *);
 int	qwx_dp_service_srng(struct qwx_softc *, int);
 
 int	qwx_init_hw_params(struct qwx_softc *);
-int	qwx_attach(struct qwx_softc *);
+int	qwx_vif_alloc(struct qwx_softc *);
+void	qwx_vif_free(struct qwx_softc *);
+void	qwx_attach(struct qwx_softc *);
 void	qwx_detach(struct qwx_softc *);
 int	qwx_activate(struct device *, int);
 
@@ -2021,6 +2034,9 @@ void	qwx_init_task(void *);
 int	qwx_newstate(struct ieee80211com *, enum ieee80211_state, int);
 void	qwx_newstate_task(void *);
 int	qwx_bgscan(struct ieee80211com *);
+void	qwx_bgscan_done(struct ieee80211com *,
+	    struct ieee80211_node_switch_bss_arg *, size_t);
+void	qwx_updatechan(struct ieee80211com *);
 
 struct qwx_node {
 	struct ieee80211_node ni;
@@ -2028,6 +2044,8 @@ struct qwx_node {
 	unsigned int flags;
 #define QWX_NODE_FLAG_HAVE_PAIRWISE_KEY	0x01
 #define QWX_NODE_FLAG_HAVE_GROUP_KEY	0x02
+	uint32_t phymode;
+	enum wmi_peer_chwidth chwidth;
 };
 
 struct ieee80211_node *qwx_node_alloc(struct ieee80211com *);

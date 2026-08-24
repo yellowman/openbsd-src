@@ -1,4 +1,4 @@
-/*	$OpenBSD: if_mcx.c,v 1.121 2025/11/19 04:58:04 jmatthew Exp $ */
+/*	$OpenBSD: if_mcx.c,v 1.123 2026/07/03 03:28:23 jmatthew Exp $ */
 
 /*
  * Copyright (c) 2017 David Gwynne <dlg@openbsd.org>
@@ -2953,7 +2953,7 @@ mcx_attach(struct device *parent, struct device *self, void *aux)
 	strlcpy(ifp->if_xname, DEVNAME(sc), IFNAMSIZ);
 	ifp->if_softc = sc;
 	ifp->if_flags = IFF_BROADCAST | IFF_MULTICAST | IFF_SIMPLEX;
-	ifp->if_xflags = IFXF_MPSAFE;
+	ifp->if_xflags = IFXF_MPSAFE | IFXF_MBUF_64BIT;
 	ifp->if_ioctl = mcx_ioctl;
 	ifp->if_qstart = mcx_start;
 	ifp->if_watchdog = mcx_watchdog;
@@ -8829,6 +8829,7 @@ mcx_kstat_attach_queues(struct mcx_softc *sc)
 		ks->ks_data = kvs;
 		ks->ks_datalen = nitems(mcx_queue_kstat_tpl) * sizeof(*kvs);
 		ks->ks_read = mcx_kstat_queue_read;
+		kstat_set_wlock(ks, &sc->sc_cmdq_kstat_lk);
 
 		sc->sc_queues[q].q_kstat = ks;
 		kstat_install(ks);

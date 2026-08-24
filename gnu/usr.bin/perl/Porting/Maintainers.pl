@@ -129,8 +129,7 @@ our @IGNORABLE = qw(
 our %Modules = (
 
     'Archive::Tar' => {
-        'DISTRIBUTION' => 'BINGOS/Archive-Tar-3.04.tar.gz',
-        'SYNCINFO'     => 'mauke on Wed Mar 19 08:01:30 2025',
+        'DISTRIBUTION' => 'BINGOS/Archive-Tar-3.12.tar.gz',
         'FILES'        => q[cpan/Archive-Tar],
         'BUGS'         => 'bug-archive-tar@rt.cpan.org',
         'EXCLUDED'     => [
@@ -218,21 +217,18 @@ our %Modules = (
     },
 
     'Compress::Raw::Bzip2' => {
-        'DISTRIBUTION' => 'PMQS/Compress-Raw-Bzip2-2.213.tar.gz',
-        'SYNCINFO'     => 'jkeenan on Wed Aug 28 14:11:20 2024',
+        'DISTRIBUTION' => 'PMQS/Compress-Raw-Bzip2-2.218.tar.gz',
         'FILES'        => q[cpan/Compress-Raw-Bzip2],
         'EXCLUDED'     => [
             qr{^t/Test/},
             qr{^t/meta},
-            'bzip2-src/bzip2-const.patch',
-            'bzip2-src/bzip2-cpp.patch',
-            'bzip2-src/bzip2-unsigned.patch',
+            'SECURITY.md',
         ],
     },
 
     'Compress::Raw::Zlib' => {
-        'DISTRIBUTION' => 'PMQS/Compress-Raw-Zlib-2.213.tar.gz',
-        'SYNCINFO'     => 'jkeenan on Wed Aug 28 13:58:29 2024',
+        'DISTRIBUTION' => 'PMQS/Compress-Raw-Zlib-2.222.tar.gz',
+        'SYNCINFO'     => 'jkeenan on Wed Mar 11 21:59:54 2026',
         'FILES'    => q[cpan/Compress-Raw-Zlib],
         'EXCLUDED' => [
             qr{^examples/},
@@ -240,7 +236,8 @@ our %Modules = (
             qr{^t/meta},
             qw( t/000prereq.t
                 t/99pod.t
-                ),
+                SECURITY.md
+            ),
         ],
     },
 
@@ -249,9 +246,9 @@ our %Modules = (
         'SYNCINFO'     => 'jkeenan on Fri Jan 17 14:43:53 2025',
         'FILES'        => q[cpan/Config-Perl-V],
         'EXCLUDED'     => [qw(
-		examples/show-v.pl
-		SECURITY.md
-		)],
+            examples/show-v.pl
+            SECURITY.md
+        )],
     },
 
     'constant' => {
@@ -630,8 +627,7 @@ our %Modules = (
     },
 
     'HTTP::Tiny' => {
-        'DISTRIBUTION' => 'HAARG/HTTP-Tiny-0.090.tar.gz',
-        'SYNCINFO'     => 'tib on Tue Nov 12 16:59:11 2024',
+        'DISTRIBUTION' => 'HAARG/HTTP-Tiny-0.096.tar.gz',
         'FILES'        => q[cpan/HTTP-Tiny],
         'EXCLUDED'     => [
             't/00-report-prereqs.t',
@@ -666,8 +662,8 @@ our %Modules = (
     },
 
     'IO-Compress' => {
-        'DISTRIBUTION' => 'PMQS/IO-Compress-2.213.tar.gz',
-        'SYNCINFO'     => 'jkeenan on Wed Aug 28 14:24:42 2024',
+        'DISTRIBUTION' => 'PMQS/IO-Compress-2.223.tar.gz',
+        'SYNCINFO'     => 'jkeenan on Mon Jul  6 12:27:06 2026',
         'MAIN_MODULE'  => 'IO::Compress::Base',
         'FILES'        => q[cpan/IO-Compress],
         'EXCLUDED'     => [
@@ -678,6 +674,7 @@ our %Modules = (
             't/010examples-bzip2.t',
             't/010examples-zlib.t',
             't/cz-05examples.t',
+            'SECURITY.md',
         ],
     },
 
@@ -973,6 +970,11 @@ our %Modules = (
             qw{.ChangeLog.swp},
             qr{^\.github/}
         ],
+
+        'CUSTOMIZED'   => [
+	    # Customized by 6ea7dace3401e25dcf8318146be82c03e07a6a72
+	    'lib/Pod/Simple/HTMLLegacy.pm',
+	],
     },
 
     'Pod::Usage' => {
@@ -1033,8 +1035,7 @@ our %Modules = (
     },
 
     'Socket' => {
-        'DISTRIBUTION' => 'PEVANS/Socket-2.038.tar.gz',
-        'SYNCINFO'     => 'LeoNerd on Sat Apr 27 09:57:02 2024',
+        'DISTRIBUTION' => 'PEVANS/Socket-2.041.tar.gz',
         'FILES'        => q[cpan/Socket],
         'EXCLUDED'     => ['.editorconfig'],
     },
@@ -1312,6 +1313,9 @@ our %Modules = (
         # only necessary with the CPAN release.
         'CUSTOMIZED'   => [
             'lib/version.pm',
+
+            # Customized by ba04a9040af061424b6d6f0b1e888cd3ce4b3d9f
+            'vutil.c',
          ],
 
         'MAP' => {

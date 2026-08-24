@@ -1,4 +1,4 @@
-# $OpenBSD: Makefile,v 1.29 2025/06/29 01:36:32 jmatthew Exp $
+# $OpenBSD: Makefile,v 1.31 2026/06/23 10:50:23 jca Exp $
 
 .include <bsd.own.mk>
 
@@ -10,6 +10,7 @@ SUBDIR+=libLLVMSupport
 SUBDIR+=libLLVMTableGen
 SUBDIR+=llvm-min-tblgen
 SUBDIR+=llvm-tblgen
+SUBDIR+=include/llvm/Analysis
 SUBDIR+=include/llvm/ExecutionEngine/JITLink
 SUBDIR+=include/llvm/IR
 SUBDIR+=include/llvm/Frontend/OpenACC
@@ -40,6 +41,7 @@ SUBDIR+=libclangASTMatchers
 SUBDIR+=libclangSema
 SUBDIR+=libclangCodeGen
 SUBDIR+=libclangAnalysis
+SUBDIR+=libclangAnalysisLifetimeSafety
 SUBDIR+=libclangEdit
 SUBDIR+=libclangRewrite
 SUBDIR+=libclangDriver
@@ -50,8 +52,12 @@ SUBDIR+=libclangFrontendTool
 SUBDIR+=libclangExtractAPI
 SUBDIR+=libclangIndex
 SUBDIR+=libclangInstallAPI
+SUBDIR+=libclangOptions
+SUBDIR+=libclangDependencyScanning
+SUBDIR+=libclangTooling
 
 SUBDIR+=clang
+SUBDIR+=clang-scan-deps
 
 SUBDIR+=include/lld/ELF
 
@@ -80,6 +86,7 @@ SUBDIR+=liblldbHostOpenBSD
 SUBDIR+=liblldbHostPOSIX
 SUBDIR+=liblldbInitialization
 SUBDIR+=liblldbInterpreter
+SUBDIR+=liblldbInterpreterInterfaces
 SUBDIR+=liblldbPluginArchitecture
 SUBDIR+=liblldbPluginDisassembler
 SUBDIR+=liblldbPluginDynamicLoader
@@ -106,6 +113,7 @@ SUBDIR+=liblldbPluginUnwindAssembly
 SUBDIR+=liblldbSymbol
 SUBDIR+=liblldbTarget
 SUBDIR+=liblldbUtility
+SUBDIR+=liblldbValueObject
 
 SUBDIR+=lldb
 SUBDIR+=lldb-server

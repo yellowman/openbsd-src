@@ -1,4 +1,4 @@
-/*	$OpenBSD: vmd.c,v 1.172 2026/02/22 22:54:54 dv Exp $	*/
+/*	$OpenBSD: vmd.c,v 1.179 2026/08/06 14:20:39 dv Exp $	*/
 
 /*
  * Copyright (c) 2015 Reyk Floeter <reyk@openbsd.org>
@@ -41,7 +41,6 @@
 #include <dev/vmm/vmm.h>
 
 #include "proc.h"
-#include "atomicio.h"
 #include "vmd.h"
 
 __dead void usage(void);
@@ -91,7 +90,8 @@ int
 vmd_dispatch_control(int fd, struct privsep_proc *p, struct imsg *imsg)
 {
 	struct privsep			*ps = p->p_ps;
-	int				 res = 0, cmd = IMSG_NONE, verbose;
+	int				 kernfd = -1, res = 0;
+	int				 cmd = IMSG_NONE, verbose;
 	unsigned int			 v = 0, flags;
 	struct vmop_create_params	 vmc;
 	struct vmop_id			 vid;
@@ -99,7 +99,6 @@ vmd_dispatch_control(int fd, struct privsep_proc *p, struct imsg *imsg)
 	struct vmd_vm			*vm = NULL;
 	char				*str = NULL;
 	uint32_t			 peer_id, type, vm_id = 0;
-	struct control_sock		*rcs;
 
 	peer_id = imsg_get_id(imsg);
 	type = imsg_get_type(imsg);
@@ -107,7 +106,8 @@ vmd_dispatch_control(int fd, struct privsep_proc *p, struct imsg *imsg)
 	switch (type) {
 	case IMSG_VMDOP_START_VM_REQUEST:
 		vmop_create_params_read(imsg, &vmc);
-		vmc.vmc_kernel = imsg_get_fd(imsg);
+		kernfd = imsg_get_fd(imsg);
+		vmc.vmc_kernel = kernfd;
 
 		/* Try registering our VM in our list of known VMs. */
 		if (vm_register(ps, &vmc, &vm, 0, vmc.vmc_owner.uid)) {
@@ -116,7 +116,7 @@ vmd_dispatch_control(int fd, struct privsep_proc *p, struct imsg *imsg)
 			/* Did we have a failure during lookup of a parent? */
 			if (vm == NULL) {
 				cmd = IMSG_VMDOP_START_VM_RESPONSE;
-				break;
+				goto start_failed;
 			}
 
 			/* Does the VM already exist? */
@@ -124,24 +124,33 @@ vmd_dispatch_control(int fd, struct privsep_proc *p, struct imsg *imsg)
 				/* Is it already running? */
 				if (vm->vm_state & VM_STATE_RUNNING) {
 					cmd = IMSG_VMDOP_START_VM_RESPONSE;
-					break;
+					goto start_failed;
 				}
 
 				/* If not running, are our flags ok? */
 				if (vmc.vmc_flags &&
 				    vmc.vmc_flags != VMOP_CREATE_KERNEL) {
 					cmd = IMSG_VMDOP_START_VM_RESPONSE;
-					break;
+					goto start_failed;
 				}
+
+				close_fd(vm->vm_kernel);
+				vm->vm_kernel = kernfd;
+				kernfd = -1;
 			}
 			res = 0;
-		}
+		} else
+			kernfd = -1;
 
 		/* Try to start the launch of the VM. */
 		res = config_setvm(ps, vm, peer_id,
 		    vm->vm_params.vmc_owner.uid);
 		if (res)
 			cmd = IMSG_VMDOP_START_VM_RESPONSE;
+		break;
+	start_failed:
+		close_fd(kernfd);
+		kernfd = -1;
 		break;
 	case IMSG_VMDOP_WAIT_VM_REQUEST:
 	case IMSG_VMDOP_TERMINATE_VM_REQUEST:
@@ -191,6 +200,11 @@ vmd_dispatch_control(int fd, struct privsep_proc *p, struct imsg *imsg)
 		break;
 	case IMSG_VMDOP_LOAD:
 		str = imsg_string_read(imsg, PATH_MAX);
+		if (str == NULL || *str == '\0') {
+			free(str);
+			cmd = IMSG_CTL_FAIL;
+			break;
+		}
 		/* fallthrough */
 	case IMSG_VMDOP_RELOAD:
 		if (vmd_reload(0, str) == -1)
@@ -249,8 +263,6 @@ vmd_dispatch_control(int fd, struct privsep_proc *p, struct imsg *imsg)
 		break;
 	case IMSG_VMDOP_DONE:
 		control_reset(&ps->ps_csock);
-		TAILQ_FOREACH(rcs, &ps->ps_rcsocks, cs_entry)
-			control_reset(rcs);
 		break;
 	default:
 		return (-1);
@@ -553,8 +565,12 @@ main(int argc, char **argv)
 
 	if ((env = calloc(1, sizeof(*env))) == NULL)
 		fatal("calloc: env");
-	env->vmd_fd = -1;
-	env->vmd_fd6 = -1;
+
+	env->vmd_ptm_fd = -1;
+	env->vmd_psp_fd = -1;
+	env->vmd_sock_fd = -1;
+	env->vmd_sock_fd6 = -1;
+	env->vmd_vmm_fd = -1;
 
 	while ((ch = getopt(argc, argv, "D:P:V:X:df:i:j:nt:vp:")) != -1) {
 		switch (ch) {
@@ -684,14 +700,13 @@ main(int argc, char **argv)
 
 	/* Open /dev/vmm early. */
 	if (env->vmd_noaction == 0 && proc_id == PROC_PARENT) {
-		env->vmd_fd = open(VMM_NODE, O_RDWR | O_CLOEXEC);
-		if (env->vmd_fd == -1)
+		env->vmd_vmm_fd = open(VMM_NODE, O_RDWR | O_CLOEXEC);
+		if (env->vmd_vmm_fd == -1)
 			fatal("%s", VMM_NODE);
 	}
 
 	/* Configure the control socket */
 	ps->ps_csock.cs_name = SOCKET_NAME;
-	TAILQ_INIT(&ps->ps_rcsocks);
 
 	/* Configuration will be parsed after forking the children */
 	env->vmd_conffile = conffile;
@@ -790,7 +805,7 @@ vmd_configure(void)
 	    " chown fattr flock", NULL) == -1)
 		fatal("pledge");
 
-	if ((env->vmd_ptmfd = getptmfd()) == -1)
+	if ((env->vmd_ptm_fd = getptmfd()) == -1)
 		fatal("getptmfd %s", PATH_PTMDEV);
 
 	if (parse_config(env->vmd_conffile) == -1) {
@@ -806,7 +821,7 @@ vmd_configure(void)
 
 	/* Send VMM device fd to vmm proc. */
 	proc_compose_imsg(&env->vmd_ps, PROC_VMM,
-	    IMSG_VMDOP_RECEIVE_VMM_FD, -1, env->vmd_fd, NULL, 0);
+	    IMSG_VMDOP_RECEIVE_VMM_FD, -1, env->vmd_vmm_fd, NULL, 0);
 
 	/* Send PSP device fd to vmm proc. */
 	if (env->vmd_psp_fd != -1) {
@@ -1148,7 +1163,6 @@ vm_register(struct privsep *ps, struct vmop_create_params *vmc,
 			errno = EPERM;
 			goto fail;
 		}
-		vm->vm_kernel = vmc->vmc_kernel;
 		*ret_vm = vm;
 		errno = EALREADY;
 		goto fail;
@@ -1174,6 +1188,9 @@ vm_register(struct privsep *ps, struct vmop_create_params *vmc,
 		vmc->vmc_memranges[0].vmr_size = VM_DEFAULT_MEMORY;
 	if (vmc->vmc_ncpus > VMM_MAX_VCPUS_PER_VM) {
 		log_warnx("invalid number of CPUs");
+		goto fail;
+	} else if (vmc->vmc_nmemranges > VMM_MAX_MEM_RANGES) {
+		log_warnx("invalid number of memory ranges");
 		goto fail;
 	} else if (vmc->vmc_ndisks > VM_MAX_DISKS_PER_VM) {
 		log_warnx("invalid number of disks");
@@ -1430,7 +1447,7 @@ vm_instance(struct privsep *ps, struct vmd_vm **vm_parent,
 	}
 	if (vmc_parent->vmc_insflags & VMOP_CREATE_INSTANCE) {
 		vmc->vmc_insowner.gid = vmc_parent->vmc_insowner.gid;
-		vmc->vmc_insowner.uid = vmc_parent->vmc_insowner.gid;
+		vmc->vmc_insowner.uid = vmc_parent->vmc_insowner.uid;
 		vmc->vmc_insflags = vmc_parent->vmc_insflags;
 	} else {
 		vmc->vmc_insowner.gid = 0;
@@ -1612,7 +1629,7 @@ vm_opentty(struct vmd_vm *vm)
 	/*
 	 * Open tty with pre-opened PTM fd
 	 */
-	if (fdopenpty(env->vmd_ptmfd, &vm->vm_tty, &tty_slave, vm->vm_ttyname,
+	if (fdopenpty(env->vmd_ptm_fd, &vm->vm_tty, &tty_slave, vm->vm_ttyname,
 	    NULL, NULL) == -1) {
 		log_warn("fdopenpty");
 		return (-1);

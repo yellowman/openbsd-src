@@ -1,4 +1,4 @@
-/*	$OpenBSD: ieee80211_node.c,v 1.211 2026/03/19 16:50:32 chris Exp $	*/
+/*	$OpenBSD: ieee80211_node.c,v 1.216 2026/05/24 16:29:51 kirill Exp $	*/
 /*	$NetBSD: ieee80211_node.c,v 1.14 2004/05/09 09:18:47 dyoung Exp $	*/
 
 /*-
@@ -408,7 +408,8 @@ ieee80211_add_ess(struct ieee80211com *ic, struct ieee80211_join *join)
 	if (join->i_flags & IEEE80211_JOIN_WPA) {
 		if (join->i_wpaparams.i_enabled) {
 			if (!(ic->ic_caps & IEEE80211_C_RSN)) {
-				free(ess, M_DEVBUF, sizeof(*ess));
+				if (new)
+					free(ess, M_DEVBUF, sizeof(*ess));
 				return ENODEV;
 			}
 			ieee80211_ess_setwpaparms(ic, ess,
@@ -426,7 +427,8 @@ ieee80211_add_ess(struct ieee80211com *ic, struct ieee80211_join *join)
 	} else if (join->i_flags & IEEE80211_JOIN_NWKEY) {
 		if (join->i_nwkey.i_wepon) {
 			if (!(ic->ic_caps & IEEE80211_C_WEP)) {
-				free(ess, M_DEVBUF, sizeof(*ess));
+				if (new)
+					free(ess, M_DEVBUF, sizeof(*ess));
 				return ENODEV;
 			}
 			ieee80211_ess_setnwkeys(ess, &join->i_nwkey);
@@ -1135,6 +1137,8 @@ ieee80211_match_bss(struct ieee80211com *ic, struct ieee80211_node *ni,
 	if ((ic->ic_flags & IEEE80211_F_DESBSSID) &&
 	    !IEEE80211_ADDR_EQ(ic->ic_des_bssid, ni->ni_bssid))
 		fail |= IEEE80211_NODE_ASSOCFAIL_BSSID;
+	if (ni->ni_flags & IEEE80211_NODE_CSA)
+		fail |= IEEE80211_NODE_ASSOCFAIL_CSA;
 
 	if (ic->ic_flags & IEEE80211_F_RSNON) {
 		/*
@@ -2475,7 +2479,7 @@ ieee80211_40mhz_valid_secondary_below(uint8_t primary_chan)
 		1, 2, 3, 4, 5, 6, 7, 8, 9,
 		36, 44, 52, 60, 100, 108, 116, 124, 132, 140, 149, 157
 	};
-	int8_t secondary_chan;
+	uint8_t secondary_chan;
 	int i;
 
 	if ((primary_chan >= 5 && primary_chan <= 13) ||
@@ -2534,7 +2538,7 @@ ieee80211_setup_htop(struct ieee80211_node *ni, const uint8_t *data,
 	if (!ieee80211_40mhz_center_freq_valid(data[0], data[1]))
 		ni->ni_htop0 &= ~IEEE80211_HTOP0_SCO_MASK;
 	ni->ni_htop1 = (data[2] | (data[3] << 8));
-	ni->ni_htop2 = (data[3] | (data[4] << 8));
+	ni->ni_htop2 = (data[4] | (data[5] << 8));
 
 	/*
 	 * According to 802.11-2012 Table 8-130 the Basic MCS set is
@@ -2563,8 +2567,7 @@ ieee80211_setup_vhtcaps(struct ieee80211_node *ni, const uint8_t *data,
 	ni->ni_vht_rx_max_lgi_mbit_s = ((data[6] | (data[7] << 8)) &
 	    IEEE80211_VHT_MAX_LGI_MBIT_S_MASK);
 	ni->ni_vht_txmcs = (data[8] | (data[9] << 8));
-	ni->ni_vht_tx_max_lgi_mbit_s = ((data[10] | (data[11] << 8)) &
-	    IEEE80211_VHT_MAX_LGI_MBIT_S_MASK);
+	ni->ni_vht_tx_max_lgi_mbit_s = (data[10] | (data[11] << 8));
 
 	ni->ni_flags |= IEEE80211_NODE_VHTCAP;
 }
@@ -2601,8 +2604,10 @@ int
 ieee80211_setup_vhtop(struct ieee80211_node *ni, const uint8_t *data,
     uint8_t len, int isprobe)
 {
-	uint8_t sco;
-	int have_40mhz;
+	struct ieee80211com *ic = ni->ni_ic;
+	uint8_t sco, ccfs0, ccfs1, ccfs2, supp_chwidth, ext_nss_bw_supp;
+	uint8_t local_chwidth, local_ext_nss_bw_supp;
+	int have_40mhz, local_supports_160, width, ccf1;
 
 	if (len != 5)
 		return 0;
@@ -2619,14 +2624,88 @@ ieee80211_setup_vhtop(struct ieee80211_node *ni, const uint8_t *data,
 	    sco == IEEE80211_HTOP0_SCO_SCB);
 
 	if (have_40mhz && ieee80211_80mhz_center_freq_valid(data[1])) {
-		ni->ni_vht_chan_width = data[0];
-		ni->ni_vht_chan_center_freq_idx0 = data[1];
-
-		/* Only used in non-consecutive 80-80 160MHz configs. */
+		width = data[0];
+		ccfs0 = data[1];
 		if (data[2] && ieee80211_80mhz_center_freq_valid(data[2]))
-			ni->ni_vht_chan_center_freq_idx1 = data[2];
+			ccfs1 = data[2];
 		else
+			ccfs1 = 0;
+		ccfs2 = (ni->ni_htop1 & IEEE80211_HTOP1_CCFS2_MASK) >>
+		    IEEE80211_HTOP1_CCFS2_SHIFT;
+		if (!ieee80211_80mhz_center_freq_valid(ccfs2))
+			ccfs2 = 0;
+
+		supp_chwidth = (ni->ni_vhtcaps & IEEE80211_VHTCAP_CHAN_WIDTH_MASK) >>
+		    IEEE80211_VHTCAP_CHAN_WIDTH_SHIFT;
+		ext_nss_bw_supp =
+		    (ni->ni_vhtcaps & IEEE80211_VHTCAP_EXT_NSS_BW_MASK) >>
+		    IEEE80211_VHTCAP_EXT_NSS_BW_SHIFT;
+		local_chwidth = (ic->ic_vhtcaps &
+		    IEEE80211_VHTCAP_CHAN_WIDTH_MASK) >>
+		    IEEE80211_VHTCAP_CHAN_WIDTH_SHIFT;
+		local_ext_nss_bw_supp = (ic->ic_vhtcaps &
+		    IEEE80211_VHTCAP_EXT_NSS_BW_MASK) >>
+		    IEEE80211_VHTCAP_EXT_NSS_BW_SHIFT;
+		local_supports_160 = IEEE80211_CHAN_160MHZ_ALLOWED(ni->ni_chan) &&
+		    (local_chwidth == IEEE80211_VHTCAP_CHAN_WIDTH_160 ||
+		    local_chwidth == IEEE80211_VHTCAP_CHAN_WIDTH_160_8080 ||
+		    (local_ext_nss_bw_supp != 0 &&
+		    (ic->ic_vht_tx_max_lgi_mbit_s &
+		    IEEE80211_VHT_EXT_NSS_BW_CAPABLE) != 0));
+
+		/* See 802.11-2024 Table 9-314 */
+		switch ((supp_chwidth << 4) | ext_nss_bw_supp) {
+		case 0x01:
+		case 0x02:
+		case 0x03:
+			ccf1 = ccfs2;
+			break;
+		case 0x10:
+			ccf1 = ccfs1;
+			break;
+		case 0x11:
+		case 0x12:
+			if (ccfs1 != 0)
+				ccf1 = ccfs1;
+			else
+				ccf1 = ccfs2;
+			break;
+		case 0x13:
+		case 0x20:
+		case 0x23:
+			ccf1 = ccfs1;
+			break;
+		default:
+			ccf1 = 0;
+			break;
+		}
+
+		ni->ni_vht_chan_center_freq_idx0 = ccfs0;
+		ni->ni_vht_chan_center_freq_idx1 = ccfs1;
+
+		if (width == IEEE80211_VHTOP0_CHAN_WIDTH_80 && ccf1 != 0) {
+			int diff;
+
+			diff = abs(ccf1 - ccfs0);
+			if (diff == 8) {
+				if (local_supports_160) {
+					ni->ni_vht_chan_center_freq_idx0 = ccf1;
+					width = IEEE80211_VHTOP0_CHAN_WIDTH_160;
+				}
+				ni->ni_vht_chan_center_freq_idx1 = 0;
+			}
+		} else if (width == IEEE80211_VHTOP0_CHAN_WIDTH_160) {
+			if (!local_supports_160) {
+				if (ni->ni_primary_chan < ccfs0)
+					ni->ni_vht_chan_center_freq_idx0 = ccfs0 - 4;
+				else if (ni->ni_primary_chan > ccfs0)
+					ni->ni_vht_chan_center_freq_idx0 = ccfs0 + 4;
+				width = IEEE80211_VHTOP0_CHAN_WIDTH_80;
+			}
 			ni->ni_vht_chan_center_freq_idx1 = 0;
+		}
+
+		ni->ni_vht_chan_width = width;
 	} else {
 		ni->ni_vht_chan_width = IEEE80211_VHTOP0_CHAN_WIDTH_HT;
 		ni->ni_vht_chan_center_freq_idx0 = 0;

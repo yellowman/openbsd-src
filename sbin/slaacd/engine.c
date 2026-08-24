@@ -1,4 +1,4 @@
-/*	$OpenBSD: engine.c,v 1.99 2024/11/21 13:35:20 claudio Exp $	*/
+/*	$OpenBSD: engine.c,v 1.105 2026/08/04 12:48:01 claudio Exp $	*/
 
 /*
  * Copyright (c) 2017 Florian Obser <florian@openbsd.org>
@@ -459,8 +459,7 @@ engine_dispatch_frontend(int fd, short event, void *bula)
 	struct imsg_del_addr		 del_addr;
 	struct imsg_del_route		 del_route;
 	struct imsg_dup_addr		 dup_addr;
-	ssize_t				 n;
-	int				 shut = 0;
+	int				 n, shut = 0;
 #ifndef	SMALL
 	int				 verbose;
 #endif	/* SMALL */
@@ -482,8 +481,8 @@ engine_dispatch_frontend(int fd, short event, void *bula)
 	}
 
 	for (;;) {
-		if ((n = imsg_get(ibuf, &imsg)) == -1)
-			fatal("%s: imsg_get error", __func__);
+		if ((n = imsgbuf_get(ibuf, &imsg)) == -1)
+			fatal("%s: imsgbuf_get error", __func__);
 		if (n == 0)	/* No more messages. */
 			break;
 
@@ -630,9 +629,8 @@ engine_dispatch_main(int fd, short event, void *bula)
 	struct imsgev		*iev = bula;
 	struct imsgbuf		*ibuf = &iev->ibuf;
 	struct imsg_ifinfo	 imsg_ifinfo;
-	ssize_t			 n;
 	uint32_t		 type;
-	int			 shut = 0;
+	int			 n, shut = 0;
 
 	if (event & EV_READ) {
 		if ((n = imsgbuf_read(ibuf)) == -1)
@@ -650,8 +648,8 @@ engine_dispatch_main(int fd, short event, void *bula)
 	}
 
 	for (;;) {
-		if ((n = imsg_get(ibuf, &imsg)) == -1)
-			fatal("%s: imsg_get error", __func__);
+		if ((n = imsgbuf_get(ibuf, &imsg)) == -1)
+			fatal("%s: imsgbuf_get error", __func__);
 		if (n == 0)	/* No more messages. */
 			break;
 
@@ -1474,6 +1472,8 @@ parse_ra(struct slaacd_iface *iface, struct imsg_ra *ra)
 		struct in6_addr *in6;
 		int i;
 
+		if (nd_opt_hdr->nd_opt_len == 0)
+			goto err;
 		len -= sizeof(struct nd_opt_hdr);
 		p += sizeof(struct nd_opt_hdr);
 
@@ -1491,10 +1491,17 @@ parse_ra(struct slaacd_iface *iface, struct imsg_ra *ra)
 				goto err;
 			}
 
+			prf = (struct nd_opt_prefix_info*) nd_opt_hdr;
+
+			if (prf->nd_opt_pi_prefix_len > 128) {
+				log_debug("%s: invalid prefix length(%d)",
+				    __func__, prf->nd_opt_pi_prefix_len);
+				goto err;
+			}
+
 			if ((prefix = calloc(1, sizeof(*prefix))) == NULL)
 				fatal("calloc");
 
-			prf = (struct nd_opt_prefix_info*) nd_opt_hdr;
 			prefix->prefix = prf->nd_opt_pi_prefix;
 			prefix->prefix_len = prf->nd_opt_pi_prefix_len;
 			prefix->onlink = prf->nd_opt_pi_flags_reserved &
@@ -1645,8 +1652,10 @@ in6_prefixlen2mask(struct in6_addr *maskp, int len)
 	u_char maskarray[8] = {0x80, 0xc0, 0xe0, 0xf0, 0xf8, 0xfc, 0xfe, 0xff};
 	int bytelen, bitlen, i;
 
-	if (0 > len || len > 128)
-		fatalx("%s: invalid prefix length(%d)\n", __func__, len);
+	if (0 > len || len > 128) {
+		log_debug("%s: invalid prefix length(%d)", __func__, len);
+		len = 128;
+	}
 
 	bzero(maskp, sizeof(*maskp));
 	bytelen = len / 8;
@@ -1760,6 +1769,8 @@ debug_log_ra(struct imsg_ra *ra)
 		struct in6_addr *in6;
 		int i;
 
+		if (nd_opt_hdr->nd_opt_len == 0)
+			return;
 		len -= sizeof(struct nd_opt_hdr);
 		p += sizeof(struct nd_opt_hdr);
 		if (nd_opt_hdr->nd_opt_len * 8 - 2 > len) {
@@ -2081,7 +2092,7 @@ update_iface_ra_rdns(struct slaacd_iface *iface, struct radv *ra)
 	LIST_FOREACH(radv_rdns, &ra->rdns_servers, entries) {
 		memcpy(&rdns[rdns_count++],
 		    &radv_rdns->rdns, sizeof(struct in6_addr));
-		if (rdns_proposal->rdns_count == MAX_RDNS_COUNT)
+		if (rdns_count == MAX_RDNS_COUNT)
 			break;
 	}
 

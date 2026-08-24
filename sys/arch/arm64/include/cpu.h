@@ -1,4 +1,4 @@
-/* $OpenBSD: cpu.h,v 1.53 2025/12/15 12:59:24 dlg Exp $ */
+/* $OpenBSD: cpu.h,v 1.56 2026/07/07 12:12:44 kettenis Exp $ */
 /*
  * Copyright (c) 2016 Dale Rahn <drahn@dalerahn.com>
  *
@@ -37,7 +37,8 @@
 #define	CPU_ID_AA64SMFR0       10
 #define	CPU_ID_AA64ZFR0	       11
 #define	CPU_LIDACTION          12
-#define	CPU_MAXID	       13	/* number of valid machdep ids */
+#define	CPU_LED_BLINK	       13	/* int: blink leds? */
+#define	CPU_MAXID	       14	/* number of valid machdep ids */
 
 #define	CTL_MACHDEP_NAMES { \
 	{ 0, 0 }, \
@@ -53,6 +54,7 @@
 	{ "id_aa64smfr0", CTLTYPE_QUAD }, \
 	{ "id_aa64zfr0", CTLTYPE_QUAD }, \
 	{ "lidaction", CTLTYPE_INT }, \
+	{ "led_blink", CTLTYPE_INT }, \
 }
 
 #ifdef _KERNEL
@@ -127,6 +129,7 @@ struct cpu_info {
 	struct cpu_info		*ci_self;
 
 #define __HAVE_CPU_TOPOLOGY
+	u_int32_t		ci_cputype;
 	u_int32_t		ci_smt_id;
 	u_int32_t		ci_core_id;
 	u_int32_t		ci_pkg_id;
@@ -162,6 +165,8 @@ struct cpu_info {
 	volatile int		ci_opp_idx;
 	volatile int		ci_opp_max;
 	uint32_t		ci_cpu_supply;
+
+	uint64_t		ci_capacity;
 
 	u_long			ci_prev_sleep;
 	u_long			ci_last_itime;
@@ -341,6 +346,7 @@ intr_restore(u_long daif)
 	restore_daif(daif);
 }
 
+void	cpu_classify(void);
 void	cpu_halt(void);
 int	cpu_suspend_primary(void);
 void	cpu_resume_secondary(struct cpu_info *);
@@ -352,6 +358,14 @@ void	cpu_wfi(void);
 
 void	delay (unsigned);
 #define	DELAY(x)	delay(x)
+
+struct blink_led {
+	void (*bl_func)(void *, int);
+	void *bl_arg;
+	SLIST_ENTRY(blink_led) bl_next;
+};
+
+void blink_led_register(struct blink_led *);
 
 #endif /* _KERNEL */
 

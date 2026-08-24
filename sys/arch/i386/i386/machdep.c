@@ -1,4 +1,4 @@
-/*	$OpenBSD: machdep.c,v 1.678 2025/09/10 00:07:29 jsg Exp $	*/
+/*	$OpenBSD: machdep.c,v 1.680 2026/05/14 01:39:38 jsg Exp $	*/
 /*	$NetBSD: machdep.c,v 1.214 1996/11/10 03:16:17 thorpej Exp $	*/
 
 /*-
@@ -2019,12 +2019,29 @@ identifycpu(struct cpu_info *ci)
 			if (msr != nmsr)
 				wrmsr(MSR_DE_CFG, nmsr);
 		}
+		/* Zen 2 mitigations: Zenbleed, op cache corruption */
 		if (ci->ci_family == 0x17 && ci->ci_model >= 0x31 &&
 		    (cpu_ecxfeature & CPUIDECX_HV) == 0) {
 			nmsr = msr = rdmsr(MSR_DE_CFG);
 			nmsr |= DE_CFG_SERIALIZE_9;
 			if (msr != nmsr)
 				wrmsr(MSR_DE_CFG, nmsr);
+
+			nmsr = msr = rdmsr(MSR_BP_CFG);
+			nmsr |= BP_CFG_33;
+			if (msr != nmsr)
+				wrmsr(MSR_BP_CFG, nmsr);
+		}
+		/*
+		 * Mitigation for Floating Point Divider State Sampling
+		 * from AMD-SB-7053
+		 */
+		if (ci->ci_family == 0x17 && ci->ci_model <= 0x2f &&
+		    (cpu_ecxfeature & CPUIDECX_HV) == 0) {
+			nmsr = msr = rdmsr(MSR_FP_CFG);
+			nmsr |= FP_CFG_9;
+			if (msr != nmsr)
+				wrmsr(MSR_FP_CFG, nmsr);
 		}
 	}
 

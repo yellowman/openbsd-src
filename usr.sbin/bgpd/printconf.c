@@ -1,4 +1,4 @@
-/*	$OpenBSD: printconf.c,v 1.185 2026/03/02 09:51:48 claudio Exp $	*/
+/*	$OpenBSD: printconf.c,v 1.188 2026/06/08 12:26:45 claudio Exp $	*/
 
 /*
  * Copyright (c) 2003, 2004 Henning Brauer <henning@openbsd.org>
@@ -918,7 +918,7 @@ print_addpath_mode(enum addpath_mode mode)
 void
 print_announce(struct peer_config *p, const char *c)
 {
-	uint8_t	aid;
+	u_int	aid;
 	int match = 0;
 
 	for (aid = AID_MIN; aid < AID_MAX; aid++)
@@ -953,10 +953,10 @@ print_announce(struct peer_config *p, const char *c)
 	    p->capabilities.grestart.grnotification)
 		printf("%s\tannounce graceful notification yes\n", c);
 
-	if (p->capabilities.as4byte == 2)
-		printf("%s\tannounce as4byte enforce\n", c);
+	if (p->capabilities.as4byte == 1)
+		printf("%s\tannounce as-4byte yes\n", c);
 	else if (p->capabilities.as4byte == 0)
-		printf("%s\tannounce as4byte no\n", c);
+		printf("%s\tannounce as-4byte no\n", c);
 
 	if (p->capabilities.ext_msg == 2)
 		printf("%s\tannounce extended message enforce\n", c);

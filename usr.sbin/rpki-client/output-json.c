@@ -1,4 +1,4 @@
-/*	$OpenBSD: output-json.c,v 1.59 2025/11/13 15:18:53 job Exp $ */
+/*	$OpenBSD: output-json.c,v 1.61 2026/07/07 13:38:54 claudio Exp $ */
 /*
  * Copyright (c) 2019 Claudio Jeker <claudio@openbsd.org>
  *
@@ -64,6 +64,7 @@ outputheader_json(struct validation_data *vd, struct stats *st)
 	json_do_int("certificates", st->repo_tal_stats.certs);
 	json_do_int("invalidcertificates", st->repo_tal_stats.certs_fail);
 	json_do_int("nonfunctionalcas", st->repo_tal_stats.certs_nonfunc);
+	json_do_int("deferredcas", st->repo_tal_stats.certs_nonfunc_deferred);
 	json_do_int("taks", st->repo_tal_stats.taks);
 	json_do_int("tals", st->tals);
 	json_do_int("invalidtals", talsz - st->tals);
@@ -102,12 +103,12 @@ print_vap(struct vap *v)
 		return;
 
 	json_do_object("aspa", 1);
-	json_do_int("customer_asid", v->custasid);
+	json_do_uint("customer_asid", v->custasid);
 	json_do_int("expires", v->expires);
 
 	json_do_array("providers");
 	for (i = 0; i < v->num_providers; i++)
-		json_do_int("provider", v->providers[i]);
+		json_do_uint("provider", v->providers[i]);
 
 	json_do_end();
 }
@@ -133,7 +134,7 @@ output_spl(struct vsp_tree *vsps)
 	json_do_array("signedprefixlists");
 	RB_FOREACH(vsp, vsp_tree, vsps) {
 		json_do_object("vsp", 1);
-		json_do_int("origin_as", vsp->asid);
+		json_do_uint("origin_as", vsp->asid);
 		json_do_array("prefixes");
 		for (i = 0; i < vsp->num_prefixes; i++) {
 			ip_addr_print(&vsp->prefixes[i].prefix,
@@ -164,7 +165,7 @@ output_json(FILE *out, struct validation_data *vd, struct stats *st)
 		ip_addr_print(&v->addr, v->afi, buf, sizeof(buf));
 
 		json_do_object("roa", 1);
-		json_do_int("asn", v->asid);
+		json_do_uint("asn", v->asid);
 		json_do_string("prefix", buf);
 		json_do_int("maxLength", v->maxlength);
 		json_do_string("ta", taldescs[v->talid]);
@@ -176,7 +177,7 @@ output_json(FILE *out, struct validation_data *vd, struct stats *st)
 	json_do_array("bgpsec_keys");
 	RB_FOREACH(b, brk_tree, &vd->brks) {
 		json_do_object("brks", 0);
-		json_do_int("asn", b->asid);
+		json_do_uint("asn", b->asid);
 		json_do_string("ski", b->ski);
 		json_do_string("pubkey", b->pubkey);
 		json_do_string("ta", taldescs[b->talid]);
@@ -192,7 +193,13 @@ output_json(FILE *out, struct validation_data *vd, struct stats *st)
 		json_do_string("ta", taldescs[nca->talid]);
 		json_do_string("caRepository", nca->carepo);
 		json_do_string("rpkiManifest", nca->mfturi);
+		if (nca->notify != NULL)
+			json_do_string("rpkiNotify", nca->notify);
+		json_do_string("aki", nca->aki);
 		json_do_string("ski", nca->ski);
+		json_do_int("since", (long long)nca->since);
+		json_do_int("last_attempt", (long long)nca->last_attempt);
+		json_do_int("total_attempts", nca->attempts);
 		json_do_end();
 	}
 	json_do_end();

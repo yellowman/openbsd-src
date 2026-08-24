@@ -1,4 +1,4 @@
-/*	$OpenBSD: machdep.c,v 1.307 2026/03/11 16:18:42 kettenis Exp $	*/
+/*	$OpenBSD: machdep.c,v 1.312 2026/08/19 08:56:28 hshoexer Exp $	*/
 /*	$NetBSD: machdep.c,v 1.3 2003/05/07 22:58:18 fvdl Exp $	*/
 
 /*-
@@ -321,6 +321,8 @@ cpu_startup(void)
 
 	bufinit();
 
+	sched_blockcpu = CPUTYP_SMT | CPUTYP_L;
+
 	if (boothowto & RB_CONFIG) {
 #ifdef BOOT_CONFIG
 		user_config();
@@ -573,7 +575,9 @@ cpu_sysctl(int *name, u_int namelen, void *oldp, size_t *oldlenp, void *newp,
 		return (sysctl_rdquad(oldp, oldlenp, newp, tsc_frequency));
 	case CPU_VMMODE:
 		if (ISSET(cpu_ecxfeature, CPUIDECX_HV)) {
-			if (ISSET(cpu_sev_guestmode, SEV_STAT_ES_ENABLED))
+			if (ISSET(cpu_sev_guestmode, SEV_STAT_SNP_ACTIVE))
+				strlcpy(vmmode, "SEV-SNP", sizeof(vmmode));
+			else if (ISSET(cpu_sev_guestmode, SEV_STAT_ES_ENABLED))
 				strlcpy(vmmode, "SEV-ES", sizeof(vmmode));
 			else if (ISSET(cpu_sev_guestmode, SEV_STAT_ENABLED))
 				strlcpy(vmmode, "SEV", sizeof(vmmode));
@@ -1331,6 +1335,7 @@ cpu_init_idt(void)
 	lidt(&region);
 }
 
+#ifdef AMDSEV
 uint64_t early_gdt[GDT_SIZE / 8];
 
 void
@@ -1362,6 +1367,7 @@ cpu_init_early_vctrap(paddr_t addr)
 	memset((void *)ghcb_vaddr, 0, 2 * PAGE_SIZE);
 	wrmsr(MSR_SEV_GHCB, ghcb_paddr);
 }
+#endif	/* AMDSEV */
 
 void
 cpu_init_extents(void)
@@ -1481,8 +1487,16 @@ init_x86_64(paddr_t first_avail)
 	struct region_descriptor region;
 	bios_memmap_t *bmp;
 	int x, ist;
-	uint64_t max_dm_size = ((uint64_t)512 * NUM_L4_SLOT_DIRECT) << 30;
+	uint64_t max_dm_size = DIRECT_MAP_SIZE;
+	extern vaddr_t pmap_direct_base, pmap_direct_end;
+	extern char pmap_direct_rand;
 
+	pmap_direct_base = (VA_SIGN_NEG((L4_SLOT_DIRECT * NBPD_L4)));
+	pmap_direct_base = (VA_SIGN_NEG((pmap_direct_base +
+	    ((pmap_direct_rand & DIRECT_MAP_START_MASK) * NBPD_L4))));
+	pmap_direct_end = pmap_direct_base + DIRECT_MAP_SIZE;
+
+#ifdef AMDSEV
 	/*
 	 * locore0 mapped 2 pages for use as GHCB before pmap is initialized.
 	 */
@@ -1492,6 +1506,7 @@ init_x86_64(paddr_t first_avail)
 	}
 	if (ISSET(cpu_sev_guestmode, SEV_STAT_ENABLED))
 		boothowto |= RB_COCOVM;
+#endif
 
 	/*
 	 * locore0 mapped 3 pages for use before the pmap is initialized
@@ -1637,8 +1652,8 @@ init_x86_64(paddr_t first_avail)
 		}
 
 		/*
-		 * The direct map is limited to 512GB * NUM_L4_SLOT_DIRECT of
-		 * memory, so discard anything above that.
+		 * The direct map is limited to DIRECT_MAP_SIZE of memory, so
+		 * discard anything above that.
 		 */
 		if (e1 >= max_dm_size) {
 			e1 = max_dm_size;

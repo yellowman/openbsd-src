@@ -1,6 +1,6 @@
-/* $OpenBSD: roff.c,v 1.277 2025/04/08 14:02:53 schwarze Exp $ */
+/* $OpenBSD: roff.c,v 1.280 2026/08/20 12:56:15 schwarze Exp $ */
 /*
- * Copyright (c) 2010-2015, 2017-2025 Ingo Schwarze <schwarze@openbsd.org>
+ * Copyright (c) 2010-2015, 2017-2026 Ingo Schwarze <schwarze@openbsd.org>
  * Copyright (c) 2008-2012, 2014 Kristaps Dzonsons <kristaps@bsd.lv>
  *
  * Permission to use, copy, modify, and distribute this software for any
@@ -187,6 +187,7 @@ static	int		 roff_cond_text(ROFF_ARGS);
 static	int		 roff_cond_sub(ROFF_ARGS);
 static	int		 roff_ds(ROFF_ARGS);
 static	int		 roff_ec(ROFF_ARGS);
+static	int		 roff_endtbl(struct roff *, int);
 static	int		 roff_eo(ROFF_ARGS);
 static	int		 roff_eqndelim(struct roff *, struct buf *, int);
 static	int		 roff_evalcond(struct roff *, int, char *, int *);
@@ -242,6 +243,7 @@ static	void		 roff_setstrn(struct roffkv **, const char *,
 				size_t, const char *, size_t, int);
 static	int		 roff_shift(ROFF_ARGS);
 static	int		 roff_so(ROFF_ARGS);
+static	int		 roff_stringup(ROFF_ARGS);
 static	int		 roff_tr(ROFF_ARGS);
 static	int		 roff_Dd(ROFF_ARGS);
 static	int		 roff_TE(ROFF_ARGS);
@@ -284,6 +286,7 @@ const char *__roff_name[MAN_MAX + 1] = {
 	"fzoom",	"gcolor",	"hc",		"hcode",
 	"hidechar",	"hla",		"hlm",		"hpf",
 	"hpfa",		"hpfcode",	"hw",		"hy",
+	"hydefault",
 	"hylang",	"hylen",	"hym",		"hypp",
 	"hys",		"ie",		"if",		"ig",
 	"index",	"it",		"itc",		"IX",
@@ -291,22 +294,25 @@ const char *__roff_name[MAN_MAX + 1] = {
 	"lc",		"lc_ctype",	"lds",		"length",
 	"letadj",	"lf",		"lg",		"lhang",
 	"linetabs",	"lnr",		"lnrf",		"lpfx",
-	"ls",		"lsm",		"lt",
-	"mediasize",	"minss",	"mk",		"mso",
+	"ls",		"lsm",		"lt",		"mediasize",
+	"minss",	"mk",		"mso",		"msoquiet",
 	"na",		"ne",		"nh",		"nhychar",
 	"nm",		"nn",		"nop",		"nr",
 	"nrf",		"nroff",	"ns",		"nx",
 	"open",		"opena",	"os",		"output",
-	"padj",		"papersize",	"pc",		"pev",
-	"pi",		"PI",		"pl",		"pm",
-	"pn",		"pnr",		"ps",
-	"psbb",		"pshape",	"pso",		"ptr",
-	"pvs",		"rchar",	"rd",		"recursionlimit",
+	"padj",		"papersize",	"pc",		"pchar",
+	"pcolor",	"pcomposite",	"pev",		"phw",
+	"pi",		"PI",		"pl",		"pline",
+	"pm",		"pn",		"pnr",		"ps",
+	"psbb",		"pshape",	"pso",		"pstream",
+	"ptr",		"pvs",		"pwh",
+	"rchar",	"rd",		"recursionlimit",
 	"return",	"rfschar",	"rhang",
 	"rm",		"rn",		"rnn",		"rr",
 	"rs",		"rt",		"schar",	"sentchar",
 	"shc",		"shift",	"sizes",	"so",
-	"spacewidth",	"special",	"spreadwarn",	"ss",
+	"soquiet",	"spacewidth",	"special",	"spreadwarn",
+	"ss",		"stringdown",	"stringup",
 	"sty",		"substring",	"sv",		"sy",
 	"T&",		"tc",		"TE",
 	"TH",		"tkf",		"tl",
@@ -478,6 +484,7 @@ static	struct roffmac	 roffs[TOKEN_NONE] = {
 	{ roff_line_ignore, NULL, NULL, 0 },  /* hpfcode */
 	{ roff_line_ignore, NULL, NULL, 0 },  /* hw */
 	{ roff_line_ignore, NULL, NULL, 0 },  /* hy */
+	{ roff_line_ignore, NULL, NULL, 0 },  /* hydefault */
 	{ roff_line_ignore, NULL, NULL, 0 },  /* hylang */
 	{ roff_line_ignore, NULL, NULL, 0 },  /* hylen */
 	{ roff_line_ignore, NULL, NULL, 0 },  /* hym */
@@ -513,6 +520,7 @@ static	struct roffmac	 roffs[TOKEN_NONE] = {
 	{ roff_line_ignore, NULL, NULL, 0 },  /* minss */
 	{ roff_line_ignore, NULL, NULL, 0 },  /* mk */
 	{ roff_insec, NULL, NULL, 0 },  /* mso */
+	{ roff_insec, NULL, NULL, 0 },  /* msoquiet */
 	{ roff_line_ignore, NULL, NULL, 0 },  /* na */
 	{ roff_line_ignore, NULL, NULL, 0 },  /* ne */
 	{ roff_line_ignore, NULL, NULL, 0 },  /* nh */
@@ -532,10 +540,15 @@ static	struct roffmac	 roffs[TOKEN_NONE] = {
 	{ roff_line_ignore, NULL, NULL, 0 },  /* padj */
 	{ roff_line_ignore, NULL, NULL, 0 },  /* papersize */
 	{ roff_line_ignore, NULL, NULL, 0 },  /* pc */
+	{ roff_line_ignore, NULL, NULL, 0 },  /* pchar */
+	{ roff_line_ignore, NULL, NULL, 0 },  /* pcolor */
+	{ roff_line_ignore, NULL, NULL, 0 },  /* pcomposite */
 	{ roff_line_ignore, NULL, NULL, 0 },  /* pev */
+	{ roff_line_ignore, NULL, NULL, 0 },  /* phw */
 	{ roff_insec, NULL, NULL, 0 },  /* pi */
 	{ roff_unsupp, NULL, NULL, 0 },  /* PI */
 	{ roff_line_ignore, NULL, NULL, 0 },  /* pl */
+	{ roff_line_ignore, NULL, NULL, 0 },  /* pline */
 	{ roff_line_ignore, NULL, NULL, 0 },  /* pm */
 	{ roff_line_ignore, NULL, NULL, 0 },  /* pn */
 	{ roff_line_ignore, NULL, NULL, 0 },  /* pnr */
@@ -543,8 +556,10 @@ static	struct roffmac	 roffs[TOKEN_NONE] = {
 	{ roff_unsupp, NULL, NULL, 0 },  /* psbb */
 	{ roff_unsupp, NULL, NULL, 0 },  /* pshape */
 	{ roff_insec, NULL, NULL, 0 },  /* pso */
+	{ roff_line_ignore, NULL, NULL, 0 },  /* pstream */
 	{ roff_line_ignore, NULL, NULL, 0 },  /* ptr */
 	{ roff_line_ignore, NULL, NULL, 0 },  /* pvs */
+	{ roff_line_ignore, NULL, NULL, 0 },  /* pwh */
 	{ roff_unsupp, NULL, NULL, 0 },  /* rchar */
 	{ roff_line_ignore, NULL, NULL, 0 },  /* rd */
 	{ roff_line_ignore, NULL, NULL, 0 },  /* recursionlimit */
@@ -563,10 +578,13 @@ static	struct roffmac	 roffs[TOKEN_NONE] = {
 	{ roff_shift, NULL, NULL, 0 },  /* shift */
 	{ roff_line_ignore, NULL, NULL, 0 },  /* sizes */
 	{ roff_so, NULL, NULL, 0 },  /* so */
+	{ roff_so, NULL, NULL, 0 },  /* soquiet */
 	{ roff_line_ignore, NULL, NULL, 0 },  /* spacewidth */
 	{ roff_line_ignore, NULL, NULL, 0 },  /* special */
 	{ roff_line_ignore, NULL, NULL, 0 },  /* spreadwarn */
 	{ roff_line_ignore, NULL, NULL, 0 },  /* ss */
+	{ roff_stringup, NULL, NULL, 0 },  /* stringdown */
+	{ roff_stringup, NULL, NULL, 0 },  /* stringup */
 	{ roff_line_ignore, NULL, NULL, 0 },  /* sty */
 	{ roff_unsupp, NULL, NULL, 0 },  /* substring */
 	{ roff_line_ignore, NULL, NULL, 0 },  /* sv */
@@ -1040,6 +1058,33 @@ roff_addtbl(struct roff_man *man, int line, struct tbl_node *tbl)
 		n->flags |= NODE_VALID | NODE_ENDED;
 		man->next = ROFF_NEXT_SIBLING;
 	}
+}
+
+static int
+roff_endtbl(struct roff *r, int still_open)
+{
+	struct roff_node	 *n;
+	int			  irc, space_allowed;
+
+	n = r->man->last;
+	while (n->prev != NULL && n->prev->span != NULL)
+		n = n->prev;
+
+	space_allowed = 1;
+	if (n->prev == NULL) {
+		switch (n->parent->tok) {
+		case MAN_LP:
+		case MAN_PP:
+		case MAN_P:
+			space_allowed = 0;
+			break;
+		default:
+			break;
+		}
+	}
+	irc = tbl_end(r->tbl, space_allowed, still_open);
+	r->tbl = NULL;
+	return irc;
 }
 
 void
@@ -1968,10 +2013,8 @@ roff_endparse(struct roff *r)
 		r->eqn = NULL;
 	}
 
-	if (r->tbl != NULL) {
-		tbl_end(r->tbl, 1);
-		r->tbl = NULL;
-	}
+	if (r->tbl != NULL)
+		roff_endtbl(r, 1);
 }
 
 /*
@@ -3291,19 +3334,15 @@ static int
 roff_TE(ROFF_ARGS)
 {
 	r->man->flags &= ~ROFF_NONOFILL;
-	if (r->tbl == NULL) {
+	if (r->tbl == NULL)
 		mandoc_msg(MANDOCERR_BLK_NOTOPEN, ln, ppos, "TE");
-		return ROFF_IGN;
-	}
-	if (tbl_end(r->tbl, 0) == 0) {
-		r->tbl = NULL;
+	else if (roff_endtbl(r, 0) == 0) {
 		free(buf->buf);
 		buf->buf = mandoc_strdup(".sp");
 		buf->sz = 4;
 		*offs = 0;
 		return ROFF_REPARSE;
 	}
-	r->tbl = NULL;
 	return ROFF_IGN;
 }
 
@@ -3433,7 +3472,7 @@ roff_TS(ROFF_ARGS)
 {
 	if (r->tbl != NULL) {
 		mandoc_msg(MANDOCERR_BLK_BROKEN, ln, ppos, "TS breaks TS");
-		tbl_end(r->tbl, 0);
+		roff_endtbl(r, 0);
 	}
 	r->man->flags |= ROFF_NONOFILL;
 	r->tbl = tbl_alloc(ppos, ln, r->last_tbl);
@@ -3941,6 +3980,33 @@ roff_so(ROFF_ARGS)
 
 	*offs = pos;
 	return ROFF_SO;
+}
+
+static int
+roff_stringup(ROFF_ARGS)
+{
+	const char	*name;
+	char		*cp;
+	size_t		 namesz;
+	int		 deftype;
+
+	cp = buf->buf + pos;
+	name = cp;
+	namesz = roff_getname(&cp, ln, pos);
+	if (*cp != '\0')
+		mandoc_msg(MANDOCERR_ARG_EXCESS, ln, (int)(cp - buf->buf),
+		    "%s ... %s", roff_name[tok], cp);
+	deftype = ROFFDEF_USER;
+	if ((cp = (char *)roff_getstrn(r, name, namesz, &deftype)) != NULL) {
+		while (*cp != '\0') {
+			if (tok == ROFF_stringup)
+				*cp = toupper(*cp);
+			else
+				*cp = tolower(*cp);
+			cp++;
+		}
+	}
+	return ROFF_IGN;
 }
 
 /* --- user defined strings and macros ------------------------------------ */

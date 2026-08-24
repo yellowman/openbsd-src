@@ -1,4 +1,4 @@
-/*	$OpenBSD: proc.c,v 1.39 2024/11/21 13:38:45 claudio Exp $	*/
+/*	$OpenBSD: proc.c,v 1.45 2026/08/03 11:27:19 claudio Exp $	*/
 
 /*
  * Copyright (c) 2010 - 2016 Reyk Floeter <reyk@openbsd.org>
@@ -17,13 +17,14 @@
  * OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
  */
 
+#include <sys/types.h>
+#include <sys/queue.h>
 #include <sys/socket.h>
 #include <sys/wait.h>
 
 #include <fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>
-#include <stdint.h>
 #include <unistd.h>
 #include <string.h>
 #include <errno.h>
@@ -36,12 +37,14 @@
 #include "log.h"
 #include "snmpd.h"
 
+enum privsep_procid privsep_process;
+
 void	 proc_exec(struct privsep *, struct privsep_proc *, unsigned int, int,
-	    char **);
+    char **);
 void	 proc_setup(struct privsep *, struct privsep_proc *, unsigned int);
 void	 proc_open(struct privsep *, int, int);
 void	 proc_accept(struct privsep *, int, enum privsep_procid,
-	    unsigned int);
+    unsigned int);
 void	 proc_close(struct privsep *);
 void	 proc_shutdown(struct privsep_proc *);
 void	 proc_sig_handler(int, short, void *);
@@ -70,11 +73,11 @@ void
 proc_exec(struct privsep *ps, struct privsep_proc *procs, unsigned int nproc,
     int argc, char **argv)
 {
-	unsigned int		 proc, nargc, i, proc_i;
+	unsigned int		  proc, nargc, i, proc_i;
 	char			**nargv;
-	struct privsep_proc	*p;
-	char			 num[32];
-	int			 fd;
+	struct privsep_proc	 *p;
+	char			  num[32];
+	int			  fd;
 
 	/* Prepare the new process argv. */
 	nargv = calloc(argc + 5, sizeof(char *));
@@ -93,7 +96,7 @@ proc_exec(struct privsep *ps, struct privsep_proc *procs, unsigned int nproc,
 	/* Point process instance arg to stack and copy the original args. */
 	nargv[nargc++] = "-I";
 	nargv[nargc++] = num;
-	for (i = 1; i < (unsigned int) argc; i++)
+	for (i = 1; i < (unsigned int)argc; i++)
 		nargv[nargc++] = argv[i];
 
 	nargv[nargc] = NULL;
@@ -119,8 +122,8 @@ proc_exec(struct privsep *ps, struct privsep_proc *procs, unsigned int nproc,
 			case 0:
 				/* Prepare parent socket. */
 				if (fd != PROC_PARENT_SOCK_FILENO) {
-					if (dup2(fd, PROC_PARENT_SOCK_FILENO)
-					    == -1)
+					if (dup2(fd, PROC_PARENT_SOCK_FILENO) ==
+					    -1)
 						fatal("dup2");
 				} else if (fcntl(fd, F_SETFD, 0) == -1)
 					fatal("fcntl");
@@ -139,14 +142,18 @@ proc_exec(struct privsep *ps, struct privsep_proc *procs, unsigned int nproc,
 }
 
 void
-proc_connect(struct privsep *ps)
+proc_connect(struct privsep *ps, void (*connected)(struct privsep *))
 {
 	struct imsgev		*iev;
 	unsigned int		 src, dst, inst;
 
 	/* Don't distribute any sockets if we are not really going to run. */
-	if (ps->ps_noaction)
+	if (ps->ps_noaction) {
+		if (connected != NULL)
+			connected(ps);
 		return;
+	}
+	ps->ps_connected = connected;
 
 	for (dst = 0; dst < PROC_MAX; dst++) {
 		/* We don't communicate with ourselves. */
@@ -157,7 +164,7 @@ proc_connect(struct privsep *ps)
 			iev = &ps->ps_ievs[dst][inst];
 			if (imsgbuf_init(&iev->ibuf,
 			    ps->ps_pp->pp_pipes[dst][inst]) == -1)
-				fatal("imsgbuf_init");
+				fatal("%s: imsgbuf_init", __func__);
 			imsgbuf_allow_fdpass(&iev->ibuf);
 			event_set(&iev->ev, iev->ibuf.fd, iev->events,
 			    iev->handler, iev->data);
@@ -174,6 +181,25 @@ proc_connect(struct privsep *ps)
 
 			proc_open(ps, src, dst);
 		}
+
+	/*
+	 * Finally, send a ready message to everyone:
+	 * When this message is processed by the receiver, it has
+	 * already processed all IMSG_CTL_PROCFD messages and all
+	 * pipes are ready.
+	 */
+	for (dst = 0; dst < PROC_MAX; dst++) {
+		if (dst == PROC_PARENT)
+			continue;
+		for (inst = 0; inst < ps->ps_instances[dst]; inst++) {
+			if (proc_compose_imsg(ps, dst, inst, IMSG_CTL_PROCREADY,
+			    -1, -1, NULL, 0) == -1)
+				fatal("%s: proc_compose_imsg", __func__);
+			ps->ps_connecting++;
+			DPRINTF("%s: #%d %s %d", __func__,
+			    ps->ps_connecting, ps->ps_title[dst], inst + 1);
+		}
+	}
 }
 
 void
@@ -248,6 +274,11 @@ proc_accept(struct privsep *ps, int fd, enum privsep_procid dst,
 	struct privsep_pipes	*pp = ps->ps_pp;
 	struct imsgev		*iev;
 
+	if (fd == -1 || dst < 0 || dst >= PROC_MAX ||
+	    n >= ps->ps_instances[dst])
+		fatalx("%s: invalid descriptor target %d instance %u",
+		    __func__, dst, n);
+
 	if (ps->ps_ievs[dst] == NULL) {
 #if DEBUG > 1
 		log_debug("%s: %s src %d %d to dst %d %d not connected",
@@ -259,16 +290,13 @@ proc_accept(struct privsep *ps, int fd, enum privsep_procid dst,
 		return;
 	}
 
-	if (pp->pp_pipes[dst][n] != -1) {
-		log_warnx("%s: duplicated descriptor", __func__);
-		close(fd);
-		return;
-	} else
-		pp->pp_pipes[dst][n] = fd;
+	if (pp->pp_pipes[dst][n] != -1)
+		fatalx("%s: duplicated descriptor", __func__);
+	pp->pp_pipes[dst][n] = fd;
 
 	iev = &ps->ps_ievs[dst][n];
 	if (imsgbuf_init(&iev->ibuf, fd) == -1)
-		fatal("imsgbuf_init");
+		fatal("%s: imsgbuf_init", __func__);
 	imsgbuf_allow_fdpass(&iev->ibuf);
 	event_set(&iev->ev, iev->ibuf.fd, iev->events, iev->handler, iev->data);
 	event_add(&iev->ev, NULL);
@@ -553,11 +581,12 @@ proc_run(struct privsep *ps, struct privsep_proc *p,
 
 	proc_setup(ps, procs, nproc);
 	proc_accept(ps, PROC_PARENT_SOCK_FILENO, PROC_PARENT, 0);
+
 	DPRINTF("%s: %s %d/%d, pid %d", __func__, p->p_title,
 	    ps->ps_instance + 1, ps->ps_instances[p->p_id], getpid());
 
-	if (run != NULL)
-		run(ps, p, arg);
+	ps->ps_run = run;
+	ps->ps_arg = arg;
 
 	event_dispatch();
 
@@ -572,8 +601,8 @@ proc_dispatch(int fd, short event, void *arg)
 	struct privsep		*ps = p->p_ps;
 	struct imsgbuf		*ibuf;
 	struct imsg		 imsg;
-	ssize_t			 n;
-	int			 verbose;
+	int			 n;
+	int			 ver;
 	const char		*title;
 	struct privsep_fd	 pf;
 
@@ -581,9 +610,11 @@ proc_dispatch(int fd, short event, void *arg)
 	ibuf = &iev->ibuf;
 
 	if (event & EV_READ) {
-		if ((n = imsgbuf_read(ibuf)) == -1)
+		switch (imsgbuf_read(ibuf)) {
+		case -1:
 			fatal("%s: imsgbuf_read", __func__);
-		if (n == 0) {
+			break;
+		case 0:
 			/* this pipe is dead, so remove the event handler */
 			event_del(&iev->ev);
 			event_loopexit(NULL);
@@ -593,8 +624,7 @@ proc_dispatch(int fd, short event, void *arg)
 
 	if (event & EV_WRITE) {
 		if (imsgbuf_write(ibuf) == -1) {
-			if (errno == EPIPE) {
-				/* this pipe is dead, remove the handler */
+			if (errno == EPIPE) {	/* Connection closed. */
 				event_del(&iev->ev);
 				event_loopexit(NULL);
 				return;
@@ -604,15 +634,16 @@ proc_dispatch(int fd, short event, void *arg)
 	}
 
 	for (;;) {
-		if ((n = imsg_get(ibuf, &imsg)) == -1)
-			fatal("%s: imsg_get", __func__);
+		if ((n = imsgbuf_get(ibuf, &imsg)) == -1)
+			fatal("%s: imsgbuf_get", __func__);
 		if (n == 0)
 			break;
 
 #if DEBUG > 1
 		log_debug("%s: %s %d got imsg %d peerid %d from %s %d",
 		    __func__, title, ps->ps_instance + 1,
-		    imsg.hdr.type, imsg.hdr.peerid, p->p_title, imsg.hdr.pid);
+		    imsg_get_type(&imsg), imsg_get_id(&imsg),
+		    p->p_title, imsg_get_pid(&imsg));
 #endif
 
 		/*
@@ -627,24 +658,62 @@ proc_dispatch(int fd, short event, void *arg)
 		/*
 		 * Generic message handling
 		 */
-		switch (imsg.hdr.type) {
+		switch (imsg_get_type(&imsg)) {
 		case IMSG_CTL_VERBOSE:
-			IMSG_SIZE_CHECK(&imsg, &verbose);
-			memcpy(&verbose, imsg.data, sizeof(verbose));
-			log_setverbose(verbose);
+			if (imsg_get_data(&imsg, &ver, sizeof(ver)) == -1)
+				fatalx("%s: imsg_get_data", __func__);
+
+			log_setverbose(ver);
 			break;
 		case IMSG_CTL_PROCFD:
-			IMSG_SIZE_CHECK(&imsg, &pf);
-			memcpy(&pf, imsg.data, sizeof(pf));
+			if (p->p_id != PROC_PARENT || ps->ps_run == NULL) {
+				fatalx("%s: received unexpected "
+				    "IMSG_CTL_PROCFD from %s",
+				    __func__, p->p_title);
+			}
+
+			if (imsg_get_data(&imsg, &pf, sizeof(pf)) == -1)
+				fatalx("%s: imsg_get_data", __func__);
+
 			proc_accept(ps, imsg_get_fd(&imsg), pf.pf_procid,
 			    pf.pf_instance);
+			break;
+		case IMSG_CTL_PROCREADY:
+			DPRINTF("%s: ready-%s: #%d %s %d -> %s %d", __func__,
+			    p->p_id == PROC_PARENT ? "req" : "ack",
+			    ps->ps_connecting, p->p_title, imsg_get_pid(&imsg),
+			    title, ps->ps_instance + 1);
+			if (p->p_id == PROC_PARENT) {
+				if (ps->ps_run != NULL) {
+					ps->ps_run(ps, p, ps->ps_arg);
+					ps->ps_run = NULL;
+				}
+				/* ack that we are ready */
+				if (proc_compose_imsg(ps, PROC_PARENT, 0,
+				    IMSG_CTL_PROCREADY, -1, -1, NULL, 0) == -1)
+					fatal("%s: proc_compose_imsg",
+					    __func__);
+			} else {
+				/* parent received ack */
+				if (ps->ps_connecting == 0)
+					fatalx("%s: wrong acks", __func__);
+				if (ps->ps_instance != 0)
+					fatalx("%s: wrong instance %d",
+					    __func__, ps->ps_instance);
+				if (--ps->ps_connecting == 0) {
+					log_debug("%s: all connected",
+					    __func__);
+					if (ps->ps_connected != NULL)
+						ps->ps_connected(ps);
+				}
+			}
 			break;
 		default:
 			fatalx("%s: %s %d got invalid imsg %d peerid %d "
 			    "from %s %d",
 			    __func__, title, ps->ps_instance + 1,
-			    imsg.hdr.type, imsg.hdr.peerid,
-			    p->p_title, imsg.hdr.pid);
+			    imsg_get_type(&imsg), imsg_get_id(&imsg),
+			    p->p_title, imsg_get_pid(&imsg));
 		}
 		imsg_free(&imsg);
 	}
@@ -760,6 +829,20 @@ proc_composev(struct privsep *ps, enum privsep_procid id,
     uint16_t type, const struct iovec *iov, int iovcnt)
 {
 	return (proc_composev_imsg(ps, id, -1, type, -1, -1, iov, iovcnt));
+}
+
+void
+proc_forward_imsg(struct privsep *ps, struct imsg *imsg,
+    enum privsep_procid id)
+{
+	int	 m, n = -1;
+
+	proc_range(ps, id, &n, &m);
+	for (; n < m; n++) {
+		if (imsg_forward(&ps->ps_ievs[id][n].ibuf, imsg) == -1)
+			fatal("%s: imsg_forward", __func__);
+		imsg_event_add(&ps->ps_ievs[id][n]);
+	}
 }
 
 struct imsgbuf *

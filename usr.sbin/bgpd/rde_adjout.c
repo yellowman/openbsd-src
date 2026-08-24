@@ -1,4 +1,4 @@
-/*	$OpenBSD: rde_adjout.c,v 1.16 2026/03/17 09:29:29 claudio Exp $ */
+/*	$OpenBSD: rde_adjout.c,v 1.22 2026/07/15 11:59:27 claudio Exp $ */
 
 /*
  * Copyright (c) 2003, 2004, 2025 Claudio Jeker <claudio@openbsd.org>
@@ -412,15 +412,13 @@ static void	 adjout_prefix_unlink(struct adjout_prefix *,
 
 static struct adjout_prefix	*adjout_prefix_alloc(struct pt_entry *,
 				    uint32_t);
-static void			 adjout_prefix_free(struct pt_entry *,
-				    struct adjout_prefix *);
 
 static inline uint32_t
 adjout_prefix_index(struct pt_entry *pte, struct adjout_prefix *p)
 {
 	ptrdiff_t idx = p - pte->adjout;
 
-	if (idx < 0 || idx > pte->adjoutlen)
+	if (idx < 0 || (size_t)idx > pte->adjoutlen)
 		fatalx("corrupt pte adjout list");
 
 	return idx;
@@ -479,21 +477,15 @@ adjout_prefix_with_attrs(struct pt_entry *pte, uint32_t path_id_tx,
  * Returns NULL if not found.
  */
 struct adjout_prefix *
-adjout_prefix_first(struct rde_peer *peer, struct pt_entry *pte)
+adjout_prefix_first(struct pt_entry *pte, uint32_t bid)
 {
 	struct adjout_prefix *p;
 	uint32_t i;
-	int has_add_path = 0;
-
-	if (peer_has_add_path(peer, pte->aid, CAPA_AP_SEND))
-		has_add_path = 1;
 
 	for (i = 0; i < pte->adjoutlen; i++) {
 		p = &pte->adjout[i];
-		if (bitmap_test(&p->peermap, peer->adjout_bid))
+		if (bitmap_test(&p->peermap, bid))
 			return p;
-		if (!has_add_path && p->path_id_tx != 0)
-			return NULL;
 	}
 
 	return NULL;
@@ -503,14 +495,11 @@ adjout_prefix_first(struct rde_peer *peer, struct pt_entry *pte)
  * Return next prefix for peer after last.
  */
 struct adjout_prefix *
-adjout_prefix_next(struct rde_peer *peer, struct pt_entry *pte,
+adjout_prefix_next(struct pt_entry *pte, uint32_t bid,
     struct adjout_prefix *last)
 {
 	struct adjout_prefix *p;
 	uint32_t i;
-
-	if (!peer_has_add_path(peer, pte->aid, CAPA_AP_SEND))
-		return NULL;
 
 	i = adjout_prefix_index(pte, last);
 	for (; i < pte->adjoutlen; i++)
@@ -518,7 +507,7 @@ adjout_prefix_next(struct rde_peer *peer, struct pt_entry *pte,
 			break;
 	for (; i < pte->adjoutlen; i++) {
 		p = &pte->adjout[i];
-		if (bitmap_test(&p->peermap, peer->adjout_bid))
+		if (bitmap_test(&p->peermap, bid))
 			return p;
 	}
 
@@ -527,10 +516,12 @@ adjout_prefix_next(struct rde_peer *peer, struct pt_entry *pte,
 
 /*
  * Put a prefix from the Adj-RIB-Out onto the update queue.
+ * If force_send is set, ensure an UPDATE is sent in any case to the peer.
  */
 void
 adjout_prefix_update(struct adjout_prefix *p, struct rde_peer *peer,
-    struct filterstate *state, struct pt_entry *pte, uint32_t path_id_tx)
+    struct filterstate *state, struct pt_entry *pte, uint32_t path_id_tx,
+    int force_send)
 {
 	struct adjout_attr *attrs;
 
@@ -552,6 +543,8 @@ adjout_prefix_update(struct adjout_prefix *p, struct rde_peer *peer,
 		    attrs->communities) &&
 		    path_equal(&state->aspath, attrs->aspath)) {
 			/* nothing changed */
+			if (force_send && peer_is_up(peer))
+				pend_prefix_add(peer, attrs, pte, path_id_tx);
 			return;
 		}
 
@@ -571,15 +564,16 @@ adjout_prefix_update(struct adjout_prefix *p, struct rde_peer *peer,
 /*
  * Withdraw a prefix from the Adj-RIB-Out, this unlinks the aspath but leaves
  * the prefix in the RIB linked to the peer withdraw list.
+ * If skip_send is set there is no need to send a withdraw to the peer.
  */
 void
 adjout_prefix_withdraw(struct rde_peer *peer, struct pt_entry *pte,
-    struct adjout_prefix *p)
+    struct adjout_prefix *p, int skip_send)
 {
 	if (bitmap_test(&p->peermap, peer->adjout_bid) == 0)
 		fatalx("%s: king bula is unhappy", __func__);
 
-	if (peer_is_up(peer))
+	if (peer_is_up(peer) && !skip_send)
 		pend_prefix_add(peer, NULL, pte, p->path_id_tx);
 
 	adjout_prefix_unlink(p, pte, peer);
@@ -596,10 +590,6 @@ static struct pt_entry *
 prefix_restart(struct rib_context *ctx)
 {
 	struct pt_entry *pte = NULL;
-	struct rde_peer *peer;
-
-	if ((peer = peer_get(ctx->ctx_id)) == NULL)
-		return NULL;
 
 	/* be careful when this is the last reference to pte */
 	if (ctx->ctx_pt != NULL) {
@@ -624,10 +614,11 @@ adjout_prefix_dump_r(struct rib_context *ctx)
 {
 	struct pt_entry *pte, *next;
 	struct adjout_prefix *p;
-	struct rde_peer *peer;
 	unsigned int i;
+	uint32_t adjout_bid = ctx->ctx_id;
 
-	if ((peer = peer_get(ctx->ctx_id)) == NULL)
+	/* no adjout_bid -> no adj-rib-out */
+	if (adjout_bid == 0)
 		goto done;
 
 	if (ctx->ctx_pt == NULL && ctx->ctx_subtree.aid == AID_UNSPEC)
@@ -653,13 +644,14 @@ adjout_prefix_dump_r(struct rib_context *ctx)
 			ctx->ctx_pt = pt_ref(pte);
 			return;
 		}
-		p = adjout_prefix_first(peer, pte);
-		if (p == NULL)
-			continue;
-		ctx->ctx_prefix_call(peer, pte, p, ctx->ctx_arg);
+		for (p = adjout_prefix_first(pte, adjout_bid);
+		    p != NULL;
+		    p = adjout_prefix_next(pte, adjout_bid, p))
+			ctx->ctx_prefix_call(pte, p, adjout_bid, ctx->ctx_arg);
+		adjout_prefix_collect(pte);
 	}
 
-done:
+ done:
 	if (ctx->ctx_done)
 		ctx->ctx_done(ctx->ctx_arg, ctx->ctx_aid);
 	LIST_REMOVE(ctx, entry);
@@ -669,8 +661,7 @@ done:
 int
 adjout_prefix_dump_new(struct rde_peer *peer, uint8_t aid,
     unsigned int count, void *arg,
-    void (*upcall)(struct rde_peer *, struct pt_entry *,
-	struct adjout_prefix *, void *),
+    void (*upcall)(struct pt_entry *, struct adjout_prefix *, uint32_t, void *),
     void (*done)(void *, uint8_t),
     int (*throttle)(void *))
 {
@@ -678,7 +669,7 @@ adjout_prefix_dump_new(struct rde_peer *peer, uint8_t aid,
 
 	if ((ctx = calloc(1, sizeof(*ctx))) == NULL)
 		return -1;
-	ctx->ctx_id = peer->conf.id;
+	ctx->ctx_id = peer->adjout_bid;
 	ctx->ctx_aid = aid;
 	ctx->ctx_count = count;
 	ctx->ctx_arg = arg;
@@ -698,8 +689,7 @@ adjout_prefix_dump_new(struct rde_peer *peer, uint8_t aid,
 int
 adjout_prefix_dump_subtree(struct rde_peer *peer, struct bgpd_addr *subtree,
     uint8_t subtreelen, unsigned int count, void *arg,
-    void (*upcall)(struct rde_peer *, struct pt_entry *,
-	struct adjout_prefix *, void *),
+    void (*upcall)(struct pt_entry *, struct adjout_prefix *, uint32_t, void *),
     void (*done)(void *, uint8_t),
     int (*throttle)(void *))
 {
@@ -707,7 +697,7 @@ adjout_prefix_dump_subtree(struct rde_peer *peer, struct bgpd_addr *subtree,
 
 	if ((ctx = calloc(1, sizeof(*ctx))) == NULL)
 		return -1;
-	ctx->ctx_id = peer->conf.id;
+	ctx->ctx_id = peer->adjout_bid;
 	ctx->ctx_aid = subtree->aid;
 	ctx->ctx_count = count;
 	ctx->ctx_arg = arg;
@@ -767,8 +757,35 @@ adjout_prefix_unlink(struct adjout_prefix *p, struct pt_entry *pte,
 		adjout_attr_unref(p->attrs);
 		p->attrs = NULL;
 
-		adjout_prefix_free(pte, p);
+		bitmap_reset(&p->peermap);
 	}
+}
+
+/* remove all tombstone entries from the pte adjout array */
+void
+adjout_prefix_collect(struct pt_entry *pte)
+{
+	uint32_t i, j;
+
+	/* collect all tombstones and shift array forward */
+	for (i = 0, j = 0; i + j < pte->adjoutlen; i++) {
+		for (; i + j < pte->adjoutlen; j++) {
+			if (pte->adjout[i + j].attrs != NULL)
+				break;
+			/* reset bitmap just to be sure */
+			bitmap_reset(&pte->adjout[i + j].peermap);
+		}
+		if (i + j == pte->adjoutlen)
+			break;
+		pte->adjout[i] = pte->adjout[i + j];
+	}
+
+	/* TODO shrink array if X% empty */
+	if (i < pte->adjoutlen)
+		memset(&pte->adjout[i], 0, sizeof(pte->adjout[0]) * j);
+	pte->adjoutlen = i;
+
+	rdemem.adjout_prefix_cnt -= j;
 }
 
 static void
@@ -822,27 +839,6 @@ adjout_prefix_alloc(struct pt_entry *pte, uint32_t path_id_tx)
 	return p;
 }
 
-/* remove an entry from the pte adjout array */
-static void
-adjout_prefix_free(struct pt_entry *pte, struct adjout_prefix *p)
-{
-	uint32_t i, idx;
-
-	bitmap_reset(&p->peermap);
-
-	idx = adjout_prefix_index(pte, p);
-	for (i = idx + 1; i < pte->adjoutlen; i++)
-		pte->adjout[i - 1] = pte->adjout[i];
-
-	p = &pte->adjout[pte->adjoutlen - 1];
-	memset(p, 0, sizeof(*p));
-	pte->adjoutlen--;
-
-	/* TODO shrink array if X% empty */
-
-	rdemem.adjout_prefix_cnt--;
-}
-
 void
 adjout_peer_init(struct rde_peer *peer)
 {
@@ -861,7 +857,7 @@ adjout_peer_flush_pending(struct rde_peer *peer)
 {
 	struct pend_attr *pa, *npa;
 	struct pend_prefix *pp, *npp;
-	uint8_t aid;
+	u_int aid;
 
 	for (aid = AID_MIN; aid < AID_MAX; aid++) {
 		TAILQ_FOREACH_SAFE(pp, &peer->withdraws[aid], entry, npp) {

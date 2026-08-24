@@ -1,4 +1,4 @@
-.\" $OpenBSD: bgpd.conf.5,v 1.252 2026/01/18 16:38:02 schwarze Exp $
+.\" $OpenBSD: bgpd.conf.5,v 1.255 2026/06/02 08:40:02 claudio Exp $
 .\"
 .\" Copyright (c) 2004 Claudio Jeker <claudio@openbsd.org>
 .\" Copyright (c) 2003, 2004 Henning Brauer <henning@openbsd.org>
@@ -16,7 +16,7 @@
 .\" ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
 .\" OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
 .\"
-.Dd $Mdocdate: January 18 2026 $
+.Dd $Mdocdate: June 2 2026 $
 .Dt BGPD.CONF 5
 .Os
 .Sh NAME
@@ -603,7 +603,7 @@ Bind to the specific IP address before opening the TCP connection to the
 .Em rtr
 server.
 .Pp
-.Ic min-version Ar number
+.It Ic min-version Ar number
 Require a minimal RTR version of
 .Ar number .
 To ensure that ASPA records are synchronised over RTR a minimal version
@@ -1098,7 +1098,7 @@ If
 is set, the session will only be established if the neighbor also announces
 the capability.
 The default is
-.Ic yes .
+.Ic enforce .
 .Pp
 .It Xo
 .Ic announce enhanced refresh
@@ -1148,6 +1148,8 @@ is set, the session will only be established if the neighbor also announces
 the capability.
 The default is
 .Ic no .
+Currently enabling this capability requires setting
+.Ic fib-update no .
 .Pp
 .It Xo
 .Ic announce graceful notification

@@ -1,4 +1,4 @@
-/*	$OpenBSD: imsg-buffer.c,v 1.36 2025/08/25 08:29:49 claudio Exp $	*/
+/*	$OpenBSD: imsg-buffer.c,v 1.41 2026/07/30 17:55:33 claudio Exp $	*/
 
 /*
  * Copyright (c) 2023 Claudio Jeker <claudio@openbsd.org>
@@ -378,10 +378,19 @@ ibuf_set_maxsize(struct ibuf *buf, size_t max)
 		errno = EINVAL;
 		return (-1);
 	}
-	if (max > buf->max) {
+	if (max > buf->max) {	/* can only shrink the buffer */
 		errno = ERANGE;
 		return (-1);
 	}
+	if (buf->wpos > max) {	/* cannot shrink below current wpos */
+		errno = ERANGE;
+		return (-1);
+	}
+	if (buf->size > max) {	/* clear excess memory */
+		explicit_bzero(buf->buf + max, buf->size - max);
+		buf->size = max;
+	}
+	
 	buf->max = max;
 	return (0);
 }
@@ -549,6 +558,8 @@ ibuf_get_string(struct ibuf *buf, size_t len)
 int
 ibuf_get_strbuf(struct ibuf *buf, char *str, size_t len)
 {
+	size_t n;
+
 	if (len == 0) {
 		errno = EINVAL;
 		return (-1);
@@ -556,11 +567,14 @@ ibuf_get_strbuf(struct ibuf *buf, char *str, size_t len)
 
 	if (ibuf_get(buf, str, len) == -1)
 		return -1;
-	if (str[len - 1] != '\0') {
-		str[len - 1] = '\0';
+	if ((n = strnlen(str, len)) == len) {
+		str[len - 1] = '\0';	/* just to be safe */
 		errno = EOVERFLOW;
 		return -1;
 	}
+	/* clear rest of the buffer */
+	memset(str + n, 0, len - n);
+
 	return 0;
 }
 
@@ -732,7 +746,7 @@ ibuf_write(int fd, struct msgbuf *msgbuf)
 		if (errno == EINTR)
 			goto again;
 		if (errno == EAGAIN || errno == ENOBUFS)
-			/* lets retry later again */
+			/* let's retry later again */
 			return (0);
 		return (-1);
 	}
@@ -791,7 +805,7 @@ msgbuf_write(int fd, struct msgbuf *msgbuf)
 		if (errno == EINTR)
 			goto again;
 		if (errno == EAGAIN || errno == ENOBUFS)
-			/* lets retry later again */
+			/* let's retry later again */
 			return (0);
 		return (-1);
 	}
@@ -880,7 +894,7 @@ ibuf_read(int fd, struct msgbuf *msgbuf)
 		if (errno == EINTR)
 			goto again;
 		if (errno == EAGAIN)
-			/* lets retry later again */
+			/* let's retry later again */
 			return (1);
 		return (-1);
 	}
@@ -924,16 +938,20 @@ again:
 	if ((n = recvmsg(fd, &msg, 0)) == -1) {
 		if (errno == EINTR)
 			goto again;
-		if (errno == EMSGSIZE)
+		if (errno == EMSGSIZE) {
 			/*
 			 * Not enough fd slots: fd passing failed, retry
 			 * to receive the message without fd.
 			 * imsg_get_fd() will return -1 in that case.
 			 */
+			msg.msg_control = NULL;
+			msg.msg_controllen = 0;
 			goto again;
-		if (errno == EAGAIN)
-			/* lets retry later again */
+		}
+		if (errno == EAGAIN) {
+			/* let's retry later again */
 			return (1);
+		}
 		return (-1);
 	}
 	if (n == 0)	/* connection closed */

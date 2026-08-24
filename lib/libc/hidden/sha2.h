@@ -1,4 +1,4 @@
-/*	$OpenBSD: sha2.h,v 1.2 2016/09/03 16:25:03 tedu Exp $	*/
+/*	$OpenBSD: sha2.h,v 1.7 2026/08/21 16:28:25 jsing Exp $	*/
 /*
  * Copyright (c) 2015 Philip Guenther <guenther@openbsd.org>
  *
@@ -14,12 +14,27 @@
  * ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
  * OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
  */
-/*	$OpenBSD: sha2.h,v 1.2 2016/09/03 16:25:03 tedu Exp $	*/
 
 #ifndef _LIBC_SHA2_H
 #define _LIBC_SHA2_H
 
 #include_next <sha2.h>
+
+__BEGIN_HIDDEN_DECLS
+void __sha256_block(uint32_t state[8], const uint8_t *in, size_t num);
+void __sha256_block_generic(uint32_t state[8], const uint8_t *in, size_t num);
+void __sha512_block(uint64_t state[8], const uint8_t *in, size_t num);
+void __sha512_block_generic(uint64_t state[8], const uint8_t *in, size_t num);
+
+#ifdef __aarch64__
+void __sha256_block_ce(uint32_t state[8], const uint8_t *in, size_t num);
+void __sha512_block_ce(uint64_t state[8], const uint8_t *in, size_t num);
+#endif
+
+#ifdef __amd64__
+void __sha256_block_shani(uint32_t state[8], const uint8_t *in, size_t num);
+#endif
+__END_HIDDEN_DECLS
 
 PROTO_NORMAL(SHA224Data);
 PROTO_NORMAL(SHA224End);

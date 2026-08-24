@@ -1,4 +1,4 @@
-/* $OpenBSD: fuse.c,v 1.59 2026/03/10 16:20:57 deraadt Exp $ */
+/* $OpenBSD: fuse.c,v 1.61 2026/07/23 04:50:38 helg Exp $ */
 /*
  * Copyright (c) 2013 Sylvestre Gallon <ccna.syl@gmail.com>
  *
@@ -82,6 +82,7 @@ static struct fuse_opt fuse_lib_opts[] = {
 	FUSE_OPT_KEY("fmask=%o",		KEY_STUB),
 	FUSE_LIB_OPT("umask=",			set_mode),
 	FUSE_LIB_OPT("umask=%o",		umask),
+	FUSE_OPT_KEY("max_write=",		FUSE_OPT_KEY_KEEP),
 	FUSE_OPT_END
 };
 
@@ -98,7 +99,6 @@ static struct fuse_opt fuse_mount_opts[] = {
 	FUSE_MOUNT_OPT("fsname=%s",		fsname),
 	FUSE_MOUNT_OPT("max_read=%u",		max_read),
 	FUSE_OPT_KEY("max_readahead",		KEY_STUB),
-	FUSE_OPT_KEY("max_write",		KEY_STUB),
 	FUSE_MOUNT_OPT("noatime",		noatime),
 	FUSE_MOUNT_OPT("nonempty",		nonempty),
 	FUSE_MOUNT_OPT("-r",			rdonly),
@@ -135,8 +135,11 @@ fuse_mount(const char *dir, struct fuse_args *args)
 		return (NULL);
 
 	mnt_dir = realpath(dir, NULL);
-	if (mnt_dir == NULL)
+	if (mnt_dir == NULL) {
+		fprintf(stderr, "fuse: realpath %s: %s\n", dir,
+		    strerror(errno));
 		goto bad;
+	}
 
 	if ((fc->fd = open("/dev/fuse0", O_RDWR|O_CLOEXEC)) == -1) {
 		perror("/dev/fuse0");
@@ -176,7 +179,7 @@ fuse_mount(const char *dir, struct fuse_args *args)
 			errcause = strerror(errno);
 			break;
 		}
-		fprintf(stderr, "%s on %s: %s\n", __func__, dir, errcause);
+		fprintf(stderr, "fuse: %s: %s\n", mnt_dir, errcause);
 		goto bad;
 	}
 
@@ -412,8 +415,6 @@ ifuse_process_opt(void *data, const char *arg, int key,
     unused struct fuse_args *args)
 {
 	struct fuse_core_opts *opt = data;
-	struct stat st;
-	int res;
 
 	switch (key) {
 	case KEY_STUB:
@@ -433,23 +434,10 @@ ifuse_process_opt(void *data, const char *arg, int key,
 		return (-1);
 	case FUSE_OPT_KEY_NONOPT:
 		if (opt->mp == NULL) {
-			opt->mp = realpath(arg, opt->mp);
+			opt->mp = strdup(arg);
 			if (opt->mp == NULL) {
-				fprintf(stderr, "fuse: realpath: "
-				    "%s : %s\n", arg, strerror(errno));
-				return (-1);
-			}
-
-			res = stat(opt->mp, &st);
-			if (res == -1) {
-				fprintf(stderr, "fuse: bad mount point "
-				    "%s : %s\n", arg, strerror(errno));
-				return (-1);
-			}
-
-			if (!S_ISDIR(st.st_mode)) {
-				fprintf(stderr, "fuse: bad mount point "
-				    "%s : %s\n", arg, strerror(ENOTDIR));
+				fprintf(stderr, "fuse: strdup: %s\n",
+				    strerror(errno));
 				return (-1);
 			}
 		}
@@ -474,11 +462,8 @@ fuse_parse_cmdline(struct fuse_args *args, char **mp, int *mt, int *fg)
 		return (-1);
 	}
 
-	if (mp != NULL) {
-		*mp = strdup(opt.mp);
-		if (*mp == NULL)
-			return (-1);
-	}
+	if (mp != NULL)
+		*mp = opt.mp;
 
 	if (mt != NULL)
 		*mt = 0;

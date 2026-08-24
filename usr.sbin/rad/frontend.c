@@ -1,4 +1,4 @@
-/*	$OpenBSD: frontend.c,v 1.57 2025/09/15 09:01:56 florian Exp $	*/
+/*	$OpenBSD: frontend.c,v 1.59 2026/07/29 11:06:18 claudio Exp $	*/
 
 /*
  * Copyright (c) 2018 Florian Obser <florian@openbsd.org>
@@ -337,8 +337,8 @@ frontend_dispatch_main(int fd, short event, void *bula)
 	}
 
 	for (;;) {
-		if ((n = imsg_get(ibuf, &imsg)) == -1)
-			fatal("%s: imsg_get error", __func__);
+		if ((n = imsgbuf_get(ibuf, &imsg)) == -1)
+			fatal("%s: imsgbuf_get error", __func__);
 		if (n == 0)	/* No more messages. */
 			break;
 
@@ -561,8 +561,8 @@ frontend_dispatch_engine(int fd, short event, void *bula)
 	}
 
 	for (;;) {
-		if ((n = imsg_get(ibuf, &imsg)) == -1)
-			fatal("%s: imsg_get error", __func__);
+		if ((n = imsgbuf_get(ibuf, &imsg)) == -1)
+			fatal("%s: imsgbuf_get error", __func__);
 		if (n == 0)	/* No more messages. */
 			break;
 
@@ -1352,7 +1352,7 @@ build_packet(struct ra_iface *ra_iface)
 			*p++ = '\0'; /* last dot */
 		}
 		/* zero pad */
-		while (((uintptr_t)p) % 8 != 0)
+		while (((ptrdiff_t)(p - buf)) % 8 != 0)
 			*p++ = '\0';
 	}
 

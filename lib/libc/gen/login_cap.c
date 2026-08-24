@@ -1,4 +1,4 @@
-/*	$OpenBSD: login_cap.c,v 1.49 2026/03/10 04:02:53 deraadt Exp $	*/
+/*	$OpenBSD: login_cap.c,v 1.51 2026/07/29 11:01:02 claudio Exp $	*/
 
 /*
  * Copyright (c) 2000-2004 Todd C. Miller <millert@openbsd.org>
@@ -585,7 +585,7 @@ setxdgenv(uid_t uid, struct passwd *pwd)
 		goto cleanup;
 	}
 
-	fd = open(rundir, O_RDONLY|O_DIRECTORY|O_NOFOLLOW|O_CLOEXEC|O_CLOFORK);
+	fd = open(rundir, O_RDONLY|O_DIRECTORY|O_NOFOLLOW|O_CLOEXEC);
 	if (fd == -1)  {
 		syslog(LOG_ERR, "could not open %s: %m", rundir);
 		goto cleanup;
@@ -652,10 +652,10 @@ setusercontext(login_cap_t *lc, struct passwd *pwd, uid_t uid, u_int flags)
 
 	/*
 	 * Without the pwd entry being passed we cannot set either
-	 * the group or the login.  We could complain about it.
+	 * the group, the login or the xdgenv.  We could complain about it.
 	 */
 	if (pwd == NULL)
-		flags &= ~(LOGIN_SETGROUP|LOGIN_SETLOGIN);
+		flags &= ~(LOGIN_SETGROUP|LOGIN_SETLOGIN|LOGIN_SETXDGENV);
 
 	/*
 	 * Verify that we haven't been given invalid values.

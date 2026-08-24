@@ -1,4 +1,4 @@
-/*	$OpenBSD: iked.h,v 1.233 2024/11/04 02:44:28 dlg Exp $	*/
+/*	$OpenBSD: iked.h,v 1.235 2026/07/16 09:35:40 martijn Exp $	*/
 
 /*
  * Copyright (c) 2019 Tobias Heider <tobias.heider@stusta.de>
@@ -841,6 +841,12 @@ struct privsep_fd {
 #define PROC_PARENT_SOCK_FILENO 3
 #define PROC_MAX_INSTANCES      32
 
+#if DEBUG
+#define DPRINTF		log_debug
+#else
+#define DPRINTF(x...)	do {} while(0)
+#endif
+
 struct iked_ocsp_entry {
 	TAILQ_ENTRY(iked_ocsp_entry) ioe_entry;	/* next request */
 	void			*ioe_ocsp;	/* private ocsp request data */
@@ -1333,8 +1339,8 @@ int	 proc_composev_imsg(struct privsep *, enum privsep_procid, int,
 	    uint16_t, uint32_t, int, const struct iovec *, int);
 int	 proc_composev(struct privsep *, enum privsep_procid,
 	    uint16_t, const struct iovec *, int);
-int	 proc_forward_imsg(struct privsep *, struct imsg *,
-	    enum privsep_procid, int);
+void	 proc_forward_imsg(struct privsep *, struct imsg *,
+	    enum privsep_procid);
 struct imsgbuf *
 	 proc_ibuf(struct privsep *, enum privsep_procid, int);
 struct imsgev *

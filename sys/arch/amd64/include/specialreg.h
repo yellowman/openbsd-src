@@ -1,4 +1,4 @@
-/*	$OpenBSD: specialreg.h,v 1.121 2026/01/14 22:42:34 dv Exp $	*/
+/*	$OpenBSD: specialreg.h,v 1.124 2026/07/30 14:00:48 hshoexer Exp $	*/
 /*	$NetBSD: specialreg.h,v 1.1 2003/04/26 18:39:48 fvdl Exp $	*/
 /*	$NetBSD: x86/specialreg.h,v 1.2 2003/04/25 21:54:30 fvdl Exp $	*/
 
@@ -703,10 +703,15 @@
 #define MSR_PATCH_LOADER	0xc0010020
 #define MSR_INT_PEN_MSG	0xc0010055	/* Interrupt pending message */
 
+#define MSR_FP_CFG	0xc0011028	/* Floating Point Configuration */
+#define FP_CFG_9	(1 << 9)	/* FP-DSS chickenbit */
 #define MSR_DE_CFG	0xc0011029	/* Decode Configuration */
 #define	DE_CFG_721	0x00000001	/* errata 721 */
 #define DE_CFG_SERIALIZE_LFENCE	(1 << 1)	/* Enable serializing lfence */
 #define DE_CFG_SERIALIZE_9 (1 << 9)	/* Zenbleed chickenbit */
+
+#define MSR_BP_CFG	0xc001102e
+#define BP_CFG_33	(1ULL << 33)	/* op cache chickenbit, AMD-SB-7052 */
 
 #define IPM_C1E_CMP_HLT	0x10000000
 #define IPM_SMI_CMP_HLT	0x08000000
@@ -732,6 +737,7 @@
 #define MSR_SEV_STATUS	0xc0010131
 #define		SEV_STAT_ENABLED	0x00000001
 #define		SEV_STAT_ES_ENABLED	0x00000002
+#define		SEV_STAT_SNP_ACTIVE	0x00000004
 
 #define	MSR_LS_CFG	0xc0011020
 #define		LS_CFG_DIS_LS2_SQUISH	0x02000000

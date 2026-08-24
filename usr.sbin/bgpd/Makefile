@@ -1,4 +1,6 @@
-#	$OpenBSD: Makefile,v 1.46 2026/02/04 11:41:11 claudio Exp $
+#	$OpenBSD: Makefile,v 1.49 2026/06/27 21:24:47 claudio Exp $
+
+.include <bsd.own.mk>
 
 PROG=	bgpd
 SRCS=	bgpd.c

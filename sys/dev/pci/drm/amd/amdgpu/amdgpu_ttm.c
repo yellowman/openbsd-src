@@ -75,6 +75,9 @@ static int amdgpu_ttm_init_on_chip(struct amdgpu_device *adev,
 				    unsigned int type,
 				    uint64_t size_in_page)
 {
+	if (!size_in_page)
+		return 0;
+
 	return ttm_range_man_init(&adev->mman.bdev, type,
 				  false, size_in_page);
 }
@@ -502,6 +505,15 @@ static int amdgpu_bo_move(struct ttm_buffer_object *bo, bool evict,
 
 	if (new_mem->mem_type == TTM_PL_TT ||
 	    new_mem->mem_type == AMDGPU_PL_PREEMPT) {
+		if (old_mem && (old_mem->mem_type == TTM_PL_TT ||
+				old_mem->mem_type == AMDGPU_PL_PREEMPT)) {
+			r = ttm_bo_wait_ctx(bo, ctx);
+			if (r)
+				return r;
+
+			amdgpu_ttm_backend_unbind(bo->bdev, bo->ttm);
+		}
+
 		r = amdgpu_ttm_backend_bind(bo->bdev, bo->ttm, new_mem);
 		if (r)
 			return r;
@@ -531,6 +543,15 @@ static int amdgpu_bo_move(struct ttm_buffer_object *bo, bool evict,
 			return r;
 
 		amdgpu_ttm_backend_unbind(bo->bdev, bo->ttm);
+		amdgpu_bo_move_notify(bo, evict, new_mem);
+		ttm_resource_free(bo, &bo->resource);
+		ttm_bo_assign_mem(bo, new_mem);
+		return 0;
+	}
+	if ((old_mem->mem_type == TTM_PL_TT ||
+	     old_mem->mem_type == AMDGPU_PL_PREEMPT) &&
+	    (new_mem->mem_type == TTM_PL_TT ||
+	     new_mem->mem_type == AMDGPU_PL_PREEMPT)) {
 		amdgpu_bo_move_notify(bo, evict, new_mem);
 		ttm_resource_free(bo, &bo->resource);
 		ttm_bo_assign_mem(bo, new_mem);
@@ -1957,7 +1978,7 @@ static void amdgpu_ttm_mmio_remap_bo_fini(struct amdgpu_device *adev)
 int amdgpu_ttm_init(struct amdgpu_device *adev)
 {
 	uint64_t gtt_size;
-	int r;
+	int r, flags;
 
 	rw_init(&adev->mman.gtt_window_lock, "gttwin");
 
@@ -2016,10 +2037,21 @@ int amdgpu_ttm_init(struct amdgpu_device *adev)
 #endif
 		adev->mman.aper_base_kaddr = ioremap_wc(adev->gmc.aper_base,
 				adev->gmc.visible_vram_size);
-#else
-	if (bus_space_map(adev->memt, adev->gmc.aper_base,
-	    adev->gmc.visible_vram_size,
-	    BUS_SPACE_MAP_LINEAR | BUS_SPACE_MAP_PREFETCHABLE,
+#endif
+#ifdef __OpenBSD__
+	flags = BUS_SPACE_MAP_LINEAR;
+#ifdef CONFIG_X86
+	if (adev->gmc.xgmi.connected_to_cpu)
+		flags |= BUS_SPACE_MAP_CACHEABLE;
+	else
+#endif
+		flags |= BUS_SPACE_MAP_PREFETCHABLE;
+	
+	if (adev->gmc.is_app_apu)
+		DRM_DEBUG_DRIVER(
+			"No need to ioremap when real vram size is 0\n");
+	else if (bus_space_map(adev->memt, adev->gmc.aper_base,
+	    adev->gmc.visible_vram_size, flags,
 	    &adev->mman.aper_bsh)) {
 		adev->mman.aper_base_kaddr = NULL;
 	} else {
@@ -2107,6 +2139,18 @@ int amdgpu_ttm_init(struct amdgpu_device *adev)
 		gtt_size = configured_size;
 	}
 
+	/* Cap GTT so that it does not exceed total physical RAM. */
+	if (adev->flags & AMD_IS_APU) {
+		u64 phys_ram = (u64)totalram_pages() << PAGE_SHIFT;
+
+		if (gtt_size > phys_ram) {
+			gtt_size = phys_ram;
+			dev_info(adev->dev,
+				 "Capping GTT to %uM to not exceed available system memory\n",
+				 (unsigned int)(gtt_size / (1024 * 1024)));
+		}
+	}
+
 	/* Initialize GTT memory pool */
 	r = amdgpu_gtt_mgr_init(adev, gtt_size);
 	if (r) {
@@ -2186,8 +2230,6 @@ int amdgpu_ttm_init(struct amdgpu_device *adev)
  */
 void amdgpu_ttm_fini(struct amdgpu_device *adev)
 {
-	int idx;
-
 	if (!adev->mman.initialized)
 		return;
 
@@ -2214,19 +2256,14 @@ void amdgpu_ttm_fini(struct amdgpu_device *adev)
 	amdgpu_ttm_fw_reserve_vram_fini(adev);
 	amdgpu_ttm_drv_reserve_vram_fini(adev);
 
-	if (drm_dev_enter(adev_to_drm(adev), &idx)) {
-
+	if (adev->mman.aper_base_kaddr) {
 #ifdef __linux__
-		if (adev->mman.aper_base_kaddr)
-			iounmap(adev->mman.aper_base_kaddr);
+		iounmap(adev->mman.aper_base_kaddr);
 #else
-		if (adev->mman.aper_base_kaddr)
-			bus_space_unmap(adev->memt, adev->mman.aper_bsh,
-			    adev->gmc.visible_vram_size);
+		bus_space_unmap(adev->memt, adev->mman.aper_bsh,
+		    adev->gmc.visible_vram_size);
 #endif
 		adev->mman.aper_base_kaddr = NULL;
-
-		drm_dev_exit(idx);
 	}
 
 	if (!adev->gmc.is_app_apu)

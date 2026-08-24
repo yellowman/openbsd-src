@@ -1,4 +1,4 @@
-/*	$OpenBSD: output.c,v 1.45 2025/11/13 15:18:53 job Exp $ */
+/*	$OpenBSD: output.c,v 1.47 2026/07/15 07:53:06 tb Exp $ */
 /*
  * Copyright (c) 2019 Theo de Raadt <deraadt@openbsd.org>
  *
@@ -62,16 +62,17 @@ static char	 output_name[PATH_MAX];
 
 static const struct outputs {
 	int	 format;
+	int	 always_output;
 	char	*name;
 	int	(*fn)(FILE *, struct validation_data *, struct stats *);
 } outputs[] = {
-	{ FORMAT_OPENBGPD, "openbgpd", output_bgpd },
-	{ FORMAT_BIRD, "bird", output_bird },
-	{ FORMAT_CSV, "csv", output_csv },
-	{ FORMAT_JSON, "json", output_json },
-	{ FORMAT_OMETRIC, "metrics", output_ometric },
-	{ FORMAT_CCR, "rpki.ccr", output_ccr_der },
-	{ 0, NULL, NULL }
+	{ FORMAT_OPENBGPD, 0, "openbgpd", output_bgpd },
+	{ FORMAT_BIRD, 0, "bird", output_bird },
+	{ FORMAT_CSV, 0, "csv", output_csv },
+	{ FORMAT_JSON, 0, "json", output_json },
+	{ FORMAT_OMETRIC, 1, "metrics", output_ometric },
+	{ FORMAT_CCR, 0, "rpki.ccr", output_ccr_der },
+	{ 0, 0, NULL, NULL }
 };
 
 static FILE	*output_createtmp(char *);
@@ -123,7 +124,7 @@ prune_as0_tals(struct vrp_tree *vrps)
 }
 
 int
-outputfiles(struct validation_data *vd, struct stats *st)
+outputfiles(struct validation_data *vd, struct stats *st, int exit_code)
 {
 	int i, rc = 0;
 
@@ -137,6 +138,9 @@ outputfiles(struct validation_data *vd, struct stats *st)
 		FILE *fout;
 
 		if (!(outformats & outputs[i].format))
+			continue;
+
+		if (exit_code != 0 && !outputs[i].always_output)
 			continue;
 
 		fout = output_createtmp(outputs[i].name);
@@ -269,14 +273,15 @@ outputheader(FILE *out, struct validation_data *vd, struct stats *st)
 	    "# CCR validated ASPA payloads hash: %s\n"
 	    "# Route Origin Authorizations: %u (%u failed parse, %u invalid)\n"
 	    "# BGPsec Router Certificates: %u\n"
-	    "# Certificates: %u (%u invalid, %u non-functional)\n",
-	    hn, tbuf, (long long)st->elapsed_time.tv_sec,
+	    "# Certificates: %u (%u invalid, %u non-functional, %u sync "
+	    "deferred)\n", hn, tbuf, (long long)st->elapsed_time.tv_sec,
 	    (long long)st->user_time.tv_sec, (long long)st->system_time.tv_sec,
 	    vd->ccr.mfts_hash, vd->ccr.vrps_hash, vd->ccr.vaps_hash,
 	    st->repo_tal_stats.roas, st->repo_tal_stats.roas_fail,
 	    st->repo_tal_stats.roas_invalid, st->repo_tal_stats.brks,
 	    st->repo_tal_stats.certs, st->repo_tal_stats.certs_fail,
-	    st->repo_tal_stats.certs_nonfunc) < 0)
+	    st->repo_tal_stats.certs_nonfunc,
+	    st->repo_tal_stats.certs_nonfunc_deferred) < 0)
 		return -1;
 
 	if (fprintf(out,

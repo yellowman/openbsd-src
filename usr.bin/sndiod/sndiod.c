@@ -1,4 +1,4 @@
-/*	$OpenBSD: sndiod.c,v 1.53 2026/03/15 10:05:09 ratchov Exp $	*/
+/*	$OpenBSD: sndiod.c,v 1.61 2026/08/12 11:01:26 ratchov Exp $	*/
 /*
  * Copyright (c) 2008-2012 Alexandre Ratchov <alex@caoua.org>
  *
@@ -100,11 +100,9 @@ int opt_mmc(void);
 int opt_onoff(void);
 int getword(char *, char **);
 unsigned int opt_mode(void);
-void getbasepath(char *);
 void setsig(void);
 void unsetsig(void);
-struct dev *mkdev(char *, struct aparams *,
-    int, int, int, int, int, int);
+struct dev *mkdev(char *, struct aparams *, int, int);
 struct port *mkport(char *, int);
 struct opt *mkopt(char *, struct dev *, struct opt_alt *,
     int, int, int, int, int, int, int, int);
@@ -288,47 +286,6 @@ reopen_devs(void)
 	}
 }
 
-/*
- * For each port, open the alt with the highest priority and switch to it
- */
-static void
-reopen_ports(void)
-{
-	struct port *p, *a, *apri;
-	int inuse;
-
-	for (p = port_list; p != NULL; p = a->next) {
-
-		/* skip unused ports */
-		inuse = 0;
-		a = p;
-		while (1) {
-			if (midi_rxmask(a->midi) || a->midi->txmask)
-				inuse = 1;
-			if (a->alt_next == p)
-				break;
-			a = a->alt_next;
-		}
-		if (!inuse)
-			continue;
-
-		/* open the alt with the highest prio */
-		apri = port_alt_ref(p->num);
-
-		/* switch to it */
-		a = p;
-		while (1) {
-			if (a != apri) {
-				midi_migrate(a->midi, apri->midi);
-				port_unref(a);
-			}
-			if (a->alt_next == p)
-				break;
-			a = a->alt_next;
-		}
-	}
-}
-
 void
 setsig(void)
 {
@@ -364,9 +321,28 @@ unsetsig(void)
 		err(1, "unsetsig(int): sigaction failed");
 }
 
+static int
+ckname(const char *name)
+{
+	size_t len;
+	char c;
+
+	for (len = 0; name[len] != '\0'; len++) {
+		if (len == CTL_NAMEMAX - 1) {
+			warnx("%s: too long", name);
+			return 0;
+		}
+		c = name[len];
+		if ((c < 'a' || c > 'z') && (c < 'A' || c > 'Z')) {
+			warnx("%s: only alphabetic chars allowed", name);
+			return 0;
+		}
+	}
+	return 1;
+}
+
 struct dev *
-mkdev(char *path, struct aparams *par,
-    int mode, int bufsz, int round, int rate, int hold, int autovol)
+mkdev(char *path, struct aparams *par, int hold, int autovol)
 {
 	struct dev *d;
 
@@ -374,14 +350,7 @@ mkdev(char *path, struct aparams *par,
 		if (strcmp(d->path, path) == 0)
 			return d;
 	}
-	if (!bufsz && !round) {
-		round = DEFAULT_ROUND;
-		bufsz = DEFAULT_BUFSZ;
-	} else if (!bufsz) {
-		bufsz = round * 2;
-	} else if (!round)
-		round = bufsz / 2;
-	d = dev_new(path, par, mode, bufsz, round, rate, hold, autovol);
+	d = dev_new(path, par, hold, autovol);
 	if (d == NULL)
 		exit(1);
 	return d;
@@ -410,11 +379,13 @@ mkopt(char *path, struct dev *d, struct opt_alt *alt_list,
 	struct opt *o;
 	struct opt_alt *a;
 
+	if (!ckname(path))
+		return NULL;
 	o = opt_new(d, path, pmin, pmax, rmin, rmax,
 	    MIDI_TO_ADATA(vol), mmc, dup, mode);
 	if (o == NULL)
 		return NULL;
-	dev_adjpar(d, o->mode, o->pmax, o->rmax);
+	dev_adjpar(d, o->pmax, o->rmax);
 	for (a = alt_list; a != NULL; a = a->next)
 		opt_setalt(o, a->dev);
 	return o;
@@ -508,13 +479,13 @@ main(int argc, char **argv)
 	int c, i, background, unit;
 	int pmin, pmax, rmin, rmax;
 	unsigned int mode, dup, mmc, vol;
-	unsigned int hold, autovol, bufsz, round, rate;
+	unsigned int hold, autovol;
 	const char *str;
 	struct aparams par;
 	struct opt *o;
 	struct dev *d;
 	struct opt_alt *a, **pa, *alt_list;
-	struct port *p, *port_first, *port_next;
+	struct port *p;
 	struct listen *l;
 	struct passwd *pw;
 	struct tcpaddr {
@@ -527,14 +498,12 @@ main(int argc, char **argv)
 	/*
 	 * global options defaults
 	 */
+	dev_rate = DEFAULT_RATE;
 	vol = 127;
 	dup = 1;
 	mmc = 0;
 	hold = 0;
 	autovol = 0;
-	bufsz = 0;
-	round = 0;
-	rate = DEFAULT_RATE;
 	unit = 0;
 	background = 1;
 	pmin = 0;
@@ -548,7 +517,6 @@ main(int argc, char **argv)
 	par.msb = 0;
 	mode = MODE_PLAY | MODE_REC;
 	alt_list = NULL;
-	port_first = port_next = NULL;
 	tcpaddr_list = NULL;
 	d = NULL;
 	p = NULL;
@@ -590,7 +558,7 @@ main(int argc, char **argv)
 			opt_enc(&par);
 			break;
 		case 'r':
-			rate = strtonum(optarg, RATE_MIN, RATE_MAX, &str);
+			dev_rate = strtonum(optarg, RATE_MIN, RATE_MAX, &str);
 			if (str)
 				errx(1, "%s: rate is %s", optarg, str);
 			break;
@@ -602,8 +570,7 @@ main(int argc, char **argv)
 		case 's':
 			if (d == NULL) {
 				for (i = 0; default_devs[i] != NULL; i++) {
-					mkdev(default_devs[i], &par, 0,
-					    bufsz, round, rate, 0, autovol);
+					mkdev(default_devs[i], &par, 0, autovol);
 				}
 				d = dev_list;
 			}
@@ -612,18 +579,8 @@ main(int argc, char **argv)
 				return 1;
 			break;
 		case 'q':
-			p = mkport(optarg, hold);
-			/* create new circulate list */
-			port_first = port_next = p;
-			break;
 		case 'Q':
-			if (p == NULL)
-				errx(1, "-Q %s: no ports defined", optarg);
 			p = mkport(optarg, hold);
-			/* add to circulate list */
-			p->alt_next = port_next;
-			port_first->alt_next = p;
-			port_next = p;
 			break;
 		case 'a':
 			hold = opt_onoff();
@@ -632,18 +589,17 @@ main(int argc, char **argv)
 			autovol = opt_onoff();
 			break;
 		case 'b':
-			bufsz = strtonum(optarg, 1, RATE_MAX, &str);
+			dev_bufsz = strtonum(optarg, 1, RATE_MAX, &str);
 			if (str)
 				errx(1, "%s: buffer size is %s", optarg, str);
 			break;
 		case 'z':
-			round = strtonum(optarg, 1, SHRT_MAX, &str);
+			dev_round = strtonum(optarg, 1, SHRT_MAX, &str);
 			if (str)
 				errx(1, "%s: block size is %s", optarg, str);
 			break;
 		case 'f':
-			d = mkdev(optarg, &par, 0, bufsz, round,
-			    rate, hold, autovol);
+			d = mkdev(optarg, &par, hold, autovol);
 			while ((a = alt_list) != NULL) {
 				alt_list = a->next;
 				xfree(a);
@@ -653,8 +609,7 @@ main(int argc, char **argv)
 			if (d == NULL)
 				errx(1, "-F %s: no devices defined", optarg);
 			a = xmalloc(sizeof(struct opt_alt));
-			a->dev = mkdev(optarg, &par, 0, bufsz, round,
-			    rate, hold, autovol);
+			a->dev = mkdev(optarg, &par, hold, autovol);
 			for (pa = &alt_list; *pa != NULL; pa = &(*pa)->next)
 				;
 			a->next = NULL;
@@ -671,14 +626,33 @@ main(int argc, char **argv)
 		fputs(usagestr, stderr);
 		return 1;
 	}
+
+	if (!dev_bufsz && !dev_round) {
+		dev_round = DEFAULT_ROUND;
+		dev_bufsz = DEFAULT_BUFSZ;
+	} else if (!dev_bufsz) {
+		dev_bufsz = dev_round * 2;
+	} else if (!dev_round) {
+		dev_round = dev_bufsz / 2;
+	}
+
+	/*
+	 * initialize midithru/N
+	 */
+	for (i = 0; i < MIDITHRU_NMAX; i++) {
+		char name[CTL_NAMEMAX];
+
+		snprintf(name, sizeof(name), "default-%d", i);
+		midithru_new(name);
+	}
+
 	if (port_list == NULL) {
 		for (i = 0; default_ports[i] != NULL; i++)
 			mkport(default_ports[i], 0);
 	}
 	if (dev_list == NULL) {
 		for (i = 0; default_devs[i] != NULL; i++) {
-			mkdev(default_devs[i], &par, 0,
-			    bufsz, round, rate, 0, autovol);
+			mkdev(default_devs[i], &par, 0, autovol);
 		}
 	}
 
@@ -698,10 +672,10 @@ main(int argc, char **argv)
 	 * the "default" sub-device as template
 	 */
 	for (d = dev_list; d != NULL; d = d->next) {
-		if (opt_new(d, NULL, o->pmin, o->pmax, o->rmin, o->rmax,
+		if (opt_new(d, d->name, o->pmin, o->pmax, o->rmin, o->rmax,
 			o->maxweight, o->mtc != NULL, o->dup, o->mode) == NULL)
 			return 1;
-		dev_adjpar(d, o->mode, o->pmax, o->rmax);
+		dev_adjpar(d, o->pmax, o->rmax);
 	}
 
 	while ((a = alt_list) != NULL) {
@@ -771,7 +745,7 @@ main(int argc, char **argv)
 		if (reopen_flag) {
 			reopen_flag = 0;
 			reopen_devs();
-			reopen_ports();
+			midithru_scanports();
 		}
 		if (!fdpass_peer)
 			break;
@@ -799,6 +773,8 @@ main(int argc, char **argv)
 		dev_del(dev_list);
 	while (port_list)
 		port_del(port_list);
+	while (midithru_list)
+		midithru_del(midithru_list);
 	while (tcpaddr_list) {
 		ta = tcpaddr_list;
 		tcpaddr_list = ta->next;

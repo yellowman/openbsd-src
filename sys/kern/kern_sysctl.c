@@ -1,4 +1,4 @@
-/*	$OpenBSD: kern_sysctl.c,v 1.485 2026/02/11 22:34:41 deraadt Exp $	*/
+/*	$OpenBSD: kern_sysctl.c,v 1.495 2026/07/12 15:49:45 mvs Exp $	*/
 /*	$NetBSD: kern_sysctl.c,v 1.17 1996/05/20 17:49:05 mrg Exp $	*/
 
 /*-
@@ -251,10 +251,12 @@ sys_sysctl(struct proc *p, void *v, register_t *retval)
 	if (error)
 		return (error);
 
+#ifndef SMALL_KERNEL
 	error = pledge_sysctl(p, SCARG(uap, namelen),
 	    name, SCARG(uap, new));
 	if (error)
 		return (error);
+#endif /* SMALL_KERNEL */
 
 	switch (name[0]) {
 	case CTL_KERN:
@@ -422,6 +424,20 @@ kern_sysctl_dirs(int top_name, int *name, u_int namelen,
 	case KERN_CPUSTATS:
 		return (sysctl_cpustats(name, namelen, oldp, oldlenp,
 		    newp, newlen));
+#if defined(SYSVMSG) || defined(SYSVSEM) || defined(SYSVSHM)
+	case KERN_SYSVIPC_INFO:
+		return (sysctl_sysvipc(name, namelen, oldp, oldlenp));
+#endif
+#ifdef SYSVSEM
+	case KERN_SEMINFO:
+		return (sysctl_sysvsem(name, namelen, oldp, oldlenp,
+		    newp, newlen));
+#endif
+#ifdef SYSVSHM
+	case KERN_SHMINFO:
+		return (sysctl_sysvshm(name, namelen, oldp, oldlenp,
+		    newp, newlen));
+#endif
 #endif /* SMALL_KERNEL */
 #if NAUDIO > 0
 	case KERN_AUDIO:
@@ -481,20 +497,6 @@ kern_sysctl_dirs_locked(int top_name, int *name, u_int namelen,
 #if defined(GPROF) || defined(DDBPROF)
 	case KERN_PROF:
 		return (sysctl_doprof(name, namelen, oldp, oldlenp,
-		    newp, newlen));
-#endif
-#if defined(SYSVMSG) || defined(SYSVSEM) || defined(SYSVSHM)
-	case KERN_SYSVIPC_INFO:
-		return (sysctl_sysvipc(name, namelen, oldp, oldlenp));
-#endif
-#ifdef SYSVSEM
-	case KERN_SEMINFO:
-		return (sysctl_sysvsem(name, namelen, oldp, oldlenp,
-		    newp, newlen));
-#endif
-#ifdef SYSVSHM
-	case KERN_SHMINFO:
-		return (sysctl_sysvshm(name, namelen, oldp, oldlenp,
 		    newp, newlen));
 #endif
 	case KERN_TIMECOUNTER:
@@ -781,7 +783,7 @@ kern_sysctl_locked(int *name, u_int namelen, void *oldp, size_t *oldlenp,
 		return (0);
 	    }
 	case KERN_CACHEPCT: {
-		u_int64_t dmapages;
+		u_int64_t pages;
 		int opct, pgs;
 		opct = bufcachepercent;
 		error = sysctl_int(oldp, oldlenp, newp, newlen,
@@ -792,9 +794,9 @@ kern_sysctl_locked(int *name, u_int namelen, void *oldp, size_t *oldlenp,
 			bufcachepercent = opct;
 			return (EINVAL);
 		}
-		dmapages = uvm_pagecount(&dma_constraint);
+		pages = uvm_pagecount(&no_constraint);
 		if (bufcachepercent != opct) {
-			pgs = bufcachepercent * dmapages / 100;
+			pgs = bufcachepercent * pages / 100;
 			bufadjust(pgs); /* adjust bufpages */
 			bufhighpages = bufpages; /* set high water mark */
 		}
@@ -882,6 +884,7 @@ hw_sysctl(int *name, u_int namelen, void *oldp, size_t *oldlenp, void *newp,
 	case HW_UCOMNAMES:
 #ifdef __HAVE_CPU_TOPOLOGY
 	case HW_SMT:
+	case HW_BLOCKCPU:
 #endif
 #endif /* !SMALL_KERNEL */
 	{
@@ -982,6 +985,8 @@ hw_sysctl_locked(int *name, u_int namelen, void *oldp, size_t *oldlenp,
 #ifdef __HAVE_CPU_TOPOLOGY
 	case HW_SMT:
 		return (sysctl_hwsmt(oldp, oldlenp, newp, newlen));
+	case HW_BLOCKCPU:
+		return (sysctl_hwblockcpu(oldp, oldlenp, newp, newlen));
 #endif
 	case HW_BATTERY:
 		return (sysctl_hwbattery(name + 1, namelen - 1, oldp, oldlenp,
@@ -1936,7 +1941,7 @@ sysctl_doproc(int *name, u_int namelen, char *where, size_t *sizep)
 	doingzomb = 0;
 again:
 	for (; pr != NULL; pr = LIST_NEXT(pr, ps_list)) {
-		/* XXX skip processes in the middle of being zapped */
+		/* XXX skip processes in the middle of being created or zapped */
 		if (pr->ps_pgrp == NULL)
 			continue;
 
@@ -2532,7 +2537,7 @@ sysctl_proc_vmmap(int *name, u_int namelen, void *oldp, size_t *oldlenp,
 		return (error);
 
 	/* Allocate wired memory to not block. */
-	kve = malloc(oldlen, M_TEMP, M_WAITOK);
+	kve = malloc(oldlen, M_TEMP, M_WAITOK | M_ZERO);
 
 	/* Set the base address and read entries. */
 	kve[0].kve_start = start;
@@ -2667,117 +2672,131 @@ sysctl_diskinit(int update, struct proc *p)
 int
 sysctl_sysvipc(int *name, u_int namelen, void *where, size_t *sizep)
 {
-#ifdef SYSVSEM
-	struct sem_sysctl_info *semsi;
-#endif
-#ifdef SYSVSHM
-	struct shm_sysctl_info *shmsi;
-#endif
-	size_t infosize, dssize, tsize, buflen, bufsiz;
-	int i, nds, error, ret;
-	void *buf;
-
 	if (namelen != 1)
 		return (EINVAL);
 
-	buflen = *sizep;
-
 	switch (*name) {
-	case KERN_SYSVIPC_MSG_INFO:
 #ifdef SYSVMSG
+	case KERN_SYSVIPC_MSG_INFO:
 		return (sysctl_sysvmsg(name, namelen, where, sizep));
-#else
-		return (EOPNOTSUPP);
 #endif
-	case KERN_SYSVIPC_SEM_INFO:
 #ifdef SYSVSEM
-		infosize = sizeof(semsi->seminfo);
-		nds = seminfo.semmni;
-		dssize = sizeof(semsi->semids[0]);
-		break;
-#else
-		return (EOPNOTSUPP);
+	case KERN_SYSVIPC_SEM_INFO: {
+		struct seminfo seminfo_tmp;
+		struct sem_sysctl_info *info;
+		size_t infolen, avail, i;
+		int error, error1 = 0;
+
+		rw_enter_read(&sysvsem_lock);
+		memcpy(&seminfo_tmp, &seminfo, sizeof(seminfo_tmp));
+		rw_exit_read(&sysvsem_lock);
+
+		infolen = sizeof(seminfo_tmp) +
+		    seminfo_tmp.semmni * sizeof(info->semids[0]);
+
+		if (where == NULL) {
+			*sizep = infolen;
+			return (0);
+		}
+		if (*sizep < sizeof(info->seminfo)) {
+			*sizep = 0;
+			return (ENOMEM);
+		}
+
+		avail = infolen = min(*sizep, infolen);
+		info = malloc(infolen, M_TEMP, M_WAITOK | M_ZERO);
+
+		memcpy(&info->seminfo, &seminfo_tmp, sizeof(info->seminfo));
+		avail -= sizeof(info->seminfo);
+
+		if (avail > 0) {
+			KERNEL_LOCK();
+			for (i = 0; i < seminfo_tmp.semmni; i++) {
+				if (avail < sizeof(info->semids[0])) {
+					error1 = ENOMEM;
+					break;
+				}
+				if (sema[i] != NULL) {
+					info->semids[i].sem_perm =
+					    sema[i]->sem_perm;
+					info->semids[i].sem_nsems =
+					    sema[i]->sem_nsems;
+					info->semids[i].sem_otime =
+					    sema[i]->sem_otime;
+					info->semids[i].sem_ctime =
+					    sema[i]->sem_ctime;
+				}
+				avail -= sizeof(info->semids[0]);
+			}
+			KERNEL_UNLOCK();
+		}
+
+		*sizep = infolen - avail;
+		error = copyout(info, where, *sizep);
+		free(info, M_TEMP, infolen);
+
+		/* If copyout succeeded, use return code set earlier. */
+		return (error ? error : error1);
+	}
 #endif
-	case KERN_SYSVIPC_SHM_INFO:
 #ifdef SYSVSHM
-		infosize = sizeof(shmsi->shminfo);
-		nds = shminfo.shmmni;
-		dssize = sizeof(shmsi->shmids[0]);
-		break;
-#else
-		return (EOPNOTSUPP);
+	case KERN_SYSVIPC_SHM_INFO: {
+		struct shminfo shminfo_tmp;
+		struct shm_sysctl_info *info;
+		size_t infolen, avail, i;
+		int error, error1 = 0;
+
+		rw_enter_read(&sysvshm_lock);
+		memcpy(&shminfo_tmp, &shminfo, sizeof(shminfo_tmp));
+		rw_exit_read(&sysvshm_lock);
+
+		infolen = sizeof(shminfo_tmp) +
+		    shminfo_tmp.shmmni * sizeof(info->shmids[0]);
+
+		if (where == NULL) {
+			*sizep = infolen;
+			return (0);
+		}
+		if (*sizep < sizeof(info->shminfo)) {
+			*sizep = 0;
+			return (ENOMEM);
+		}
+
+		avail = infolen = min(*sizep, infolen); 
+		info = malloc(infolen, M_TEMP, M_WAITOK | M_ZERO);
+
+		memcpy(&info->shminfo, &shminfo_tmp, sizeof(info->shminfo));
+		avail -= sizeof(info->shminfo);
+
+		if (avail) {
+			KERNEL_LOCK();
+			for (i = 0; i < shminfo_tmp.shmmni; i++) {
+				if (avail < sizeof(info->shmids[0])) {
+					error1 = ENOMEM;
+					break;
+				}
+				if (shmsegs[i]) {
+					memcpy(&info->shmids[i], shmsegs[i],
+					    sizeof(info->shmids[0]));
+					info->shmids[i].shm_internal = NULL;
+				}
+				avail -= sizeof(info->shmids[0]);
+			}
+			KERNEL_UNLOCK();
+		}
+
+		*sizep = infolen - avail;
+		error = copyout(info, where, *sizep);
+		free(info, M_TEMP, infolen);
+
+		/* If copyout succeeded, use return code set earlier. */
+		return (error ? error : error1);
+	}
 #endif
 	default:
-		return (EINVAL);
-	}
-	tsize = infosize + (nds * dssize);
+		return (EOPNOTSUPP);
 
-	/* Return just the total size required. */
-	if (where == NULL) {
-		*sizep = tsize;
-		return (0);
 	}
-
-	/* Not enough room for even the info struct. */
-	if (buflen < infosize) {
-		*sizep = 0;
-		return (ENOMEM);
-	}
-	bufsiz = min(tsize, buflen);
-	buf = malloc(bufsiz, M_TEMP, M_WAITOK|M_ZERO);
-
-	switch (*name) {
-#ifdef SYSVSEM
-	case KERN_SYSVIPC_SEM_INFO:
-		semsi = (struct sem_sysctl_info *)buf;
-		semsi->seminfo = seminfo;
-		break;
-#endif
-#ifdef SYSVSHM
-	case KERN_SYSVIPC_SHM_INFO:
-		shmsi = (struct shm_sysctl_info *)buf;
-		shmsi->shminfo = shminfo;
-		break;
-#endif
-	}
-	buflen -= infosize;
-
-	ret = 0;
-	if (buflen > 0) {
-		/* Fill in the IPC data structures.  */
-		for (i = 0; i < nds; i++) {
-			if (buflen < dssize) {
-				ret = ENOMEM;
-				break;
-			}
-			switch (*name) {
-#ifdef SYSVSEM
-			case KERN_SYSVIPC_SEM_INFO:
-				if (sema[i] != NULL)
-					memcpy(&semsi->semids[i], sema[i],
-					    dssize);
-				else
-					memset(&semsi->semids[i], 0, dssize);
-				break;
-#endif
-#ifdef SYSVSHM
-			case KERN_SYSVIPC_SHM_INFO:
-				if (shmsegs[i] != NULL)
-					memcpy(&shmsi->shmids[i], shmsegs[i],
-					    dssize);
-				else
-					memset(&shmsi->shmids[i], 0, dssize);
-				break;
-#endif
-			}
-			buflen -= dssize;
-		}
-	}
-	*sizep -= buflen;
-	error = copyout(buf, where, *sizep);
-	free(buf, M_TEMP, bufsiz);
-	/* If copyout succeeded, use return code set earlier. */
-	return (error ? error : ret);
 }
 #endif /* SYSVMSG || SYSVSEM || SYSVSHM */
 

@@ -1,4 +1,4 @@
-/*	$OpenBSD: vioblk.c,v 1.27 2026/01/14 03:09:05 dv Exp $	*/
+/*	$OpenBSD: vioblk.c,v 1.32 2026/08/04 19:12:14 claudio Exp $	*/
 
 /*
  * Copyright (c) 2023 Dave Voutila <dv@openbsd.org>
@@ -36,7 +36,7 @@
 extern struct vmd_vm *current_vm;
 struct iovec io_v[VIRTIO_QUEUE_SIZE_MAX];
 
-static const char *disk_type(int);
+static const char *disk_type(enum vm_disk_fmt);
 static uint32_t vioblk_read(struct virtio_dev *, struct viodev_msg *, int *);
 static int vioblk_write(struct virtio_dev *, struct viodev_msg *);
 static uint32_t vioblk_dev_read(struct virtio_dev *, struct viodev_msg *);
@@ -49,11 +49,13 @@ static void dev_dispatch_vm(int, short, void *);
 static void handle_sync_io(int, short, void *);
 
 static const char *
-disk_type(int type)
+disk_type(enum vm_disk_fmt type)
 {
 	switch (type) {
+	case VMDF_AUTO: return "auto";
 	case VMDF_RAW: return "raw";
 	case VMDF_QCOW2: return "qcow2";
+	case VMDF_INVALID: return "invalid";
 	}
 	return "unknown";
 }
@@ -67,7 +69,8 @@ vioblk_main(int fd, int fd_vmm)
 	struct vmd_vm		 vm;
 	ssize_t			 sz;
 	off_t			 szp = 0;
-	int			 i, ret, type;
+	enum vm_disk_fmt	 type;
+	int			 i, ret;
 
 	/*
 	 * stdio - needed for read/write to disk fds and channels to the vm.
@@ -264,7 +267,7 @@ vioblk_notifyq(struct virtio_dev *dev, uint16_t vq_idx)
 	struct vioblk_dev *vioblk = &dev->vioblk;
 
 	/* Invalid queue? */
-	if (vq_idx > dev->num_queues)
+	if (vq_idx >= dev->num_queues)
 		return (0);
 
 	vq_info = &dev->vq[vq_idx];
@@ -281,6 +284,11 @@ vioblk_notifyq(struct virtio_dev *dev, uint16_t vq_idx)
 	while (idx != avail->idx) {
 		/* Retrieve Command descriptor. */
 		cmd_desc_idx = avail->ring[idx & vq_info->mask];
+		if (cmd_desc_idx >= vq_info->qs) {
+			log_warnx("%s: invalid head descriptor index",
+			    __func__);
+			goto reset;
+		}
 		desc = &table[cmd_desc_idx];
 		cmd_len = desc->len;
 
@@ -391,8 +399,7 @@ dev_dispatch_vm(int fd, short event, void *arg)
 	struct imsgev		*iev = &dev->async_iev;
 	struct imsgbuf		*ibuf = &iev->ibuf;
 	struct imsg	 	 imsg;
-	ssize_t			 n = 0;
-	int			 verbose;
+	int			 n, verbose;
 	uint32_t		 type;
 
 	if (event & EV_READ) {
@@ -421,8 +428,8 @@ dev_dispatch_vm(int fd, short event, void *arg)
 	}
 
 	for (;;) {
-		if ((n = imsg_get(ibuf, &imsg)) == -1)
-			fatal("%s: imsg_get", __func__);
+		if ((n = imsgbuf_get(ibuf, &imsg)) == -1)
+			fatal("%s: imsgbuf_get", __func__);
 		if (n == 0)
 			break;
 
@@ -459,8 +466,7 @@ handle_sync_io(int fd, short event, void *arg)
 	struct imsgbuf *ibuf = &iev->ibuf;
 	struct viodev_msg msg;
 	struct imsg imsg;
-	ssize_t n;
-	int deassert = 0;
+	int n, deassert = 0;
 
 	if (event & EV_READ) {
 		if ((n = imsgbuf_read(ibuf)) == -1)
@@ -488,8 +494,8 @@ handle_sync_io(int fd, short event, void *arg)
 	}
 
 	for (;;) {
-		if ((n = imsg_get(ibuf, &imsg)) == -1)
-			fatalx("%s: imsg_get (n=%ld)", __func__, n);
+		if ((n = imsgbuf_get(ibuf, &imsg)) == -1)
+			fatal("%s: imsgbuf_get", __func__);
 		if (n == 0)
 			break;
 

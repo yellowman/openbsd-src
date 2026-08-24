@@ -973,6 +973,9 @@ respip_rewrite_reply(const struct query_info* qinfo,
 					lock_rw_unlock(&raddr->lock);
 					lock_rw_unlock(&a->lock);
 					lock_rw_unlock(&az->rpz_lock);
+					if(view) {
+                    	lock_rw_unlock(&view->lock);
+					}
 					return 0;
 				}
 				if(rpz_used) {
@@ -1074,7 +1077,8 @@ generate_cname_request(struct module_qstate* qstate,
 	subqi.qtype = qstate->qinfo.qtype;
 	subqi.qclass = qstate->qinfo.qclass;
 	fptr_ok(fptr_whitelist_modenv_attach_sub(qstate->env->attach_sub));
-	return (*qstate->env->attach_sub)(qstate, &subqi, BIT_RD, 0, 0, &subq);
+	return (*qstate->env->attach_sub)(qstate, &subqi,
+		qstate->client_info, BIT_RD, 0, 0, &subq);
 }
 
 void
@@ -1110,7 +1114,13 @@ respip_operate(struct module_qstate* qstate, enum module_ev event, int id,
 		if((qstate->qinfo.qtype == LDNS_RR_TYPE_A ||
 			qstate->qinfo.qtype == LDNS_RR_TYPE_AAAA ||
 			qstate->qinfo.qtype == LDNS_RR_TYPE_ANY) &&
-			qstate->return_msg && qstate->return_msg->rep) {
+			qstate->return_msg && qstate->return_msg->rep &&
+			!(qstate->env->need_to_validate &&
+			  (!(qstate->query_flags & BIT_CD)
+			    || qstate->env->cfg->ignore_cd) &&
+			  (qstate->return_msg->rep->security <= sec_status_bogus
+			    || qstate->return_msg->rep->security ==
+			    sec_status_secure_sentinel_fail))) {
 			struct reply_info* new_rep = qstate->return_msg->rep;
 			struct ub_packed_rrset_key* alias_rrset = NULL;
 			struct respip_action_info actinfo = {0, 0, 0, 0, NULL, 0, NULL};
@@ -1233,7 +1243,8 @@ respip_inform_super(struct module_qstate* qstate, int id,
 	struct respip_qstate* rq = (struct respip_qstate*)super->minfo[id];
 	struct reply_info* new_rep = NULL;
 
-	rq->state = RESPIP_SUBQUERY_FINISHED;
+	if(rq)
+		rq->state = RESPIP_SUBQUERY_FINISHED;
 
 	/* respip subquery should have always been created with a valid reply
 	 * in super. */

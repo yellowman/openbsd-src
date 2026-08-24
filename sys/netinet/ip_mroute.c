@@ -1,4 +1,4 @@
-/*	$OpenBSD: ip_mroute.c,v 1.150 2025/07/19 16:40:40 mvs Exp $	*/
+/*	$OpenBSD: ip_mroute.c,v 1.154 2026/07/16 12:21:40 bluhm Exp $	*/
 /*	$NetBSD: ip_mroute.c,v 1.85 2004/04/26 01:31:57 matt Exp $	*/
 
 /*
@@ -79,6 +79,8 @@
 /*
  * Locks used to protect data:
  *	I	immutable after creation
+ *	N	net lock
+ *	R	multicast router lock
  */
 
 /* #define MCAST_DEBUG */
@@ -96,14 +98,21 @@ int mcast_debug = 1;
 	do { } while (0)
 #endif
 
+struct rwlock mrt_routerlock = RWLOCK_INITIALIZER("mrouter");
+
 /*
- * Globals.  All but ip_mrouter and ip_mrtproto could be static,
- * except for netstat or debugging purposes.
+ * Kernel multicast routing API capabilities and setup.
+ * If more API capabilities are added to the kernel, they should be
+ * recorded in `mrt_api_support'.
  */
-struct socket	*ip_mrouter[RT_TABLEID_MAX + 1];
-struct rttimer_queue ip_mrouterq;
-uint64_t	 mrt_count[RT_TABLEID_MAX + 1];
-int		ip_mrtproto = IGMP_DVMRP;    /* [I] for netstat only */
+static const u_int32_t mrt_api_support =
+    MRT_MFC_FLAGS_DISABLE_WRONGVIF | MRT_MFC_RP;
+
+struct rttimer_queue mrt_timer;
+struct socket	*mrt_mrouter[RT_TABLEID_MAX + 1];	/* [R] */
+uint32_t	 mrt_api_config[RT_TABLEID_MAX + 1];	/* [R] */
+uint64_t	 mrt_count[RT_TABLEID_MAX + 1];		/* [N] */
+int		 ip_mrtproto = IGMP_DVMRP;	/* [I] for netstat only */
 
 struct cpumem *mrtcounters;
 
@@ -124,23 +133,13 @@ int add_mfc(struct socket *, struct mbuf *);
 int del_mfc(struct socket *, struct mbuf *);
 int set_api_config(struct socket *, struct mbuf *); /* chose API capabilities */
 int get_api_support(struct mbuf *);
-int get_api_config(struct mbuf *);
-int socket_send(struct socket *, struct mbuf *,
-			    struct sockaddr_in *);
+int get_api_config(struct socket *, struct mbuf *);
+int socket_send(struct socket *, struct mbuf *, struct sockaddr_in *);
 int ip_mdq(struct mbuf *, struct ifnet *, struct rtentry *, int);
 struct ifnet *if_lookupbyvif(vifi_t, unsigned int);
 struct rtentry *rt_mcast_add(struct ifnet *, struct sockaddr *,
     struct sockaddr *);
 void mrt_mcast_del(struct rtentry *, unsigned int);
-
-/*
- * Kernel multicast routing API capabilities and setup.
- * If more API capabilities are added to the kernel, they should be
- * recorded in `mrt_api_support'.
- */
-static const u_int32_t mrt_api_support = (MRT_MFC_FLAGS_DISABLE_WRONGVIF |
-					  MRT_MFC_RP);
-static u_int32_t mrt_api_config = 0;
 
 /*
  * Find a route for a given Multicast group address.
@@ -185,39 +184,34 @@ mfc_find(struct ifnet *ifp, struct in_addr *group, unsigned int rtableid)
 int
 ip_mrouter_set(struct socket *so, int optname, struct mbuf *m)
 {
-	struct inpcb *inp = sotoinpcb(so);
 	int error;
 
-	if (optname != MRT_INIT &&
-	    so != ip_mrouter[inp->inp_rtableid])
+	switch (optname) {
+	case MRT_INIT:
+		error = ip_mrouter_init(so, m);
+		break;
+	case MRT_DONE:
+		error = ip_mrouter_done(so);
+		break;
+	case MRT_ADD_VIF:
+		error = add_vif(so, m);
+		break;
+	case MRT_DEL_VIF:
+		error = del_vif(so, m);
+		break;
+	case MRT_ADD_MFC:
+		error = add_mfc(so, m);
+		break;
+	case MRT_DEL_MFC:
+		error = del_mfc(so, m);
+		break;
+	case MRT_API_CONFIG:
+		error = set_api_config(so, m);
+		break;
+	default:
 		error = ENOPROTOOPT;
-	else
-		switch (optname) {
-		case MRT_INIT:
-			error = ip_mrouter_init(so, m);
-			break;
-		case MRT_DONE:
-			error = ip_mrouter_done(so);
-			break;
-		case MRT_ADD_VIF:
-			error = add_vif(so, m);
-			break;
-		case MRT_DEL_VIF:
-			error = del_vif(so, m);
-			break;
-		case MRT_ADD_MFC:
-			error = add_mfc(so, m);
-			break;
-		case MRT_DEL_MFC:
-			error = del_mfc(so, m);
-			break;
-		case MRT_API_CONFIG:
-			error = set_api_config(so, m);
-			break;
-		default:
-			error = ENOPROTOOPT;
-			break;
-		}
+		break;
+	}
 
 	return (error);
 }
@@ -228,29 +222,30 @@ ip_mrouter_set(struct socket *so, int optname, struct mbuf *m)
 int
 ip_mrouter_get(struct socket *so, int optname, struct mbuf *m)
 {
-	struct inpcb *inp = sotoinpcb(so);
 	int error;
 
-	if (so != ip_mrouter[inp->inp_rtableid])
+	switch (optname) {
+	case MRT_VERSION:
+		error = get_version(m);
+		break;
+	case MRT_API_SUPPORT:
+		error = get_api_support(m);
+		break;
+	case MRT_API_CONFIG:
+		error = get_api_config(so, m);
+		break;
+	default:
 		error = ENOPROTOOPT;
-	else {
-		switch (optname) {
-		case MRT_VERSION:
-			error = get_version(m);
-			break;
-		case MRT_API_SUPPORT:
-			error = get_api_support(m);
-			break;
-		case MRT_API_CONFIG:
-			error = get_api_config(m);
-			break;
-		default:
-			error = ENOPROTOOPT;
-			break;
-		}
+		break;
 	}
 
 	return (error);
+}
+
+int
+ip_mrouter_active(u_int rtableid)
+{
+	return (READ_ONCE(mrt_mrouter[rtableid]) != NULL);
 }
 
 void
@@ -258,7 +253,7 @@ mrt_init(void)
 {
 	mrtcounters = counters_alloc(mrts_ncounters);
 
-	rt_timer_queue_init(&ip_mrouterq, MCAST_EXPIRE_FREQUENCY,
+	rt_timer_queue_init(&mrt_timer, MCAST_EXPIRE_FREQUENCY,
 	    &mfc_expire_route);
 }
 
@@ -274,30 +269,37 @@ mrt_ioctl(struct socket *so, u_long cmd, caddr_t data)
 	if (inp == NULL)
 		return (ENOTCONN);
 
-	KERNEL_LOCK();
 
-	if (so != ip_mrouter[inp->inp_rtableid])
-		error = EINVAL;
-	else
-		switch (cmd) {
-		case SIOCGETVIFCNT:
-			NET_LOCK_SHARED();
-			error = get_vif_cnt(inp->inp_rtableid,
-			    (struct sioc_vif_req *)data);
-			NET_UNLOCK_SHARED();
-			break;
-		case SIOCGETSGCNT:
-			NET_LOCK_SHARED();
-			error = get_sg_cnt(inp->inp_rtableid,
-			    (struct sioc_sg_req *)data);
-			NET_UNLOCK_SHARED();
-			break;
-		default:
-			error = ENOTTY;
-			break;
-		}
+	NET_LOCK_SHARED();
+	rw_enter_read(&mrt_routerlock);
 
-	KERNEL_UNLOCK();
+	if (so != mrt_mrouter[inp->inp_rtableid]) {
+		error =  EPROTONOSUPPORT;
+		goto out;
+	}
+
+	switch (cmd) {
+	case SIOCGETVIFCNT:
+		KERNEL_LOCK();
+		error = get_vif_cnt(inp->inp_rtableid,
+		    (struct sioc_vif_req *)data);
+		KERNEL_UNLOCK();
+		break;
+	case SIOCGETSGCNT:
+		KERNEL_LOCK();
+		error = get_sg_cnt(inp->inp_rtableid,
+		    (struct sioc_sg_req *)data);
+		KERNEL_UNLOCK();
+		break;
+	default:
+		error = ENOTTY;
+		break;
+	}
+
+ out:
+	rw_exit_read(&mrt_routerlock);
+	NET_UNLOCK_SHARED();
+
 	return (error);
 }
 
@@ -348,7 +350,7 @@ get_vif_cnt(unsigned int rtableid, struct sioc_vif_req *req)
 	if ((ifp = if_lookupbyvif(vifi, rtableid)) == NULL)
 		return (EINVAL);
 
-	v = (struct vif *)ifp->if_mcast;
+	v = ifp->if_mcast;
 	req->icount = v->v_pkt_in;
 	req->ocount = v->v_pkt_out;
 	req->ibytes = v->v_bytes_in;
@@ -386,7 +388,7 @@ mrt_sysctl_vif(void *oldp, size_t *oldlenp)
 
 	TAILQ_FOREACH (ifp, &if_tmplist, if_tmplist) {
 		NET_LOCK_SHARED();
-		if ((vifp = (struct vif *)ifp->if_mcast) == NULL) {
+		if ((vifp = ifp->if_mcast) == NULL) {
 			NET_UNLOCK_SHARED();
 			continue;
 		}
@@ -465,7 +467,7 @@ mrt_rtwalk_mfcsysctl(struct rtentry *rt, void *arg, unsigned int rtableid)
 	/* Skip route with invalid interfaces. */
 	if ((ifp = if_get(rt->rt_ifidx)) == NULL)
 		return (0);
-	if ((v = (struct vif *)ifp->if_mcast) == NULL) {
+	if ((v = ifp->if_mcast) == NULL) {
 		if_put(ifp);
 		return (0);
 	}
@@ -528,6 +530,8 @@ mrt_sysctl_mrtstat(void *oldp, size_t *oldlenp, void *newp)
 	ASSIGN(mrts_q_overflow);
 	ASSIGN(mrts_pkt2large);
 	ASSIGN(mrts_upq_sockfull);
+	ASSIGN(mrts_time_to_live);
+	ASSIGN(mrts_source_route);
 
 #undef ASSIGN
 
@@ -591,10 +595,15 @@ ip_mrouter_init(struct socket *so, struct mbuf *m)
 	if (*v != 1)
 		return (EINVAL);
 
-	if (ip_mrouter[rtableid] != NULL)
-		return (EADDRINUSE);
+	rw_enter_write(&mrt_routerlock);
 
-	ip_mrouter[rtableid] = so;
+	if (mrt_mrouter[rtableid] != NULL) {
+		rw_exit_write(&mrt_routerlock);
+		return (EADDRINUSE);
+	}
+	mrt_mrouter[rtableid] = soref(so);
+
+	rw_exit_write(&mrt_routerlock);
 
 	return (0);
 }
@@ -623,6 +632,13 @@ ip_mrouter_done(struct socket *so)
 
 	NET_ASSERT_LOCKED();
 
+	rw_enter_write(&mrt_routerlock);
+
+	if (so != mrt_mrouter[inp->inp_rtableid]) {
+		rw_exit_write(&mrt_routerlock);
+		return (EPROTONOSUPPORT);
+	}
+
 	/* Delete all remaining installed multicast routes. */
 	do {
 		struct rtentry *rt = NULL;
@@ -636,6 +652,12 @@ ip_mrouter_done(struct socket *so)
 		rtfree(rt);
 	} while (error == EAGAIN);
 
+	/*
+	 * XXX Should be KASSERT, but there is a leak.  If an interface
+	 * is destroyed, the route is deleted, but mrt_mcast_del() not run.
+	 */
+	mrt_count[rtableid] = 0;
+
 	/* Unregister all interfaces in the domain. */
 	TAILQ_FOREACH(ifp, &ifnetlist, if_list) {
 		if (ifp->if_rdomain != rtableid)
@@ -644,10 +666,11 @@ ip_mrouter_done(struct socket *so)
 		vif_delete(ifp);
 	}
 
-	mrt_api_config = 0;
+	mrt_api_config[rtableid] = 0;
+	mrt_mrouter[rtableid] = NULL;
+	sorele(so);
 
-	ip_mrouter[rtableid] = NULL;
-	mrt_count[rtableid] = 0;
+	rw_exit_write(&mrt_routerlock);
 
 	return (0);
 }
@@ -670,13 +693,20 @@ set_api_config(struct socket *so, struct mbuf *m)
 {
 	struct inpcb *inp = sotoinpcb(so);
 	struct ifnet *ifp;
-	u_int32_t *apival;
+	uint32_t *apival;
 	unsigned int rtableid = inp->inp_rtableid;
 
 	if (m == NULL || m->m_len < sizeof(u_int32_t))
 		return (EINVAL);
 
 	apival = mtod(m, u_int32_t *);
+
+	rw_enter_write(&mrt_routerlock);
+
+	if (so != mrt_mrouter[inp->inp_rtableid]) {
+		rw_exit_write(&mrt_routerlock);
+		return (EPROTONOSUPPORT);
+	}
 
 	/*
 	 * We can set the API capabilities only if it is the first operation
@@ -690,16 +720,20 @@ set_api_config(struct socket *so, struct mbuf *m)
 		if (ifp->if_mcast == NULL)
 			continue;
 
+		rw_exit_write(&mrt_routerlock);
 		*apival = 0;
 		return (EPERM);
 	}
 	if (mrt_count[rtableid] > 0) {
+		rw_exit_write(&mrt_routerlock);
 		*apival = 0;
 		return (EPERM);
 	}
 
-	mrt_api_config = *apival & mrt_api_support;
-	*apival = mrt_api_config;
+	*apival &= mrt_api_support;
+	mrt_api_config[rtableid] = *apival;
+
+	rw_exit_write(&mrt_routerlock);
 
 	return (0);
 }
@@ -710,12 +744,12 @@ set_api_config(struct socket *so, struct mbuf *m)
 int
 get_api_support(struct mbuf *m)
 {
-	u_int32_t *apival;
+	uint32_t *apival;
 
 	if (m == NULL || m->m_len < sizeof(u_int32_t))
 		return (EINVAL);
 
-	apival = mtod(m, u_int32_t *);
+	apival = mtod(m, uint32_t *);
 
 	*apival = mrt_api_support;
 
@@ -726,21 +760,27 @@ get_api_support(struct mbuf *m)
  * Get API configured capabilities
  */
 int
-get_api_config(struct mbuf *m)
+get_api_config(struct socket *so, struct mbuf *m)
 {
-	u_int32_t *apival;
+	struct inpcb *inp = sotoinpcb(so);
+	uint32_t *apival;
+	unsigned int rtableid = inp->inp_rtableid;
 
 	if (m == NULL || m->m_len < sizeof(u_int32_t))
 		return (EINVAL);
 
-	apival = mtod(m, u_int32_t *);
+	apival = mtod(m, uint32_t *);
 
-	*apival = mrt_api_config;
+	rw_enter_read(&mrt_routerlock);
+	if (so != mrt_mrouter[inp->inp_rtableid]) {
+		rw_exit_read(&mrt_routerlock);
+		return (EPROTONOSUPPORT);
+	}
+	*apival = mrt_api_config[rtableid];
+	rw_exit_read(&mrt_routerlock);
 
 	return (0);
 }
-
-static struct sockaddr_in sin = { sizeof(sin), AF_INET };
 
 int
 add_vif(struct socket *so, struct mbuf *m)
@@ -759,6 +799,13 @@ add_vif(struct socket *so, struct mbuf *m)
 	if (m == NULL || m->m_len < sizeof(struct vifctl))
 		return (EINVAL);
 
+	rw_enter_read(&mrt_routerlock);
+	if (so != mrt_mrouter[inp->inp_rtableid]) {
+		rw_exit_read(&mrt_routerlock);
+		return (EPROTONOSUPPORT);
+	}
+	rw_exit_read(&mrt_routerlock);
+
 	vifcp = mtod(m, struct vifctl *);
 	if (vifcp->vifc_vifi >= MAXVIFS)
 		return (EINVAL);
@@ -771,6 +818,8 @@ add_vif(struct socket *so, struct mbuf *m)
 	if (vifcp->vifc_flags & VIFF_TUNNEL)
 		return (EOPNOTSUPP);
 	{
+		struct sockaddr_in sin = { sizeof(sin), AF_INET };
+
 		sin.sin_addr = vifcp->vifc_lcl_addr;
 		ifa = ifa_ifwithaddr(sintosa(&sin), rtableid);
 		if (ifa == NULL)
@@ -800,7 +849,7 @@ add_vif(struct socket *so, struct mbuf *m)
 	}
 
 	vifp = malloc(sizeof(*vifp), M_MRTABLE, M_WAITOK | M_ZERO);
-	ifp->if_mcast = (caddr_t)vifp;
+	ifp->if_mcast = vifp;
 
 	vifp->v_id = vifcp->vifc_vifi;
 	vifp->v_flags = vifcp->vifc_flags;
@@ -824,6 +873,13 @@ del_vif(struct socket *so, struct mbuf *m)
 	if (m == NULL || m->m_len < sizeof(vifi_t))
 		return (EINVAL);
 
+	rw_enter_read(&mrt_routerlock);
+	if (so != mrt_mrouter[inp->inp_rtableid]) {
+		rw_exit_read(&mrt_routerlock);
+		return (EPROTONOSUPPORT);
+	}
+	rw_exit_read(&mrt_routerlock);
+
 	vifip = mtod(m, vifi_t *);
 	if ((ifp = if_lookupbyvif(*vifip, rtableid)) == NULL)
 		return (EADDRNOTAVAIL);
@@ -838,7 +894,7 @@ vif_delete(struct ifnet *ifp)
 	struct vif	*v;
 	struct ifreq	 ifr;
 
-	if ((v = (struct vif *)ifp->if_mcast) == NULL)
+	if ((v = ifp->if_mcast) == NULL)
 		return;
 
 	ifp->if_mcast = NULL;
@@ -871,7 +927,7 @@ mfc_expire_route(struct rtentry *rt, u_int rtableid)
 	/* Not expired, add it back to the queue. */
 	if (mfc->mfc_expire == 0) {
 		mfc->mfc_expire = 1;
-		rt_timer_add(rt, &ip_mrouterq, rtableid);
+		rt_timer_add(rt, &mrt_timer, rtableid);
 		return;
 	}
 
@@ -882,9 +938,10 @@ int
 mfc_add_route(struct ifnet *ifp, struct sockaddr *origin,
     struct sockaddr *group, struct mfcctl2 *mfccp, int wait)
 {
-	struct vif		*v = (struct vif *)ifp->if_mcast;
+	struct vif		*v = ifp->if_mcast;
 	struct rtentry		*rt;
 	struct mfc		*mfc;
+	uint32_t		 api_config;
 	unsigned int		 rtableid = ifp->if_rdomain;
 
 	rt = rt_mcast_add(ifp, origin, group);
@@ -905,19 +962,23 @@ mfc_add_route(struct ifnet *ifp, struct sockaddr *origin,
 
 	rt->rt_llinfo = (caddr_t)mfc;
 
-	rt_timer_add(rt, &ip_mrouterq, rtableid);
+	rt_timer_add(rt, &mrt_timer, rtableid);
+
+	rw_enter_read(&mrt_routerlock);
+	api_config = mrt_api_config[rtableid];
+	rw_exit_read(&mrt_routerlock);
 
 	mfc->mfc_parent = mfccp->mfcc_parent;
 	mfc->mfc_pkt_cnt = 0;
 	mfc->mfc_byte_cnt = 0;
 	mfc->mfc_wrong_if = 0;
 	mfc->mfc_ttl = mfccp->mfcc_ttls[v->v_id];
-	mfc->mfc_flags = mfccp->mfcc_flags[v->v_id] & mrt_api_config &
+	mfc->mfc_flags = mfccp->mfcc_flags[v->v_id] & api_config &
 	    MRT_MFC_FLAGS_ALL;
 	mfc->mfc_expire = 0;
 
 	/* set the RP address */
-	if (mrt_api_config & MRT_MFC_RP)
+	if (api_config & MRT_MFC_RP)
 		mfc->mfc_rp = mfccp->mfcc_rp;
 	else
 		mfc->mfc_rp = zeroin_addr;
@@ -1029,7 +1090,7 @@ mfc_add(struct mfcctl2 *mfcctl2, struct in_addr *origin,
 
 	ifp = if_lookupbyvif(vidx, rtableid);
 	if (ifp == NULL ||
-	    (v = (struct vif *)ifp->if_mcast) == NULL)
+	    (v = ifp->if_mcast) == NULL)
 		return (EHOSTUNREACH);
 
 	memset(&mfcctl, 0, sizeof(mfcctl));
@@ -1051,11 +1112,20 @@ add_mfc(struct socket *so, struct mbuf *m)
 	struct inpcb *inp = sotoinpcb(so);
 	struct mfcctl2 mfcctl2;
 	int mfcctl_size = sizeof(struct mfcctl);
+	uint32_t api_config;
 	unsigned int rtableid = inp->inp_rtableid;
 
 	NET_ASSERT_LOCKED();
 
-	if (mrt_api_config & MRT_API_FLAGS_ALL)
+	rw_enter_read(&mrt_routerlock);
+	if (so != mrt_mrouter[inp->inp_rtableid]) {
+		rw_exit_read(&mrt_routerlock);
+		return (EPROTONOSUPPORT);
+	}
+	api_config = mrt_api_config[rtableid];
+	rw_exit_read(&mrt_routerlock);
+
+	if (api_config & MRT_API_FLAGS_ALL)
 		mfcctl_size = sizeof(struct mfcctl2);
 
 	if (m == NULL || m->m_len < mfcctl_size)
@@ -1064,7 +1134,7 @@ add_mfc(struct socket *so, struct mbuf *m)
 	/*
 	 * select data size depending on API version.
 	 */
-	if (mrt_api_config & MRT_API_FLAGS_ALL) {
+	if (api_config & MRT_API_FLAGS_ALL) {
 		struct mfcctl2 *mp2 = mtod(m, struct mfcctl2 *);
 		memcpy((caddr_t)&mfcctl2, mp2, sizeof(*mp2));
 	} else {
@@ -1100,6 +1170,13 @@ del_mfc(struct socket *so, struct mbuf *m)
 
 	if (m == NULL || m->m_len < mfcctl_size)
 		return (EINVAL);
+
+	rw_enter_read(&mrt_routerlock);
+	if (so != mrt_mrouter[inp->inp_rtableid]) {
+		rw_exit_read(&mrt_routerlock);
+		return (EPROTONOSUPPORT);
+	}
+	rw_exit_read(&mrt_routerlock);
 
 	mp = mtod(m, struct mfcctl *);
 
@@ -1157,7 +1234,6 @@ ip_mforward(struct mbuf *m, struct ifnet *ifp, int flags)
 	struct ip *ip = mtod(m, struct ip *);
 	struct vif *v;
 	struct rtentry *rt;
-	static int srctun = 0;
 	struct mbuf *mm;
 	unsigned int rtableid = ifp->if_rdomain;
 
@@ -1172,9 +1248,7 @@ ip_mforward(struct mbuf *m, struct ifnet *ifp, int flags)
 		 * Packet arrived through a source-route tunnel.
 		 * Source-route tunnels are no longer supported.
 		 */
-		if ((srctun++ % 1000) == 0)
-			log(LOG_ERR, "ip_mforward: received source-routed "
-			    "packet from %x\n", ntohl(ip->ip_src.s_addr));
+		mrtstat_inc(mrts_source_route);
 		return (EOPNOTSUPP);
 	}
 
@@ -1182,6 +1256,8 @@ ip_mforward(struct mbuf *m, struct ifnet *ifp, int flags)
 	 * Don't forward a packet with time-to-live of zero or one,
 	 * or a packet destined to a local-only group.
 	 */
+	if (ip->ip_ttl <= 1)
+		mrtstat_inc(mrts_time_to_live);
 	if (ip->ip_ttl <= 1 || IN_LOCAL_GROUP(ip->ip_dst.s_addr))
 		return (0);
 
@@ -1205,6 +1281,7 @@ ip_mforward(struct mbuf *m, struct ifnet *ifp, int flags)
 		mrtstat_inc(mrts_no_route);
 
 		{
+			struct sockaddr_in sin = { sizeof(sin), AF_INET };
 			struct igmpmsg *im;
 
 			/*
@@ -1212,7 +1289,7 @@ ip_mforward(struct mbuf *m, struct ifnet *ifp, int flags)
 			 * this packet.
 			 * If none found, drop packet.
 			 */
-			if ((v = (struct vif *)ifp->if_mcast) == NULL)
+			if ((v = ifp->if_mcast) == NULL)
 				return (EHOSTUNREACH);
 			/*
 			 * Make a copy of the header to send to the user level
@@ -1236,12 +1313,15 @@ ip_mforward(struct mbuf *m, struct ifnet *ifp, int flags)
 			mrtstat_inc(mrts_upcalls);
 
 			sin.sin_addr = ip->ip_src;
-			if (socket_send(ip_mrouter[rtableid], mm, &sin) < 0) {
+			rw_enter_read(&mrt_routerlock);
+			if (socket_send(mrt_mrouter[rtableid], mm, &sin) < 0) {
+				rw_exit_read(&mrt_routerlock);
 				log(LOG_WARNING, "ip_mforward: ip_mrouter "
 				    "socket queue full\n");
 				mrtstat_inc(mrts_upq_sockfull);
 				return (ENOBUFS);
 			}
+			rw_exit_read(&mrt_routerlock);
 
 			mfc_add(NULL, &ip->ip_src, &ip->ip_dst, v->v_id,
 			    rtableid, M_NOWAIT);
@@ -1259,7 +1339,7 @@ ip_mdq(struct mbuf *m, struct ifnet *ifp0, struct rtentry *rt, int flags)
 {
 	struct ip  *ip = mtod(m, struct ip *);
 	struct mfc *mfc = (struct mfc *)rt->rt_llinfo;
-	struct vif *v = (struct vif *)ifp0->if_mcast;
+	struct vif *v = ifp0->if_mcast;
 	struct ifnet *ifp;
 	struct mbuf *mc;
 	struct ip_moptions imo;
@@ -1318,7 +1398,7 @@ ip_mdq(struct mbuf *m, struct ifnet *ifp0, struct rtentry *rt, int flags)
 			continue;
 
 		/* Sanity check: did we configure this? */
-		if ((v = (struct vif *)ifp->if_mcast) == NULL) {
+		if ((v = ifp->if_mcast) == NULL) {
 			if_put(ifp);
 			continue;
 		}
@@ -1369,7 +1449,7 @@ if_lookupbyvif(vifi_t vifi, unsigned int rtableid)
 	TAILQ_FOREACH(ifp, &ifnetlist, if_list) {
 		if (ifp->if_rdomain != rtableid)
 			continue;
-		if ((v = (struct vif *)ifp->if_mcast) == NULL)
+		if ((v = ifp->if_mcast) == NULL)
 			continue;
 		if (v->v_id != vifi)
 			continue;
@@ -1420,6 +1500,8 @@ mrt_mcast_del(struct rtentry *rt, unsigned int rtableid)
 	free(rt->rt_llinfo, M_MRTABLE, sizeof(struct mfc));
 	rt->rt_llinfo = NULL;
 
+	mrt_count[rtableid]--;
+
 	ifp = if_get(rt->rt_ifidx);
 	if (ifp == NULL)
 		return;
@@ -1428,6 +1510,4 @@ mrt_mcast_del(struct rtentry *rt, unsigned int rtableid)
 
 	if (error)
 		DPRINTF("delete route error %d\n", error);
-
-	mrt_count[rtableid]--;
 }

@@ -1,4 +1,4 @@
-/*	$OpenBSD: ixgbe.h,v 1.37 2024/10/27 04:44:41 yasuoka Exp $	*/
+/*	$OpenBSD: ixgbe.h,v 1.39 2026/05/18 12:14:38 stsp Exp $	*/
 
 /******************************************************************************
 
@@ -94,9 +94,10 @@ typedef int	boolean_t;
 	#define DEBUGOUT5(S,A,B,C,D,E)  printf(S "\n",A,B,C,D,E)
 	#define DEBUGOUT6(S,A,B,C,D,E,F)  printf(S "\n",A,B,C,D,E,F)
 	#define DEBUGOUT7(S,A,B,C,D,E,F,G)  printf(S "\n",A,B,C,D,E,F,G)
-	#define ERROR_REPORT1(S,A)      printf(S "\n",A)
-	#define ERROR_REPORT2(S,A,B)    printf(S "\n",A,B)
-	#define ERROR_REPORT3(S,A,B,C)  printf(S "\n",A,B,C)
+	/* Error reports use an error category code C, which we ignore. */
+	#define ERROR_REPORT1(C,S)         printf(S "\n")
+	#define ERROR_REPORT2(C,S,A...)    printf(S "\n",A)
+	#define ERROR_REPORT3(C,S,A,B...)  printf(S "\n",A,B)
 #else
 	#define DEBUGOUT(S)
 	#define DEBUGOUT1(S,A)
@@ -107,9 +108,9 @@ typedef int	boolean_t;
 	#define DEBUGOUT6(S,A,B,C,D,E,F)
 	#define DEBUGOUT7(S,A,B,C,D,E,F,G)
 
-	#define ERROR_REPORT1(S,A)
-	#define ERROR_REPORT2(S,A,B)
-	#define ERROR_REPORT3(S,A,B,C)
+	#define ERROR_REPORT1(C,S)
+	#define ERROR_REPORT2(C,S,A)
+	#define ERROR_REPORT3(C,S,A,B)
 #endif
 
 #define FALSE		    		0
@@ -262,8 +263,13 @@ int32_t ixgbe_init_ops_X550(struct ixgbe_hw *hw);
 int32_t ixgbe_init_ops_X550EM(struct ixgbe_hw *hw);
 int32_t ixgbe_init_ops_X550EM_a(struct ixgbe_hw *hw);
 int32_t ixgbe_init_ops_X550EM_x(struct ixgbe_hw *hw);
+int32_t ixgbe_init_ops_E610(struct ixgbe_hw *hw);
 
+int32_t ixgbe_get_caps(struct ixgbe_hw *hw);
 int32_t ixgbe_set_mac_type(struct ixgbe_hw *hw);
+void ixgbe_init_aci(struct ixgbe_hw *hw);
+int32_t ixgbe_aci_get_event(struct ixgbe_hw *, struct ixgbe_aci_event *, bool *);
+void ixgbe_shutdown_aci(struct ixgbe_hw *hw);
 int32_t ixgbe_init_hw(struct ixgbe_hw *hw);
 enum ixgbe_media_type ixgbe_get_media_type(struct ixgbe_hw *hw);
 int32_t ixgbe_identify_phy(struct ixgbe_hw *hw);
@@ -283,6 +289,8 @@ void ixgbe_set_mta(struct ixgbe_hw *hw, uint8_t *mc_addr);
 
 void ixgbe_disable_rx(struct ixgbe_hw *hw);
 void ixgbe_enable_rx(struct ixgbe_hw *hw);
+
+int32_t ixgbe_configure_lse(struct ixgbe_hw *, bool, uint16_t);
 
 /* PHY */
 int32_t ixgbe_init_phy_ops_generic(struct ixgbe_hw *hw);

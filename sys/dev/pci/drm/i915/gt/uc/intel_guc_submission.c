@@ -2108,7 +2108,7 @@ static int init_tlb_lookup(struct intel_guc *guc)
 	if (!HAS_GUC_TLB_INVALIDATION(guc_to_gt(guc)->i915))
 		return 0;
 
-	xa_init_flags(&guc->tlb_lookup, XA_FLAGS_ALLOC);
+	xa_init_flags(&guc->tlb_lookup, XA_FLAGS_LOCK_IRQ);
 
 	wait = kzalloc(sizeof(*wait), GFP_KERNEL);
 	if (!wait)
@@ -5935,9 +5935,7 @@ guc_create_virtual(struct intel_engine_cs **siblings, unsigned int count,
 
 	ve->base.flags = I915_ENGINE_IS_VIRTUAL;
 
-#ifdef notyet
 	BUILD_BUG_ON(ilog2(VIRTUAL_ENGINES) < I915_NUM_ENGINES);
-#endif
 	ve->base.mask = VIRTUAL_ENGINES;
 
 	intel_context_init(&ve->context, &ve->base);

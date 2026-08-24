@@ -1,4 +1,4 @@
-/*	$OpenBSD: session.c,v 1.529 2026/03/19 12:44:23 claudio Exp $ */
+/*	$OpenBSD: session.c,v 1.540 2026/07/24 05:01:01 claudio Exp $ */
 
 /*
  * Copyright (c) 2003, 2004, 2005 Henning Brauer <henning@openbsd.org>
@@ -55,7 +55,6 @@
 #define PFD_LISTENERS_START	5
 
 #define MAX_TIMEOUT		240
-#define PAUSEACCEPT_TIMEOUT	1
 
 void	session_sighdlr(int);
 int	setup_listeners(u_int *);
@@ -363,9 +362,7 @@ session_main(int debug, int verbose)
 					bgp_fsm(p, EVNT_START, NULL);
 					break;
 				case Timer_IdleHoldReset:
-					p->IdleHoldTime =
-					    INTERVAL_IDLE_HOLD_INITIAL;
-					p->errcnt = 0;
+					p->IdleHoldTime = 0;
 					timer_stop(&p->timers,
 					    Timer_IdleHoldReset);
 					break;
@@ -596,10 +593,8 @@ init_peer(struct peer *p, struct bgpd_config *c)
 	peer_cnt++;
 
 	change_state(p, STATE_IDLE, EVNT_NONE);
-	if (p->conf.down)
-		timer_stop(&p->timers, Timer_IdleHold); /* no autostart */
-	else
-		timer_set(&p->timers, Timer_IdleHold, SESSION_CLEAR_DELAY);
+	if (!p->conf.down)
+		bgp_fsm(p, EVNT_START, NULL);
 
 	p->stats.last_updown = getmonotime();
 
@@ -715,15 +710,6 @@ session_accept(int listenfd)
 	}
 
 	p = getpeerbyip(conf, (struct sockaddr *)&cliaddr);
-
-	if (p != NULL && p->state == STATE_IDLE && p->errcnt < 2) {
-		if (timer_running(&p->timers, Timer_IdleHold, NULL)) {
-			/* fast reconnect after clear */
-			p->passive = 1;
-			bgp_fsm(p, EVNT_START, NULL);
-		}
-	}
-
 	if (p != NULL &&
 	    (p->state == STATE_CONNECT || p->state == STATE_ACTIVE)) {
 		if (p->fd != -1) {
@@ -797,8 +783,11 @@ session_connect(struct peer *peer)
 	}
 
 	if (tcp_md5_set(peer->fd, &peer->auth_conf,
-	    &peer->conf.remote_addr) == -1)
+	    &peer->conf.remote_addr) == -1) {
 		log_peer_warn(&peer->conf, "setting md5sig");
+		bgp_fsm(peer, EVNT_CON_OPENFAIL, NULL);
+		return (-1);
+	}
 
 	/* if local-address is set we need to bind() */
 	bind_addr = session_localaddr(peer);
@@ -1048,8 +1037,8 @@ session_handle_rrefresh(struct peer *peer, struct route_refresh *rr)
 void
 session_graceful_restart(struct peer *p)
 {
-	uint8_t	i;
-	uint16_t staletime = conf->staletime;
+	u_int i;
+	u_int staletime = conf->staletime;
 
 	if (p->conf.staletime)
 		staletime = p->conf.staletime;
@@ -1058,6 +1047,14 @@ session_graceful_restart(struct peer *p)
 	if (staletime > p->capa.neg.grestart.timeout)
 		staletime = p->capa.neg.grestart.timeout;
 	timer_set(&p->timers, Timer_RestartTimeout, staletime);
+
+	if (staletime < INTERVAL_SESSION_DOWN - INTERVAL_STALE)
+		staletime = INTERVAL_SESSION_DOWN - INTERVAL_STALE;
+
+	/* bits from session_down that are also needed here */
+	p->stats.last_updown = getmonotime();
+	timer_set(&p->timers, Timer_SessionDown,
+	    staletime + INTERVAL_STALE);
 
 	for (i = AID_MIN; i < AID_MAX; i++) {
 		if (p->capa.neg.grestart.flags[i] & CAPA_GR_PRESENT) {
@@ -1080,7 +1077,7 @@ session_graceful_restart(struct peer *p)
 void
 session_graceful_stop(struct peer *p)
 {
-	uint8_t	i;
+	u_int	i;
 
 	for (i = AID_MIN; i < AID_MAX; i++) {
 		/*
@@ -1095,7 +1092,7 @@ session_graceful_stop(struct peer *p)
 }
 
 void
-session_graceful_flush(struct peer *p, uint8_t aid, const char *why)
+session_graceful_flush(struct peer *p, u_int aid, const char *why)
 {
 	log_peer_warnx(&p->conf, "graceful restart of %s, %s, flushing",
 	    aid2str(aid), why);
@@ -1119,7 +1116,7 @@ session_mrt_dump_state(struct peer *p)
 
 void
 session_mrt_dump_bgp_msg(struct peer *p, struct ibuf *msg,
-     enum msg_type msgtype, enum directions dir)
+     enum msg_type msgtype, enum direction dir)
 {
 	struct mrt		*mrt;
 
@@ -1191,13 +1188,13 @@ session_dispatch_imsg(struct imsgbuf *imsgbuf, int idx, u_int *listener_cnt)
 	struct session_dependon	 sdon;
 	uint32_t		 peerid;
 	int			 n, fd, depend_ok, restricted;
+	u_int			 aid;
 	uint16_t		 t;
-	uint8_t			 aid, errcode, subcode;
+	uint8_t			 errcode, subcode;
 
 	while (imsgbuf) {
-		if ((n = imsg_get(imsgbuf, &imsg)) == -1)
-			fatal("session_dispatch_imsg: imsg_get error");
-
+		if ((n = imsgbuf_get(imsgbuf, &imsg)) == -1)
+			fatal("session_dispatch_imsg: imsgbuf_get error");
 		if (n == 0)
 			break;
 
@@ -1961,7 +1958,9 @@ merge_peers(struct bgpd_config *c, struct bgpd_config *nc)
 				session_template_clone(xp, NULL, xp->conf.id,
 				    xp->conf.remote_as);
 
-				if (p->rdesession)
+				xp->local_bgpid = nc->bgpid;
+
+				if (xp->rdesession)
 					imsg_rde(IMSG_SESSION_ADD,
 					    xp->conf.id, &xp->conf,
 					    sizeof(xp->conf));

@@ -1,4 +1,4 @@
-#	$OpenBSD: RAMDISK_CD,v 1.213 2025/12/23 00:04:48 sthen Exp $
+#	$OpenBSD: RAMDISK_CD,v 1.216 2026/08/19 08:56:28 hshoexer Exp $
 
 machine		amd64
 maxusers	4
@@ -19,6 +19,7 @@ option		UDF
 option		MSDOSFS
 option		INET6
 option		CRYPTO
+option		AMDSEV
 
 option		FONT_SPLEEN8x16
 option		FONT_SPLEEN12x24
@@ -204,6 +205,9 @@ wd*		at pciide? flags 0x0000
 atapiscsi*	at wdc?
 atapiscsi*	at pciide?
 
+puc*		at pci?			# PCI "universal" communication device
+com*		at puc?
+
 sdhc*		at pci?			# SD Host Controller
 sdmmc*		at sdhc?		# SD/MMC bus
 rtsx*		at pci?			# Realtek SD Card Reader
@@ -290,7 +294,7 @@ iwn*		at pci?			# Intel Wireless WiFi Link 4965AGN
 iwm*		at pci?			# Intel WiFi Link 7xxx
 iwx*		at pci?			# Intel WiFi Link 22xxx
 qwx*		at pci?			# Qualcomm 802.11ax
-#qwz*		at pci?			# Qualcomm 802.11be
+qwz*		at pci?			# Qualcomm 802.11be
 ral*		at pci?			# Ralink RT2500/RT2501/RT2600
 ral*		at cardbus?		# Ralink RT2500/RT2501/RT2600
 rtw*		at pci?			# Realtek 8180

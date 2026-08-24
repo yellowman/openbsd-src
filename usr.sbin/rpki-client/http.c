@@ -1,4 +1,4 @@
-/*	$OpenBSD: http.c,v 1.100 2025/09/18 15:40:22 claudio Exp $ */
+/*	$OpenBSD: http.c,v 1.109 2026/08/05 19:15:22 claudio Exp $ */
 /*
  * Copyright (c) 2020 Nils Fisher <nils_fisher@hotmail.com>
  * Copyright (c) 2020 Claudio Jeker <claudio@openbsd.org>
@@ -44,6 +44,7 @@
  * ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
  * POSSIBILITY OF SUCH DAMAGE.
  */
+
 #include <sys/types.h>
 #include <sys/queue.h>
 #include <sys/socket.h>
@@ -925,7 +926,6 @@ http_done(struct http_connection *conn, enum http_result res)
 	if (!conn->was_gzipped && conn->totalsz > (1024 * 1024))
 		logx("%s: downloaded %zu bytes without HTTP "
 		    "compression", conn_info(conn), conn->totalsz);
-	conn->was_gzipped = 0;
 
 	conn->state = STATE_IDLE;
 	conn->idle_time = getmonotime() + HTTP_IDLE_TIMEOUT;
@@ -942,9 +942,13 @@ http_done(struct http_connection *conn, enum http_result res)
 	LIST_REMOVE(conn, entry);
 	LIST_INSERT_HEAD(&idle, conn, entry);
 
-	/* reset status and keep-alive for good measures */
+	/* reset connection parameters in preparation for a next request */
+	conn->totalsz = 0;
+	conn->was_gzipped = 0;
 	conn->status = 0;
 	conn->keep_alive = 0;
+	free(conn->last_modified);
+	conn->last_modified = NULL;
 
 	return WANT_POLLIN;
 }
@@ -1254,7 +1258,7 @@ http_request(struct http_connection *conn)
 
 /*
  * Parse the HTTP status line.
- * Return 0 for status codes 100, 103, 200, 203, 301-304, 307-308.
+ * Return 0 for status codes 200, 203, 301-304, 307-308.
  * The other 1xx and 2xx status codes are explicitly not handled and are
  * considered an error.
  * Failure codes and other errors return -1.
@@ -1301,9 +1305,6 @@ http_parse_status(struct http_connection *conn, char *buf)
 			return -1;
 		}
 		/* FALLTHROUGH */
-	case 100:	/* Informational: continue (ignored) */
-	case 103:	/* Informational: early hints (ignored) */
-		/* FALLTHROUGH */
 	case 200:	/* Success: OK */
 	case 203:	/* Success: non-authoritative information (proxy) */
 	case 304:	/* Redirect: not modified */
@@ -1316,6 +1317,18 @@ http_parse_status(struct http_connection *conn, char *buf)
 		return -1;
 	}
 
+	return 0;
+}
+
+/*
+ * Return true if the response should not contain a message-body.
+ */
+static inline int
+http_isbodyless(struct http_connection *conn)
+{
+	if ((conn->status >= 100 && conn->status <= 199) ||
+	    conn->status == 204 || conn->status == 205 || conn->status == 304)
+		return 1;
 	return 0;
 }
 
@@ -1380,9 +1393,30 @@ http_parse_header(struct http_connection *conn, char *buf)
 
 	cp = buf;
 	/* empty line, end of header */
-	if (*cp == '\0')
+	if (*cp == '\0') {
+		/* check consistency of header fields */
+		if (http_isredirect(conn) && conn->redir_uri == NULL) {
+			warnx("%s: redirect with no location",
+			    http_info(conn->req->uri));
+			return -1;
+		}
+		if (conn->iosz != 0 && conn->chunked) {
+			warnx("%s: mutually exclusive, Content-Length set with"
+			    "Transfer-Encoding: chunked", conn_info(conn));
+			return -1;
+		}
+		if (http_isbodyless(conn)) {
+			if (conn->bufpos != 0) {
+				/* no pipelining so no extra data */
+				warnx("%s: unexpected trailing data",
+				    conn_info(conn));
+				return -1;
+			}
+			conn->chunked = 0;
+			conn->iosz = 0;
+		}
 		return 0;
-	else if (strncasecmp(cp, CONTENTLEN, sizeof(CONTENTLEN) - 1) == 0) {
+	} else if (strncasecmp(cp, CONTENTLEN, sizeof(CONTENTLEN) - 1) == 0) {
 		cp += sizeof(CONTENTLEN) - 1;
 		cp += strspn(cp, " \t");
 		conn->iosz = strtonum(cp, 0, MAX_CONTENTLEN, &errstr);
@@ -1432,12 +1466,17 @@ http_parse_header(struct http_connection *conn, char *buf)
 		loctail = strchr(redirurl, '#');
 		if (loctail != NULL)
 			*loctail = '\0';
-		conn->redir_uri = redirurl;
 		if (!valid_origin(redirurl, conn->req->uri)) {
-			warnx("%s: cross origin redirect to %s", conn->req->uri,
-			    http_info(redirurl));
+			char redirbuf[200];
+
+			(void)strlcpy(redirbuf, http_info(redirurl),
+			    sizeof(redirbuf));
+			warnx("%s: cross origin redirect to %s",
+			    http_info(conn->req->uri), redirbuf);
+			free(redirurl);
 			return -1;
 		}
+		conn->redir_uri = redirurl;
 	} else if (strncasecmp(cp, TRANSFER_ENCODING,
 	    sizeof(TRANSFER_ENCODING) - 1) == 0) {
 		cp += sizeof(TRANSFER_ENCODING) - 1;
@@ -1540,7 +1579,10 @@ http_read(struct http_connection *conn)
 		goto again;
 
 read_more:
-	assert(conn->bufpos < conn->bufsz);
+	if (conn->bufpos >= conn->bufsz) {
+		warnx("%s: read buffer full", conn_info(conn));
+		return http_failed(conn);
+	}
 	s = tls_read(conn->tls, conn->buf + conn->bufpos,
 	    conn->bufsz - conn->bufpos);
 	if (s == -1) {
@@ -1623,12 +1665,13 @@ again:
 				done = 1;
 		}
 
+		conn->totalsz = 0;
+
 		/* Check status header and decide what to do next */
 		if (http_isok(conn) || http_isredirect(conn)) {
 			if (http_isredirect(conn))
 				http_redirect(conn);
 
-			conn->totalsz = 0;
 			if (conn->chunked)
 				conn->state = STATE_RESPONSE_CHUNKED_HEADER;
 			else
@@ -1765,7 +1808,10 @@ proxy_read(struct http_connection *conn)
 	char *buf;
 	int done;
 
-	assert(conn->bufpos < conn->bufsz);
+	if (conn->bufpos >= conn->bufsz) {
+		warnx("%s: read buffer full", conn_info(conn));
+		return http_failed(conn);
+	}
 	s = read(conn->fd, conn->buf + conn->bufpos,
 	    conn->bufsz - conn->bufpos);
 	if (s == -1) {

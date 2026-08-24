@@ -1,4 +1,4 @@
-/*	$OpenBSD: pf_ioctl.c,v 1.429 2026/02/11 01:13:20 bluhm Exp $ */
+/*	$OpenBSD: pf_ioctl.c,v 1.433 2026/07/27 19:02:48 gnezdo Exp $ */
 
 /*
  * Copyright (c) 2001 Daniel Hartmeier
@@ -1089,35 +1089,6 @@ pf_statelim_unlink(struct pf_statelim *pfstlim,
 	PF_STATE_EXIT_WRITE();
 }
 
-int
-pf_statelim_clr(uint32_t id, int rmst)
-{
-	struct pf_statelim key = { .pfstlim_id = id };
-	struct pf_statelim *pfstlim;
-	int error = ESRCH; /* is this right? */
-	struct pf_state_link_list garbage = TAILQ_HEAD_INITIALIZER(garbage);
-	struct pf_state_link *pfl, *npfl;
-
-	if (rmst)
-		return (EOPNOTSUPP);
-
-	NET_LOCK();
-	PF_LOCK();
-	pfstlim = RBT_FIND(pf_statelim_id_tree, &pf_statelim_id_tree_active,
-	    &key);
-	if (pfstlim != NULL) {
-		pf_statelim_unlink(pfstlim, &garbage);
-		error = 0;
-	}
-	PF_UNLOCK();
-	NET_UNLOCK();
-
-	TAILQ_FOREACH_SAFE(pfl, &garbage, pfl_link, npfl)
-		pool_put(&pf_state_link_pl, pfl);
-
-	return (error);
-}
-
 void
 pf_statelim_commit(void)
 {
@@ -1576,8 +1547,8 @@ pf_sourcelim_add(const struct pfioc_sourcelim *ioc)
 
 	if (RBT_INSERT(pf_sourcelim_nm_tree,
 	    &pf_sourcelim_nm_tree_inactive, pfsrlim) != NULL) {
-		RBT_INSERT(pf_sourcelim_nm_tree,
-		    &pf_sourcelim_nm_tree_inactive, pfsrlim);
+		RBT_REMOVE(pf_sourcelim_id_tree,
+		    &pf_sourcelim_id_tree_inactive, pfsrlim);
 		error = EBUSY;
 		goto unlock;
 	}
@@ -1590,6 +1561,8 @@ pf_sourcelim_add(const struct pfioc_sourcelim *ioc)
 	return (0);
 
 unlock:
+	if (pfsrlim->pfsrlim_overload.table != NULL)
+		pfr_detach_table(pfsrlim->pfsrlim_overload.table);
 	PF_UNLOCK();
 	NET_UNLOCK();
 free:
@@ -2245,6 +2218,9 @@ pfioctl(dev_t dev, u_long cmd, caddr_t addr, int flags, struct proc *p)
 			goto fail;
 		}
 		memcpy(qs, &q->queue, sizeof(*qs));
+		qs->qname[sizeof(qs->qname) - 1] = '\0';
+		qs->parent[sizeof(qs->parent) - 1] = '\0';
+		qs->ifname[sizeof(qs->ifname) - 1] = '\0';
 		qs->qid = pf_qname2qid(qs->qname, 1);
 		if (qs->qid == 0) {
 			error = EBUSY;
@@ -4066,6 +4042,15 @@ pf_rule_copyin(struct pf_rule *from, struct pf_rule *to)
 		return (EINVAL);
 
 	/* XXX union skip[] */
+
+	from->label[sizeof(from->label) - 1] = '\0';
+	from->ifname[sizeof(from->ifname) - 1] = '\0';
+	from->rcv_ifname[sizeof(from->rcv_ifname) - 1] = '\0';
+	from->qname[sizeof(from->qname) - 1] = '\0';
+	from->pqname[sizeof(from->pqname) - 1] = '\0';
+	from->tagname[sizeof(from->tagname) - 1] = '\0';
+	from->match_tagname[sizeof(from->match_tagname) - 1] = '\0';
+	from->overload_tblname[sizeof(from->overload_tblname) - 1] = '\0';
 
 	strlcpy(to->label, from->label, sizeof(to->label));
 	strlcpy(to->ifname, from->ifname, sizeof(to->ifname));

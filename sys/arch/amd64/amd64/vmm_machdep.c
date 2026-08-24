@@ -1,4 +1,4 @@
-/* $OpenBSD: vmm_machdep.c,v 1.72 2026/02/16 15:08:41 hshoexer Exp $ */
+/* $OpenBSD: vmm_machdep.c,v 1.74 2026/08/19 08:56:28 hshoexer Exp $ */
 /*
  * Copyright (c) 2014 Mike Larkin <mlarkin@openbsd.org>
  *
@@ -1391,7 +1391,11 @@ vcpu_writeregs_vmx(struct vcpu *vcpu, uint64_t regmask, int loadvmcs,
 		vcpu->vc_gueststate.vg_dr1 = drs[VCPU_REGS_DR1];
 		vcpu->vc_gueststate.vg_dr2 = drs[VCPU_REGS_DR2];
 		vcpu->vc_gueststate.vg_dr3 = drs[VCPU_REGS_DR3];
+		if ((drs[VCPU_REGS_DR6] & 0xffffffff00000000) != 0)
+			goto errout;
 		vcpu->vc_gueststate.vg_dr6 = drs[VCPU_REGS_DR6];
+		if ((drs[VCPU_REGS_DR7] & 0xffffffff00000000) != 0)
+			goto errout;
 		if (vmwrite(VMCS_GUEST_IA32_DR7, drs[VCPU_REGS_DR7]))
 			goto errout;
 	}
@@ -1528,7 +1532,11 @@ vcpu_writeregs_svm(struct vcpu *vcpu, uint64_t regmask,
 		vcpu->vc_gueststate.vg_dr1 = drs[VCPU_REGS_DR1];
 		vcpu->vc_gueststate.vg_dr2 = drs[VCPU_REGS_DR2];
 		vcpu->vc_gueststate.vg_dr3 = drs[VCPU_REGS_DR3];
+		if ((drs[VCPU_REGS_DR6] & 0xffffffff00000000) != 0)
+			return (EINVAL);
 		vmcb->v_dr6 = drs[VCPU_REGS_DR6];
+		if ((drs[VCPU_REGS_DR7] & 0xffffffff00000000) != 0)
+			return (EINVAL);
 		vmcb->v_dr7 = drs[VCPU_REGS_DR7];
 	}
 
@@ -4515,7 +4523,7 @@ svm_handle_vmgexit(struct vcpu *vcpu)
 		req = (vmcb->v_ghcb_gpa & 0xffffffff);
 
 		/* We only support cpuid and terminate. */
-		if ((req & ~PG_FRAME) == MSR_PROTO_TERMINATE) {
+		if ((req & ~PG_FRAME) == MSR_PROTO_TERMINATION_REQ) {
 			DPRINTF("%s: guest requests termination\n", __func__);
 			return (1);
 		} else if ((req & ~PG_FRAME) != MSR_PROTO_CPUID_REQ)

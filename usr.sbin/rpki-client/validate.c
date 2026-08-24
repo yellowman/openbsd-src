@@ -1,4 +1,4 @@
-/*	$OpenBSD: validate.c,v 1.82 2026/01/13 21:36:17 job Exp $ */
+/*	$OpenBSD: validate.c,v 1.84 2026/06/15 14:30:53 job Exp $ */
 /*
  * Copyright (c) 2019 Kristaps Dzonsons <kristaps@bsd.lv>
  *
@@ -218,7 +218,8 @@ valid_hash(unsigned char *buf, size_t len, const char *hash, size_t hlen)
 
 /*
  * Validate that a filename only contains characters from the POSIX portable
- * filename character set [A-Za-z0-9._-], see IEEE Std 1003.1-2013, 3.278.
+ * filename character set [A-Za-z0-9._-], and not longer than _XOPEN_NAME_MAX.
+ * see IEEE Std 1003.1-2013, 3.278, and implementation-defined constants.
  */
 int
 valid_filename(const char *fn, size_t len)
@@ -226,9 +227,13 @@ valid_filename(const char *fn, size_t len)
 	const unsigned char *c;
 	size_t i;
 
+	if (len > MAX_FN_LENGTH)
+		return 0;
+
 	for (c = fn, i = 0; i < len; i++, c++)
 		if (!isalnum(*c) && *c != '-' && *c != '_' && *c != '.')
 			return 0;
+
 	return 1;
 }
 
@@ -236,6 +241,7 @@ valid_filename(const char *fn, size_t len)
  * Validate a URI to make sure it is pure ASCII and does not point backwards
  * or doing some other silly tricks. To enforce the protocol pass either
  * https:// or rsync:// as proto, if NULL is passed no protocol is enforced.
+ * If it's rsync, check that the URI contains a module component.
  * Returns 1 if valid, 0 otherwise.
  */
 int
@@ -262,6 +268,11 @@ valid_uri(const char *uri, size_t usz, const char *proto)
 	/* do not allow files or directories to start with a '.' */
 	if (strstr(uri, "/.") != NULL)
 		return 0;
+
+	if (strncasecmp(uri, RSYNC_PROTO, RSYNC_PROTO_LEN) == 0) {
+		if (!rsync_base_uri(uri, NULL))
+			return 0;
+	}
 
 	return 1;
 }

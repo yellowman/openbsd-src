@@ -1,4 +1,4 @@
-/*	$OpenBSD: ntpd.c,v 1.143 2025/08/20 10:40:21 henning Exp $ */
+/*	$OpenBSD: ntpd.c,v 1.147 2026/08/04 19:05:21 claudio Exp $ */
 
 /*
  * Copyright (c) 2003, 2004 Henning Brauer <henning@openbsd.org>
@@ -138,7 +138,7 @@ main(int argc, char *argv[])
 	int			argc0 = argc, logdest;
 	char			**argv0 = argv;
 	char			*pname = NULL;
-	time_t			 settime_deadline;
+	time_t			 settime_deadline = 0;
 	int			 sopt = 0;
 
 	if (strcmp(__progname, "ntpctl") == 0) {
@@ -391,16 +391,15 @@ int
 dispatch_imsg(struct ntpd_conf *lconf, int argc, char **argv)
 {
 	struct imsg		 imsg;
-	int			 n;
+	int			 n, synced;
 	double			 d;
 
 	if (imsgbuf_read(ibuf) != 1)
 		return (-1);
 
 	for (;;) {
-		if ((n = imsg_get(ibuf, &imsg)) == -1)
+		if ((n = imsgbuf_get(ibuf, &imsg)) == -1)
 			return (-1);
-
 		if (n == 0)
 			break;
 
@@ -409,11 +408,11 @@ dispatch_imsg(struct ntpd_conf *lconf, int argc, char **argv)
 			if (imsg.hdr.len != IMSG_HEADER_SIZE + sizeof(d))
 				fatalx("invalid IMSG_ADJTIME received");
 			memcpy(&d, imsg.data, sizeof(d));
-			n = ntpd_adjtime(d);
-			if (n == -1)
+			synced = ntpd_adjtime(d);
+			if (synced == -1)
 				fatalx("IMSG_ADJTIME with invalid value");
 			imsg_compose(ibuf, IMSG_ADJTIME, 0, 0, -1,
-			     &n, sizeof(n));
+			     &synced, sizeof(synced));
 			break;
 		case IMSG_ADJFREQ:
 			if (imsg.hdr.len != IMSG_HEADER_SIZE + sizeof(d))
@@ -713,8 +712,8 @@ ctl_main(int argc, char *argv[])
 			errx(1, "pipe closed");
 
 		while (!done) {
-			if ((n = imsg_get(ibuf_ctl, &imsg)) == -1)
-				err(1, "ibuf_ctl: imsg_get error");
+			if ((n = imsgbuf_get(ibuf_ctl, &imsg)) == -1)
+				err(1, "ibuf_ctl: imsgbuf_get error");
 			if (n == 0)
 				break;
 
@@ -839,7 +838,7 @@ show_peer_msg(struct imsg *imsg, int calledfromshowall)
 {
 	struct ctl_show_peer	*cpeer;
 	int			 cnt;
-	char			 stratum[3];
+	char			 stratum[4];
 	static int		 firsttime = 1;
 
 	if (imsg->hdr.type == IMSG_CTL_SHOW_PEERS_END) {

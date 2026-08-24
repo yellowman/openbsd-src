@@ -1,4 +1,4 @@
-/*	$OpenBSD: vfs_vnops.c,v 1.125 2025/01/06 08:57:23 mpi Exp $	*/
+/*	$OpenBSD: vfs_vnops.c,v 1.128 2026/06/12 12:20:25 kirill Exp $	*/
 /*	$NetBSD: vfs_vnops.c,v 1.20 1996/02/04 02:18:41 christos Exp $	*/
 
 /*
@@ -99,6 +99,8 @@ vn_open(struct nameidata *ndp, int fmode, int cmode)
 		return (EINVAL);
 	if ((fmode & (O_TRUNC | FWRITE)) == O_TRUNC)
 		return (EINVAL);
+	if ((fmode & (O_CREAT | O_DIRECTORY)) == (O_CREAT | O_DIRECTORY))
+		return (EINVAL);
 	if (fmode & O_CREAT) {
 		ndp->ni_cnd.cn_nameiop = CREATE;
 		ndp->ni_cnd.cn_flags |= LOCKPARENT | LOCKLEAF;
@@ -130,6 +132,10 @@ vn_open(struct nameidata *ndp, int fmode, int cmode)
 			vp = ndp->ni_vp;
 			if (fmode & O_EXCL) {
 				error = EEXIST;
+				goto bad;
+			}
+			if (vp->v_type == VDIR) {
+				error = EISDIR;
 				goto bad;
 			}
 			fmode &= ~O_CREAT;
@@ -587,9 +593,9 @@ vn_lock(struct vnode *vp, int flags)
 				 */
 				error = ENOENT;
 				VOP_UNLOCK(vp);
-				if (do_wakeup)
-					wakeup_one(&vp->v_lockcount);
 			}
+			if (do_wakeup && xlocked)
+				wakeup_one(&vp->v_lockcount);
 		}
 	} while (flags & LK_RETRY);
 	return (error);

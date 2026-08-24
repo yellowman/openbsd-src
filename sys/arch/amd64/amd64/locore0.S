@@ -1,4 +1,4 @@
-/*	$OpenBSD: locore0.S,v 1.34 2026/01/15 12:09:49 hshoexer Exp $	*/
+/*	$OpenBSD: locore0.S,v 1.36 2026/08/19 08:56:28 hshoexer Exp $	*/
 /*	$NetBSD: locore.S,v 1.13 2004/03/25 18:33:17 drochner Exp $	*/
 
 /*
@@ -655,6 +655,10 @@ store_pte:
 	fillkpt_nx
 
 	leal	(PROC0_PML4_OFF + PDIR_SLOT_DIRECT * 8)(%esi), %ebx
+	movb	RELOC((pmap_direct_rand)), %al
+	andl	$DIRECT_MAP_START_MASK, %eax
+	shll	$0x3, %eax
+	addl	%eax, %ebx
 	leal	(PROC0_DMP3_OFF)(%esi), %eax
 	orl	$(PG_V|PG_KW), %eax
 	movl	$NDML3_ENTRIES, %ecx
@@ -806,19 +810,9 @@ longmode_hi:
 	call	main
 
 	.code32
-vc_cpuid32:
-	shll	$30, %eax		/* requested register */
-	orl	$MSR_PROTO_CPUID_REQ, %eax
-	movl	%ebx, %edx		/* CPUID function */
-	movl	$MSR_SEV_GHCB, %ecx
-	wrmsr
-	rep vmmcall
-	rdmsr
-	ret
-	lfence
-
 	.globl	locore_vc_trap32
 locore_vc_trap32:
+#ifdef AMDSEV
 	pushl	%eax
 	pushl	%ebx
 	pushl	%ecx
@@ -867,8 +861,21 @@ locore_vc_trap32:
 	addl	$3, (%esp)		/* skip mov,%db */
 	iret
 
+vc_cpuid32:
+	shll	$30, %eax		/* requested register */
+	orl	$MSR_PROTO_CPUID_REQ, %eax
+	movl	%ebx, %edx		/* CPUID function */
+	movl	$MSR_SEV_GHCB, %ecx
+	wrmsr
+	rep vmmcall
+	rdmsr
+	ret
+	lfence
+#endif	/* AMDSEV */
+	/* !AMDSEV: FALLTHROUGH and graceful termination */
+
 .Lterminate32:
-	movl	$MSR_PROTO_TERMINATE, %eax
+	movl	$MSR_PROTO_TERMINATION_REQ, %eax
 	movl	$MSR_SEV_GHCB, %ecx
 	wrmsr
 	rep vmmcall
@@ -921,4 +928,3 @@ farjmp64:
 	.align 8, 0xcc
 	.space 512
 tmpstk:
-

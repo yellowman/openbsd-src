@@ -1,4 +1,4 @@
-/* $OpenBSD: mlkem_internal.c,v 1.7 2026/03/06 09:22:29 kenjiro Exp $ */
+/* $OpenBSD: mlkem_internal.c,v 1.9 2026/05/04 20:44:36 tb Exp $ */
 /*
  * Copyright (c) 2024, Google Inc.
  * Copyright (c) 2024, 2025 Bob Beck <beck@obtuse.com>
@@ -828,11 +828,13 @@ public_key_from_external(const MLKEM_public_key *external,
     struct public_key *pub)
 {
 	size_t vector_size = external->rank * sizeof(scalar);
-	uint8_t *bytes = external->key_768->bytes;
 	size_t offset = 0;
+	uint8_t *bytes;
 
 	if (external->rank == MLKEM1024_RANK)
 		bytes = external->key_1024->bytes;
+	else
+		bytes = external->key_768->bytes;
 
 	pub->t = (struct scalar *)bytes + offset;
 	offset += vector_size;
@@ -856,10 +858,12 @@ private_key_from_external(const MLKEM_private_key *external,
 {
 	size_t vector_size = external->rank * sizeof(scalar);
 	size_t offset = 0;
-	uint8_t *bytes = external->key_768->bytes;
+	uint8_t *bytes;
 
 	if (external->rank == MLKEM1024_RANK)
 		bytes = external->key_1024->bytes;
+	else
+		bytes = external->key_768->bytes;
 
 	priv->pub.t = (struct scalar *)(bytes + offset);
 	offset += vector_size;
@@ -1133,6 +1137,7 @@ mlkem_decap(const MLKEM_private_key *private_key, const uint8_t *ciphertext,
  err:
 	freezero(expected_ciphertext, expected_ciphertext_length);
 	explicit_bzero(key_and_randomness, sizeof(key_and_randomness));
+	explicit_bzero(failure_key, sizeof(failure_key));
 	explicit_bzero(decrypted, sizeof(decrypted));
 
 	return ret;

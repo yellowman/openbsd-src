@@ -1,4 +1,4 @@
-# $OpenBSD: Makefile,v 1.114 2026/02/24 08:20:52 nicm Exp $
+# $OpenBSD: Makefile,v 1.122 2026/08/01 17:04:12 miod Exp $
 
 PROG=	tmux
 SRCS=	alerts.c \
@@ -17,7 +17,6 @@ SRCS=	alerts.c \
 	cmd-detach-client.c \
 	cmd-display-menu.c \
 	cmd-display-message.c \
-	cmd-display-panes.c \
 	cmd-find-window.c \
 	cmd-find.c \
 	cmd-if-shell.c \
@@ -76,12 +75,16 @@ SRCS=	alerts.c \
 	control-notify.c \
 	control.c \
 	environ.c \
+	events.c \
+	events-payload.c \
 	file.c \
 	format.c \
+	fuzzy.c \
 	format-draw.c \
 	grid-reader.c \
 	grid-view.c \
 	grid.c \
+	hooks.c \
 	hyperlinks.c \
 	input-keys.c \
 	input.c \
@@ -94,14 +97,16 @@ SRCS=	alerts.c \
 	log.c \
 	menu.c \
 	mode-tree.c \
+	monitor.c \
 	names.c \
-	notify.c \
 	options-table.c \
 	options.c \
 	paste.c \
 	popup.c \
 	proc.c \
 	procname.c \
+	prompt.c \
+	prompt-history.c \
 	regsub.c \
 	resize.c \
 	screen-redraw.c \
@@ -125,12 +130,16 @@ SRCS=	alerts.c \
 	tty.c \
 	utf8.c \
 	utf8-combined.c \
+	window-border.c \
 	window-buffer.c \
 	window-client.c \
 	window-clock.c \
 	window-copy.c \
 	window-customize.c \
+	window-panes.c \
+	window-switch.c \
 	window-tree.c \
+	window-visible.c \
 	window.c \
 	xmalloc.c
 
@@ -141,7 +150,12 @@ CDIAGFLAGS+= -Wundef -Wbad-function-cast -Winline -Wcast-align
 
 CFLAGS += -I${.CURDIR}
 
-LDADD=  -lutil -lcurses -levent -lm
-DPADD=  ${LIBUTIL} ${LIBCURSES} ${LIBEVENT} ${LIBM}
+LDADD=	-lutil -lcurses -levent -lm
+DPADD=	${LIBUTIL} ${LIBCURSES} ${LIBEVENT} ${LIBM}
+
+.if "${MACHINE_ARCH}" == "sh"
+screen-redraw.o:
+	${CC} ${CFLAGS} -fno-stack-protector ${CPPFLAGS} -c ${.IMPSRC}
+.endif
 
 .include <bsd.prog.mk>

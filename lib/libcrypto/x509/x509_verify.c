@@ -1,4 +1,4 @@
-/* $OpenBSD: x509_verify.c,v 1.73 2025/02/08 10:12:00 tb Exp $ */
+/* $OpenBSD: x509_verify.c,v 1.78 2026/07/31 03:59:50 kenjiro Exp $ */
 /*
  * Copyright (c) 2020-2021 Bob Beck <beck@openbsd.org>
  *
@@ -83,7 +83,7 @@ x509_verify_asn1_time_to_time_t(const ASN1_TIME *atime, int notAfter,
 	return asn1_time_tm_to_time_t(&tm, out);
 }
 
-struct x509_verify_chain *
+static struct x509_verify_chain *
 x509_verify_chain_new(void)
 {
 	struct x509_verify_chain *chain;
@@ -155,6 +155,11 @@ x509_verify_chain_append(struct x509_verify_chain *chain, X509 *cert,
 	int verify_err = X509_V_ERR_UNSPECIFIED;
 	size_t idx;
 
+	if (sk_X509_num(chain->certs) >= X509_VERIFY_MAX_CHAIN_CERTS) {
+		*error = X509_V_ERR_CERT_CHAIN_TOO_LONG;
+		return 0;
+	}
+
 	if (!x509_constraints_extract_names(chain->names, cert,
 	    sk_X509_num(chain->certs) == 0, &verify_err)) {
 		*error = verify_err;
@@ -194,7 +199,7 @@ x509_verify_chain_last(struct x509_verify_chain *chain)
 	return sk_X509_value(chain->certs, last);
 }
 
-X509 *
+static X509 *
 x509_verify_chain_leaf(struct x509_verify_chain *chain)
 {
 	if (chain->certs == NULL)
@@ -663,10 +668,8 @@ x509_verify_build_chains(struct x509_verify_ctx *ctx, X509 *cert,
 	depth = sk_X509_num(current_chain->certs);
 	if (depth > 0)
 		depth--;
-
-	if (depth >= ctx->max_depth &&
-	    !x509_verify_cert_error(ctx, cert, depth,
-		X509_V_ERR_CERT_CHAIN_TOO_LONG, 0))
+	if (depth >= ctx->max_depth && !x509_verify_cert_error(ctx, cert, depth,
+	    X509_V_ERR_CERT_CHAIN_TOO_LONG, 0))
 		return;
 
 	count = ctx->chains_count;
@@ -906,7 +909,8 @@ x509_verify_cert_extensions(struct x509_verify_ctx *ctx, X509 *cert, int need_ca
 		ctx->error = X509_V_ERR_INVALID_CA;
 		return 0;
 	}
-	if (ctx->purpose > 0 && X509_check_purpose(cert, ctx->purpose, need_ca)) {
+	if (ctx->purpose > 0 &&
+	    X509_check_purpose(cert, ctx->purpose, need_ca) != 1) {
 		ctx->error = X509_V_ERR_INVALID_PURPOSE;
 		return 0;
 	}
@@ -973,8 +977,8 @@ x509_verify_ctx_new_from_xsc(X509_STORE_CTX *xsc)
 	    (ctx->intermediates = X509_chain_up_ref(xsc->untrusted)) == NULL)
 		goto err;
 
-	max_depth = X509_VERIFY_MAX_CHAIN_CERTS;
-	if (xsc->param->depth > 0 && xsc->param->depth < X509_VERIFY_MAX_CHAIN_CERTS)
+	max_depth = X509_VERIFY_MAX_CHAIN_CERTS - 1;
+	if (xsc->param->depth > 0 && xsc->param->depth < max_depth)
 		max_depth = xsc->param->depth;
 	if (!x509_verify_ctx_set_max_depth(ctx, max_depth))
 		goto err;
@@ -1003,7 +1007,7 @@ x509_verify_ctx_new(STACK_OF(X509) *roots)
 			goto err;
 	}
 
-	ctx->max_depth = X509_VERIFY_MAX_CHAIN_CERTS;
+	ctx->max_depth = X509_VERIFY_MAX_CHAIN_CERTS - 1;
 	ctx->max_chains = X509_VERIFY_MAX_CHAINS;
 	ctx->max_sigs = X509_VERIFY_MAX_SIGCHECKS;
 
@@ -1030,7 +1034,7 @@ x509_verify_ctx_free(struct x509_verify_ctx *ctx)
 int
 x509_verify_ctx_set_max_depth(struct x509_verify_ctx *ctx, size_t max)
 {
-	if (max < 1 || max > X509_VERIFY_MAX_CHAIN_CERTS)
+	if (max < 1 || max >= X509_VERIFY_MAX_CHAIN_CERTS)
 		return 0;
 	ctx->max_depth = max;
 	return 1;

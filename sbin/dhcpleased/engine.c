@@ -1,4 +1,4 @@
-/*	$OpenBSD: engine.c,v 1.60 2025/10/05 07:25:16 florian Exp $	*/
+/*	$OpenBSD: engine.c,v 1.68 2026/08/14 15:57:30 florian Exp $	*/
 
 /*
  * Copyright (c) 2017, 2021 Florian Obser <florian@openbsd.org>
@@ -287,8 +287,7 @@ engine_dispatch_frontend(int fd, short event, void *bula)
 	struct imsgbuf			*ibuf = &iev->ibuf;
 	struct imsg			 imsg;
 	struct dhcpleased_iface		*iface;
-	ssize_t				 n;
-	int				 shut = 0;
+	int				 n, shut = 0;
 #ifndef	SMALL
 	int				 verbose;
 #endif	/* SMALL */
@@ -310,8 +309,8 @@ engine_dispatch_frontend(int fd, short event, void *bula)
 	}
 
 	for (;;) {
-		if ((n = imsg_get(ibuf, &imsg)) == -1)
-			fatal("%s: imsg_get error", __func__);
+		if ((n = imsgbuf_get(ibuf, &imsg)) == -1)
+			fatal("%s: imsgbuf_get error", __func__);
 		if (n == 0)	/* No more messages. */
 			break;
 
@@ -371,6 +370,8 @@ engine_dispatch_frontend(int fd, short event, void *bula)
 			if (imsg_get_data(&imsg, &imsg_dhcp,
 			    sizeof(imsg_dhcp)) == -1)
 				fatalx("%s: invalid %s", __func__, i2s(type));
+			if ((size_t)imsg_dhcp.len > sizeof(imsg_dhcp.packet))
+				fatalx("%s: invalid %s", __func__, i2s(type));
 
 			iface = get_dhcpleased_iface_by_id(imsg_dhcp.if_index);
 			if (iface != NULL)
@@ -402,14 +403,14 @@ engine_dispatch_main(int fd, short event, void *bula)
 #ifndef SMALL
 	static struct dhcpleased_conf	*nconf;
 	static struct iface_conf	*iface_conf;
+	struct imsg_iface_conf		 imsg_iface_conf;
 #endif /* SMALL */
 	struct imsg			 imsg;
 	struct imsgev			*iev = bula;
 	struct imsgbuf			*ibuf = &iev->ibuf;
 	struct imsg_ifinfo		 imsg_ifinfo;
-	ssize_t				 n;
 	uint32_t			 type;
-	int				 shut = 0;
+	int				 n, shut = 0;
 
 	if (event & EV_READ) {
 		if ((n = imsgbuf_read(ibuf)) == -1)
@@ -427,8 +428,8 @@ engine_dispatch_main(int fd, short event, void *bula)
 	}
 
 	for (;;) {
-		if ((n = imsg_get(ibuf, &imsg)) == -1)
-			fatal("%s: imsg_get error", __func__);
+		if ((n = imsgbuf_get(ibuf, &imsg)) == -1)
+			fatal("%s: imsgbuf_get error", __func__);
 		if (n == 0)	/* No more messages. */
 			break;
 
@@ -486,19 +487,29 @@ engine_dispatch_main(int fd, short event, void *bula)
 			SIMPLEQ_INIT(&nconf->iface_list);
 			break;
 		case IMSG_RECONF_IFACE:
-			if ((iface_conf = malloc(sizeof(struct iface_conf)))
+			if ((iface_conf = calloc(1, sizeof(struct iface_conf)))
 			    == NULL)
 				fatal(NULL);
 
-			if (imsg_get_data(&imsg, iface_conf,
-			    sizeof(struct iface_conf)) == -1)
+			if (imsg_get_data(&imsg, &imsg_iface_conf,
+			    sizeof(imsg_iface_conf)) == -1)
 				fatalx("%s: invalid %s", __func__, i2s(type));
 
-			iface_conf->vc_id = NULL;
-			iface_conf->vc_id_len = 0;
-			iface_conf->c_id = NULL;
-			iface_conf->c_id_len = 0;
-			iface_conf->h_name = NULL;
+			if (imsg_iface_conf.ignore_servers_len > MAX_SERVERS)
+				fatalx("%s: invalid %s", __func__, i2s(type));
+
+			if (strlcpy(iface_conf->name, imsg_iface_conf.name,
+			    sizeof(iface_conf->name)) >=
+			    sizeof(iface_conf->name))
+				fatalx("%s: invalid %s", __func__, i2s(type));
+			iface_conf->ignore = imsg_iface_conf.ignore;
+			memcpy(iface_conf->ignore_servers,
+			    imsg_iface_conf.ignore_servers,
+			    sizeof(iface_conf->ignore_servers));
+			iface_conf->ignore_servers_len =
+			    imsg_iface_conf.ignore_servers_len;
+			iface_conf->prefer_ipv6 = imsg_iface_conf.prefer_ipv6;
+
 			SIMPLEQ_INSERT_TAIL(&nconf->iface_list,
 			    iface_conf, entry);
 			break;
@@ -848,6 +859,9 @@ parse_dhcp(struct dhcpleased_iface *iface, struct imsg_dhcp *dhcp)
 		rem = ntohs(udp->uh_ulen);
 	}
 
+	if (rem < sizeof(*udp))
+		goto too_short;
+
 	p += sizeof(*udp);
 	rem -= sizeof(*udp);
 
@@ -1026,13 +1040,16 @@ parse_dhcp(struct dhcpleased_iface *iface, struct imsg_dhcp *dhcp)
 			memcpy(&nameservers, p, MINIMUM(sizeof(nameservers),
 			    dho_len));
 			if (log_getverbose() > 1) {
-				for (i = 0; i < MINIMUM(sizeof(nameservers),
-				    dho_len / sizeof(nameservers[0])); i++) {
+				size_t num_lease_nameservers = dho_len /
+				    sizeof(nameservers[0]);
+
+				for (i = 0; i < MINIMUM(MAX_RDNS_COUNT,
+				    num_lease_nameservers); i++) {
 					log_debug("DHO_DOMAIN_NAME_SERVERS: %s "
 					    "(%lu/%lu)", inet_ntop(AF_INET,
 					    &nameservers[i], hbuf,
 					    sizeof(hbuf)), i + 1,
-					    dho_len / sizeof(nameservers[0]));
+					    num_lease_nameservers);
 				}
 			}
 			p += dho_len;
@@ -1051,7 +1068,7 @@ parse_dhcp(struct dhcpleased_iface *iface, struct imsg_dhcp *dhcp)
 			while (slen > 0 && p[slen - 1] == '\0')
 				slen--;
 			/* slen might be 0 here, pretend option is not there. */
-			strvisx(hostname, p, slen, VIS_SAFE);
+			strvisx(hostname, p, slen, VIS_SAFE | VIS_NL);
 			if (log_getverbose() > 1)
 				log_debug("DHO_HOST_NAME: %s", hostname);
 			p += dho_len;
@@ -1070,7 +1087,7 @@ parse_dhcp(struct dhcpleased_iface *iface, struct imsg_dhcp *dhcp)
 			while (slen > 0 && p[slen - 1] == '\0')
 				slen--;
 			/* slen might be 0 here, pretend option is not there. */
-			strvisx(domainname, p, slen, VIS_SAFE);
+			strvisx(domainname, p, slen, VIS_SAFE | VIS_NL);
 			if (log_getverbose() > 1)
 				log_debug("DHO_DOMAIN_NAME: %s", domainname);
 			p += dho_len;
@@ -1351,7 +1368,7 @@ parse_dhcp(struct dhcpleased_iface *iface, struct imsg_dhcp *dhcp)
 
 		/* we made sure this is a string futher up */
 		strnvis(iface->file, dhcp_hdr->file, sizeof(iface->file),
-		    VIS_SAFE);
+		    VIS_SAFE | VIS_NL);
 
 		strlcpy(iface->domainname, domainname,
 		    sizeof(iface->domainname));
@@ -1769,6 +1786,7 @@ send_routes_withdraw(struct dhcpleased_iface *iface)
 	if (iface->requested_ip.s_addr == INADDR_ANY || iface->routes_len == 0)
 		return;
 
+	memset(&imsg, 0, sizeof(imsg));
 	imsg.if_index = iface->if_index;
 	imsg.rdomain = iface->rdomain;
 	imsg.addr = iface->requested_ip;

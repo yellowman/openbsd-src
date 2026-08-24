@@ -1,4 +1,4 @@
-/*	$OpenBSD: rtr.c,v 1.34 2026/03/19 13:36:50 claudio Exp $ */
+/*	$OpenBSD: rtr.c,v 1.36 2026/07/24 05:01:01 claudio Exp $ */
 
 /*
  * Copyright (c) 2020 Claudio Jeker <claudio@openbsd.org>
@@ -323,8 +323,8 @@ rtr_dispatch_imsg_parent(struct imsgbuf *imsgbuf)
 	int			 n, fd;
 
 	while (imsgbuf) {
-		if ((n = imsg_get(imsgbuf, &imsg)) == -1)
-			fatal("%s: imsg_get error", __func__);
+		if ((n = imsgbuf_get(imsgbuf, &imsg)) == -1)
+			fatal("%s: imsgbuf_get error", __func__);
 		if (n == 0)
 			break;
 
@@ -466,8 +466,8 @@ rtr_dispatch_imsg_rde(struct imsgbuf *imsgbuf)
 	int		n;
 
 	while (imsgbuf) {
-		if ((n = imsg_get(imsgbuf, &imsg)) == -1)
-			fatal("%s: imsg_get error", __func__);
+		if ((n = imsgbuf_get(imsgbuf, &imsg)) == -1)
+			fatal("%s: imsgbuf_get error", __func__);
 		if (n == 0)
 			break;
 
@@ -489,10 +489,13 @@ rtr_imsg_compose(int type, uint32_t id, pid_t pid, void *data, size_t datalen)
  * At the same time tas_aid is overwritten with the bitmasks or cleared
  * if no extra aid masks are needed.
  */
-static size_t
-rtr_aspa_set_size(struct aspa_set *aspa)
+static void
+rtr_aspa_set_size(const struct aspa_set *aspa, struct aspa_prep *ap)
 {
-	return aspa->num * sizeof(uint32_t);
+	if (aspa->num > MAX_ASPA_SPAS_COUNT)
+		return;
+	ap->datasize += aspa->num * sizeof(uint32_t);
+	ap->entries++;
 }
 
 /*
@@ -531,8 +534,7 @@ rtr_recalc(void)
 	rtr_aspa_merge(&at);
 
 	RB_FOREACH(aspa, aspa_tree, &at) {
-		ap.datasize += rtr_aspa_set_size(aspa);
-		ap.entries++;
+		rtr_aspa_set_size(aspa, &ap);
 	}
 
 	imsg_compose(ibuf_rde, IMSG_RECONF_ASPA_PREP, 0, 0, -1,
@@ -541,6 +543,13 @@ rtr_recalc(void)
 	/* walk tree in reverse because aspa_add_set requires that */
 	RB_FOREACH_REVERSE(aspa, aspa_tree, &at) {
 		struct aspa_set	as = { .as = aspa->as, .num = aspa->num };
+
+		if (aspa->num > MAX_ASPA_SPAS_COUNT) {
+			log_warnx("oversized ASPA record after merge: "
+			    "implicit withdraw of customerAS %s",
+			    log_as(aspa->as));
+			continue;
+		}
 
 		imsg_compose(ibuf_rde, IMSG_RECONF_ASPA, 0, 0, -1,
 		    &as, offsetof(struct aspa_set, tas));

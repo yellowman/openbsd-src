@@ -1,4 +1,4 @@
-/*	$OpenBSD: qwz.c,v 1.22 2026/02/18 03:10:57 jsg Exp $	*/
+/*	$OpenBSD: qwz.c,v 1.39 2026/06/07 16:13:08 mglocker Exp $	*/
 
 /*
  * Copyright 2023 Stefan Sperling <stsp@openbsd.org>
@@ -185,6 +185,20 @@ qwz_init(struct ifnet *ifp)
 	struct qwz_softc *sc = ifp->if_softc;
 	struct ieee80211com *ic = &sc->sc_ic;
 
+	/* Firmware stays running across ifconfig down/up; only re-scan. */
+	if (sc->fw_initialized) {
+		ic->ic_state = IEEE80211_S_INIT;
+		sc->ns_nstate = IEEE80211_S_INIT;
+		sc->scan.state = ATH12K_SCAN_IDLE;
+		if (ifp->if_flags & IFF_UP) {
+			refcnt_init(&sc->task_refs);
+			ifq_clr_oactive(&ifp->if_snd);
+			ifp->if_flags |= IFF_RUNNING;
+			ieee80211_begin_scan(ifp);
+		}
+		return 0;
+	}
+
 	sc->fw_mode = ATH12K_FIRMWARE_MODE_NORMAL;
 	/*
 	 * There are several known hardware/software crypto issues
@@ -286,6 +300,7 @@ qwz_init(struct ifnet *ifp)
 		ieee80211_begin_scan(ifp);
 	}
 
+	sc->fw_initialized = 1;
 	return 0;
 }
 
@@ -330,11 +345,20 @@ qwz_stop(struct ifnet *ifp)
 	task_del(systq, &sc->init_task);
 	qwz_del_task(sc, sc->sc_nswq, &sc->newstate_task);
 	qwz_del_task(sc, systq, &sc->setkey_task);
+	qwz_del_task(sc, systq, &sc->ba_task);
 	refcnt_finalize(&sc->task_refs, "qwzstop");
 
 	qwz_setkey_clear(sc);
 
 	clear_bit(ATH12K_FLAG_CRASH_FLUSH, sc->sc_flags);
+
+	/* Tear down firmware-side association so we can re-associate. */
+	if (!TAILQ_EMPTY(&sc->vif_list)) {
+		if (ic->ic_state == IEEE80211_S_RUN)
+			qwz_run_stop(sc);
+		if (ic->ic_state >= IEEE80211_S_AUTH)
+			qwz_deauth(sc);
+	}
 
 	ifp->if_timer = sc->sc_tx_timer = 0;
 
@@ -345,10 +369,12 @@ qwz_stop(struct ifnet *ifp)
 	sc->ns_nstate = IEEE80211_S_INIT;
 	sc->scan.state = ATH12K_SCAN_IDLE;
 	sc->vdev_id_11d_scan = QWZ_11D_INVALID_VDEV_ID;
-	sc->pdevs_active = 0;
 
-	/* power off hardware */
-	qwz_core_deinit(sc);
+	/*
+	 * Firmware stays running across ifconfig down/up; the chip is
+	 * only released on driver detach.  Do not clear pdevs_active
+	 * or call qwz_core_deinit() here.
+	 */
 
 	splx(s);
 }
@@ -730,8 +756,17 @@ qwz_add_sta_key(struct qwz_softc *sc, struct ieee80211_node *ni,
 		nq->flags |= QWZ_NODE_FLAG_HAVE_PAIRWISE_KEY;
 
 	if ((nq->flags & want_keymask) == want_keymask) {
-		DPRINTF("marking port %s valid\n",
-		    ether_sprintf(ni->ni_macaddr));
+		uint8_t pdev_id = 0; /* TODO: derive pdev ID somehow? */
+
+		/* 4-way handshake done; authorize the BSS peer now. */
+		ret = qwz_wmi_set_peer_param(sc, ni->ni_macaddr, arvif->vdev_id,
+		    pdev_id, WMI_PEER_AUTHORIZE, 1);
+		if (ret) {
+			printf("%s: unable to authorize BSS peer: %d\n",
+			    sc->sc_dev.dv_xname, ret);
+			return ret;
+		}
+
 		ni->ni_port_valid = 1;
 		ieee80211_set_link_state(ic, LINK_STATE_UP);
 	}
@@ -834,9 +869,7 @@ qwz_newstate(struct ieee80211com *ic, enum ieee80211_state nstate, int arg)
 	    nstate != IEEE80211_S_AUTH)
 		return 0;
 	if (ic->ic_state == IEEE80211_S_RUN) {
-#if 0
 		qwz_del_task(sc, systq, &sc->ba_task);
-#endif
 		qwz_del_task(sc, systq, &sc->setkey_task);
 		qwz_setkey_clear(sc);
 #if 0
@@ -1006,6 +1039,11 @@ qwz_wmi_init_wcn7850(struct qwz_softc *sc,
 	config->num_multicast_filter_entries = 0x20;
 	config->num_wow_filters = 0x16;
 	config->num_keep_alive_pattern = 0;
+
+	if (isset(sc->wmi.svc_map, WMI_TLV_SERVICE_PEER_METADATA_V1A_V1B_SUPPORT))
+		config->peer_metadata_ver = ATH12K_PEER_METADATA_V1A;
+	else
+		config->peer_metadata_ver = sc->dp.peer_metadata_ver;
 }
 
 void
@@ -1111,7 +1149,7 @@ qwz_hw_wcn7850_rx_desc_get_mpdu_seq_ctl_vld(struct hal_rx_desc *desc)
 	      le32toh(desc->u.wcn7850.mpdu_start.info4));
 }
 
-int
+bool
 qwz_hw_wcn7850_rx_desc_get_mpdu_fc_valid(struct hal_rx_desc *desc)
 {
 	return !!FIELD_GET(RX_MPDU_START_INFO4_MPDU_FCTRL_VALID,
@@ -1223,6 +1261,13 @@ qwz_hw_wcn7850_rx_desc_is_da_mcbc(struct hal_rx_desc *desc)
 {
 	return FIELD_GET(RX_MSDU_END_INFO13_MCAST_BCAST,
 	    le32toh(desc->u.wcn7850.msdu_end.info13));
+}
+
+bool
+qwz_hw_wcn7850_dp_rx_h_msdu_done(struct hal_rx_desc *desc)
+{
+	return !!(le32toh(desc->u.wcn7850.msdu_end.info14) &
+	    RX_MSDU_END_INFO14_MSDU_DONE);
 }
 
 int
@@ -1578,9 +1623,9 @@ const struct ce_attr qwz_host_ce_config_wcn7850[QWZ_CE_COUNT_WCN7850] = {
 		.dest_nentries = 0,
 	},
 
-	/* CE5: target->host pktlog */
+	/* CE5: target->host pktlog (DIS_INTR: frees MSI vector 8 for DP group 0) */
 	{
-		.flags = CE_ATTR_FLAGS,
+		.flags = CE_ATTR_FLAGS | CE_ATTR_DIS_INTR,
 		.src_nentries = 0,
 		.src_sz_max = 0,
 		.dest_nentries = 0,
@@ -1629,10 +1674,16 @@ ath12k_hal_wcn7850_tcl_to_wbm_rbm_map[DP_TCL_NUM_RING_MAX] = {
 
 static const struct ath12k_hw_hal_params ath12k_hw_hal_params_wcn7850 = {
 	.rx_buf_rbm = HAL_RX_BUF_RBM_SW1_BM,
-	.wbm2sw_cc_enable = HAL_WBM_SW_COOKIE_CONV_CFG_WBM2SW0_EN |
-			    HAL_WBM_SW_COOKIE_CONV_CFG_WBM2SW2_EN |
-			    HAL_WBM_SW_COOKIE_CONV_CFG_WBM2SW3_EN |
-			    HAL_WBM_SW_COOKIE_CONV_CFG_WBM2SW4_EN,
+	/*
+	 * Keep HW cookie-conversion enabled only for the RX release ring
+	 * (WBM2SW3, DP_RX_RELEASE_RING_NUM=3).  Linux ath12k handles the
+	 * new HW-CC TX completion layout (hal_wbm_completion_ring_tx with
+	 * buf_va_lo/buf_va_hi), but qwz parses TX completions using the
+	 * older hal_wbm_release_ring layout with buf_addr_info.  Disabling
+	 * HW CC for the TX rings forces FW to use the SW-cookie path so
+	 * qwz's BUFFER_ADDR_INFO1_SW_COOKIE lookup matches FW writeback.
+	 */
+	.wbm2sw_cc_enable = HAL_WBM_SW_COOKIE_CONV_CFG_WBM2SW3_EN,
 };
 
 const struct hal_rx_ops hal_rx_wcn7850_ops = {
@@ -1647,9 +1698,9 @@ const struct hal_rx_ops hal_rx_wcn7850_ops = {
 #ifdef notyet
 	.rx_desc_get_mesh_ctl = qwz_hw_wcn7850_rx_desc_get_mesh_ctl,
 	.rx_desc_get_mpdu_seq_ctl_vld = qwz_hw_wcn7850_rx_desc_get_mpdu_seq_ctl_vld,
-	.rx_desc_get_mpdu_fc_valid = qwz_hw_wcn7850_rx_desc_get_mpdu_fc_valid,
 	.rx_desc_get_mpdu_start_seq_no = qwz_hw_wcn7850_rx_desc_get_mpdu_start_seq_no,
 #endif
+	.rx_desc_get_mpdu_fc_valid = qwz_hw_wcn7850_rx_desc_get_mpdu_fc_valid,
 	.rx_desc_get_msdu_len = qwz_hw_wcn7850_rx_desc_get_msdu_len,
 #ifdef notyet
 	.rx_desc_get_msdu_sgi = qwz_hw_wcn7850_rx_desc_get_msdu_sgi,
@@ -1677,10 +1728,10 @@ const struct hal_rx_ops hal_rx_wcn7850_ops = {
 	.rx_desc_get_dot11_hdr = qwz_hw_wcn7850_rx_desc_get_dot11_hdr,
 	.rx_desc_get_crypto_header = qwz_hw_wcn7850_rx_desc_get_crypto_hdr,
 	.rx_desc_get_mpdu_frame_ctl = qwz_hw_wcn7850_rx_desc_get_mpdu_frame_ctl,
-	.dp_rx_h_msdu_done = qwz_hw_wcn7850_dp_rx_h_msdu_done,
 	.dp_rx_h_l4_cksum_fail = qwz_hw_wcn7850_dp_rx_h_l4_cksum_fail,
 	.dp_rx_h_ip_cksum_fail = qwz_hw_wcn7850_dp_rx_h_ip_cksum_fail,
 #endif
+	.dp_rx_h_msdu_done = qwz_hw_wcn7850_dp_rx_h_msdu_done,
 	.dp_rx_h_is_decrypted = qwz_hw_wcn7850_dp_rx_h_is_decrypted,
 	.dp_rx_h_mpdu_err = qwz_hw_wcn7850_dp_rx_h_mpdu_err,
 	.rx_desc_get_desc_size = qwz_hw_wcn7850_get_rx_desc_size,
@@ -1735,6 +1786,7 @@ static const struct ath12k_hw_params ath12k_hw_params[] = {
 		.qmi_cnss_feature_bitmap = BIT(CNSS_QDSS_CFG_MISS_V01) |
 					   BIT(CNSS_PCIE_PERST_NO_PULL_V01),
 		.tx_ring_size = DP_TCL_DATA_RING_SIZE,
+		.rddm_size = 0x780000,
 	},
 };
 
@@ -2535,7 +2587,7 @@ static const struct qmi_elem_info qmi_wlanfw_host_cap_req_msg_v01_ei[] = {
 	{
 		.data_type	= QMI_UNSIGNED_2_BYTE,
 		.elem_len	= 1,
-		.elem_size	= sizeof(uint8_t),
+		.elem_size	= sizeof(uint16_t),
 		.array_type	= NO_ARRAY,
 		.tlv_type	= 0x24,
 		.offset		= offsetof(struct qmi_wlanfw_host_cap_req_msg_v01,
@@ -3839,6 +3891,7 @@ qwz_ce_intr(void *arg)
 {
 	struct qwz_ce_pipe *pipe = arg;
 	struct qwz_softc *sc = pipe->sc;
+	int ret;
 
 	if (!test_bit(ATH12K_FLAG_CE_IRQ_ENABLED, sc->sc_flags) ||
 	    ((sc->msi_ce_irqmask & (1 << pipe->pipe_num)) == 0)) {
@@ -3847,7 +3900,20 @@ qwz_ce_intr(void *arg)
 		return 1;
 	}
 
-	return qwz_ce_per_engine_service(sc, pipe->pipe_num);
+	ret = qwz_ce_per_engine_service(sc, pipe->pipe_num);
+
+	/*
+	 * Multi-MSI ext-IRQ vectors do not deliver on X1E80100; drive
+	 * the DP service path from the CE interrupt instead.
+	 */
+	if (test_bit(ATH12K_FLAG_MULTI_MSI_VECTORS, sc->sc_flags) &&
+	    test_bit(ATH12K_FLAG_EXT_IRQ_ENABLED, sc->sc_flags)) {
+		int i;
+		for (i = 0; i < nitems(sc->ext_irq_grp); i++)
+			qwz_dp_service_srng(sc, i);
+	}
+
+	return ret;
 }
 
 int
@@ -4681,6 +4747,18 @@ qwz_qmi_recv_wlanfw_phy_cap_req_v1(struct qwz_softc *sc, struct mbuf *m,
 	DNPRINTF(QWZ_D_QMI, "%s: resp.single_chip_mlo_support=0x%x\n",
 	   __func__, resp.single_chip_mlo_support);
 
+	/*
+	 * Capture WCN7850's QMI single_chip_mlo_support bit so that
+	 * qwz_qmi_host_cap_send can echo MLO capability back to FW.
+	 * Linux ath12k core.c notes that "WCN7850 firmware uses QMI
+	 * single_chip_mlo_support bit" specifically for MLO advertisement,
+	 * and qwz never captured/echoed this -- without it, FW takes a
+	 * code path different from Linux for this chip.
+	 */
+	if (resp.single_chip_mlo_support_valid && resp.single_chip_mlo_support)
+		sc->single_chip_mlo_support = 1;
+	if (resp.num_phy_valid)
+		sc->qmi_phy_cap_num_phy = resp.num_phy;
 	sc->qmi_resp.result = le16toh(resp.resp.result);
 	sc->qmi_resp.error = le16toh(resp.resp.error);
 	wakeup(&sc->qmi_resp);
@@ -5411,6 +5489,7 @@ qwz_qmi_encode_struct(uint8_t *p, size_t *encoded_len,
 {
 	const struct qmi_elem_info *ei = struct_ei->ei_array;
 	size_t remain = input_len;
+	int nelem, idx;
 
 	*encoded_len = 0;
 
@@ -5436,39 +5515,50 @@ qwz_qmi_encode_struct(uint8_t *p, size_t *encoded_len,
 			}
 		}
 
-		if (ei->elem_size > remain) {
+		/*
+		 * STATIC_ARRAY in a struct member (e.g. hw_link_id[2] in
+		 * wlfw_host_mlo_chip_info_s_v01) means we have to emit
+		 * elem_len consecutive elements; the per-byte/word/etc.
+		 * encoders already use input + offset + idx*elem_size so
+		 * we just call them in a loop and advance p per iteration.
+		 * NO_ARRAY collapses to nelem=1 -- preserves prior behavior.
+		 */
+		nelem = (ei->array_type == STATIC_ARRAY) ? ei->elem_len : 1;
+		if ((size_t)ei->elem_size * nelem > remain) {
 			printf("%s: QMI message buffer too short\n", __func__);
 			return -1;
 		}
 
-		switch (ei->data_type) {
-		case QMI_UNSIGNED_1_BYTE:
-			if (qwz_qmi_encode_byte(p, ei, input, 0))
+		for (idx = 0; idx < nelem; idx++) {
+			switch (ei->data_type) {
+			case QMI_UNSIGNED_1_BYTE:
+				if (qwz_qmi_encode_byte(p, ei, input, idx))
+					return -1;
+				break;
+			case QMI_UNSIGNED_2_BYTE:
+				if (qwz_qmi_encode_word(p, ei, input, idx))
+					return -1;
+				break;
+			case QMI_UNSIGNED_4_BYTE:
+			case QMI_SIGNED_4_BYTE_ENUM:
+				if (qwz_qmi_encode_dword(p, ei, input, idx))
+					return -1;
+				break;
+			case QMI_UNSIGNED_8_BYTE:
+				if (qwz_qmi_encode_qword(p, ei, input, idx))
+					return -1;
+				break;
+			default:
+				printf("%s: unhandled QMI struct element "
+				    "type %d\n", __func__, ei->data_type);
 				return -1;
-			break;
-		case QMI_UNSIGNED_2_BYTE:
-			if (qwz_qmi_encode_word(p, ei, input, 0))
-				return -1;
-			break;
-		case QMI_UNSIGNED_4_BYTE:
-		case QMI_SIGNED_4_BYTE_ENUM:
-			if (qwz_qmi_encode_dword(p, ei, input, 0))
-				return -1;
-			break;
-		case QMI_UNSIGNED_8_BYTE:
-			if (qwz_qmi_encode_qword(p, ei, input, 0))
-				return -1;
-			break;
-		default:
-			printf("%s: unhandled QMI struct element type %d\n",
-			    __func__, ei->data_type);
-			return -1;
+			}
+			if (p != NULL)
+				p += ei->elem_size;
 		}
 
-		remain -= ei->elem_size;
-		if (p != NULL)
-			p += ei->elem_size;
-		*encoded_len += ei->elem_size;
+		remain -= (size_t)ei->elem_size * nelem;
+		*encoded_len += (size_t)ei->elem_size * nelem;
 		ei++;
 	}
 
@@ -5579,6 +5669,33 @@ qwz_qmi_encode_msg(uint8_t **encoded_msg, size_t *encoded_len, int type,
 				goto err;
 			*encoded_len += encoded_string_len;
 			ei++;
+		} else if (ei->array_type == STATIC_ARRAY) {
+			/*
+			 * STATIC_ARRAY without a preceding QMI_DATA_LEN
+			 * always emits exactly elem_len entries on the wire,
+			 * regardless of any "valid count" field elsewhere
+			 * in the message.  Mirrors Linux's QMI library --
+			 * required for fields like mlo_chip_info[3] in
+			 * qmi_wlanfw_host_cap_req_msg_v01.
+			 */
+			if (ei->data_type == QMI_STRUCT) {
+				for (i = 0; i < ei->elem_len; i++) {
+					size_t encoded_struct_len = 0;
+					size_t inoff = ei->offset +
+					    (i * ei->elem_size);
+
+					if (qwz_qmi_encode_struct(NULL,
+					    &encoded_struct_len, ei,
+					    input + inoff,
+					    input_len - inoff))
+						goto err;
+					*encoded_len += encoded_struct_len;
+				}
+			} else {
+				*encoded_len += (size_t)ei->elem_size *
+				    ei->elem_len;
+			}
+			ei++;
 		} else {
 			*encoded_len += ei->elem_size;
 			ei++;
@@ -5641,6 +5758,9 @@ qwz_qmi_encode_msg(uint8_t **encoded_msg, size_t *encoded_len, int type,
 			ei++;
 			if (ei->array_type == VAR_LEN_ARRAY)
 				nelem = datalen;
+		} else if (ei->array_type == STATIC_ARRAY) {
+			/* See first-pass STATIC_ARRAY comment above. */
+			nelem = ei->elem_len;
 		}
 
 		for (i = 0; i < nelem; i++) {
@@ -5920,6 +6040,25 @@ qwz_qmi_host_cap_send(struct qwz_softc *sc)
 		req.nm_modem |= QWZ_SLEEP_CLOCK_SELECT_INTERNAL_BIT;
 		req.nm_modem |= QWZ_PLATFORM_CAP_PCIE_GLOBAL_RESET;
 	}
+
+	/*
+	 * MLO advertisement is intentionally NOT emitted here.
+	 *
+	 * The QMI encoder now handles STATIC_ARRAY correctly so the wire
+	 * format would be valid (FW accepts the request -- verified in
+	 * 2026-05-01 testing with the MLO block enabled), BUT advertising
+	 * MLO capability triggers FW to expect additional MLO-specific
+	 * WMI/HTT initialization that qwz does not currently perform.
+	 * The result is an earlier post-AUTHORIZE FW fault than in the
+	 * non-MLO baseline -- worse, not better.
+	 *
+	 * The PHY_CAP capture (sc->single_chip_mlo_support,
+	 * sc->qmi_phy_cap_num_phy) and the diagnostic printf in
+	 * qwz_qmi_recv_wlanfw_phy_cap_req_v1 stay in place.  When MLO
+	 * support is fully ported (post-association MLO link setup,
+	 * MLO peer state machine, etc.), restore the emission block
+	 * here -- the encoder is ready for it.
+	 */
 
 	DNPRINTF(QWZ_D_QMI, "%s: qmi host cap request\n", __func__);
 
@@ -6556,7 +6695,7 @@ qwz_qmi_load_file_target_mem(struct qwz_softc *sc, const u_char *data,
 
 	req = malloc(sizeof(*req), M_DEVBUF, M_NOWAIT | M_ZERO);
 	if (!req) {
-		printf("%s: failed to allocate bfd download request\n",
+		printf("%s: failed to allocate bdf download request\n",
 		    sc->sc_dev.dv_xname);
 		return ENOMEM;
 	}
@@ -7105,7 +7244,17 @@ qwz_hal_srng_access_begin(struct qwz_softc *sc, struct hal_srng *srng)
 		srng->u.src_ring.cached_tp =
 			*(volatile uint32_t *)srng->u.src_ring.tp_addr;
 	} else {
-		srng->u.dst_ring.cached_hp = *srng->u.dst_ring.hp_addr;
+		/*
+		 * Volatile load: hp_addr lives in the rdp DMA-shared
+		 * region the device writes to.  Without volatile the
+		 * compiler hoisted the load and we always read a stale
+		 * cached_hp, so TX completion entries the FW wrote
+		 * accumulated indefinitely (4 entries written, only 2
+		 * drained) until the FW's TX desc pool exhausted and
+		 * QURT asserted.
+		 */
+		srng->u.dst_ring.cached_hp =
+			*(volatile uint32_t *)srng->u.dst_ring.hp_addr;
 	}
 }
 
@@ -7607,29 +7756,6 @@ qwz_hal_srng_get_params(struct qwz_softc *sc, struct hal_srng *srng,
 	params->flags = srng->flags;
 }
 
-void
-qwz_hal_tx_init_data_ring(struct qwz_softc *sc, struct hal_srng *srng)
-{
-	struct hal_srng_params params;
-	struct hal_tlv_hdr *tlv;
-	int i, entry_size;
-	uint8_t *desc;
-
-	memset(&params, 0, sizeof(params));
-
-	entry_size = qwz_hal_srng_get_entrysize(sc, HAL_TCL_DATA);
-	qwz_hal_srng_get_params(sc, srng, &params);
-	desc = (uint8_t *)params.ring_base_vaddr;
-
-	for (i = 0; i < params.num_entries; i++) {
-		tlv = (struct hal_tlv_hdr *)desc;
-		tlv->tl = FIELD_PREP(HAL_TLV_HDR_TAG, HAL_TCL_DATA_CMD) |
-		    FIELD_PREP(HAL_TLV_HDR_LEN,
-		    sizeof(struct hal_tcl_data_cmd));
-		desc += entry_size;
-	}
-}
-
 #define DSCP_TID_MAP_TBL_ENTRY_SIZE 64
 
 /* dscp_tid_map - Default DSCP-TID mapping
@@ -8015,9 +8141,6 @@ qwz_dp_srng_common_setup(struct qwz_softc *sc)
 			    sc->sc_dev.dv_xname, i, ret);
 			goto err;
 		}
-
-		srng = &sc->hal.srng_list[dp->tx_ring[i].tcl_data_ring.ring_id];
-		qwz_hal_tx_init_data_ring(sc, srng);
 	}
 
 	ret = qwz_dp_srng_setup(sc, &dp->reo_reinject_ring, HAL_REO_REINJECT,
@@ -8235,7 +8358,29 @@ void *ath12k_dp_cc_get_desc_addr_ptr(struct qwz_softc *sc,
 {
 	struct qwz_dp *dp = &sc->dp;
 
-	return QWZ_DMA_KVA(dp->spt_info[ppt_idx].mem) + spt_idx;
+	/*
+	 * Cast to void** before adding spt_idx so arithmetic steps by
+	 * sizeof(void*), not by 1 byte.
+	 */
+	return (void **)QWZ_DMA_KVA(dp->spt_info[ppt_idx].mem) + spt_idx;
+}
+
+struct ath12k_rx_desc_info *
+qwz_dp_get_rx_desc(struct qwz_softc *sc, uint32_t cookie)
+{
+	struct ath12k_rx_desc_info **desc_addr_ptr;
+	uint16_t ppt_idx, spt_idx;
+
+	ppt_idx = FIELD_GET(ATH12K_DP_CC_COOKIE_PPT, cookie);
+	spt_idx = FIELD_GET(ATH12K_DP_CC_COOKIE_SPT, cookie);
+
+	if (ppt_idx < ATH12K_RX_SPT_PAGE_OFFSET ||
+	    ppt_idx >= ATH12K_RX_SPT_PAGE_OFFSET + ATH12K_NUM_RX_SPT_PAGES ||
+	    spt_idx >= ATH12K_MAX_SPT_ENTRIES)
+		return NULL;
+
+	desc_addr_ptr = ath12k_dp_cc_get_desc_addr_ptr(sc, ppt_idx, spt_idx);
+	return *desc_addr_ptr;
 }
 
 int
@@ -8246,6 +8391,8 @@ qwz_dp_cc_desc_init(struct qwz_softc *sc)
 	struct ath12k_tx_desc_info *tx_descs, **tx_desc_addr;
 	uint32_t i, j, pool_id, tx_spt_page;
 	uint32_t ppt_idx;
+	const bus_size_t size = DP_RX_BUFFER_SIZE;
+	int ret;
 
 #ifdef notyet
 	spin_lock_bh(&dp->rx_desc_lock);
@@ -8271,6 +8418,11 @@ qwz_dp_cc_desc_init(struct qwz_softc *sc)
 			rx_descs[j].magic = ATH12K_DP_RX_DESC_MAGIC;
 			TAILQ_INSERT_TAIL(&dp->rx_desc_free_list,
 			    &rx_descs[j], entry);
+
+			ret = bus_dmamap_create(sc->sc_dmat, size, 1, size,
+			    0, BUS_DMA_WAITOK, &rx_descs[j].map);
+			if (ret)
+				return ret;
 
 			/* Update descriptor VA in SPT */
 			rx_desc_addr = ath12k_dp_cc_get_desc_addr_ptr(sc, ppt_idx, j);
@@ -8340,12 +8492,19 @@ qwz_dp_cc_cleanup(struct qwz_softc *sc)
 	/* First ATH12K_NUM_RX_SPT_PAGES of allocated SPT pages are used for RX */
 	for (i = 0; i < ATH12K_NUM_RX_SPT_PAGES; i++) {
 		rx_descs = dp->spt_info->rxbaddr[i];
+		if (!rx_descs)
+			continue;
+
 		for (j = 0; j < ATH12K_MAX_SPT_ENTRIES; j++) {
-			if (!rx_descs[j].m)
-				continue;
-			bus_dmamap_unload(sc->sc_dmat, rx_descs[j].map);
-			m_freem(rx_descs[j].m);
-			rx_descs[j].m = NULL;
+			if (rx_descs[j].m) {
+				bus_dmamap_unload(sc->sc_dmat, rx_descs[j].map);
+				m_freem(rx_descs[j].m);
+				rx_descs[j].m = NULL;
+			}
+			if (rx_descs[j].map) {
+				bus_dmamap_destroy(sc->sc_dmat, rx_descs[j].map);
+				rx_descs[j].map = NULL;
+			}
 		}
 
 		free(dp->spt_info->rxbaddr[i], M_DEVBUF,
@@ -8364,6 +8523,8 @@ qwz_dp_cc_cleanup(struct qwz_softc *sc)
 		for (i = 0; i < ATH12K_TX_SPT_PAGES_PER_POOL; i++) {
 			tx_spt_page = i + pool_id * ATH12K_TX_SPT_PAGES_PER_POOL;
 			tx_descs = dp->spt_info->txbaddr[tx_spt_page];
+			if (!tx_descs)
+				continue;
 
 			for (j = 0; j < ATH12K_MAX_SPT_ENTRIES; j++) {
 				if (!tx_descs[j].m)
@@ -8381,6 +8542,17 @@ qwz_dp_cc_cleanup(struct qwz_softc *sc)
 		spin_unlock_bh(&dp->tx_desc_lock[pool_id]);
 #endif
 	}
+
+	for (i = 0; i < dp->num_spt_pages; i++) {
+		if (!dp->spt_info[i].mem)
+			continue;
+		qwz_dmamem_free(sc->sc_dmat, dp->spt_info[i].mem);
+		dp->spt_info[i].mem = NULL;
+	}
+
+	free(dp->spt_info, M_DEVBUF, dp->num_spt_pages * sizeof(*dp->spt_info));
+	dp->spt_info = NULL;
+	dp->num_spt_pages = 0;
 }
 
 int
@@ -8543,7 +8715,7 @@ qwz_dp_rx_alloc(struct qwz_softc *sc)
 
 	for (i = 0; i < sc->hw_params.num_rxdma_dst_ring; i++) {
 		ret = qwz_dp_srng_setup(sc, &dp->rxdma_err_dst_ring[i],
-		    HAL_RXDMA_BUF, 0, i, DP_RXDMA_ERR_DST_RING_SIZE);
+		    HAL_RXDMA_DST, 0, i, DP_RXDMA_ERR_DST_RING_SIZE);
 		if (ret) {
 			printf("%s: failed to setup "
 			    "rxdma_err_dst_ring %d\n",
@@ -8722,6 +8894,15 @@ fail_link_desc_cleanup:
 }
 
 void
+qwz_dp_rx_tid_clear(struct qwz_softc *sc, struct dp_rx_tid *rx_tid)
+{
+	rx_tid->mem = NULL;
+	rx_tid->vaddr = NULL;
+	rx_tid->paddr = 0ULL;
+	rx_tid->size = 0;
+}
+
+void
 qwz_dp_reo_cmd_list_cleanup(struct qwz_softc *sc)
 {
 	struct qwz_dp *dp = &sc->dp;
@@ -8734,13 +8915,7 @@ qwz_dp_reo_cmd_list_cleanup(struct qwz_softc *sc)
 	TAILQ_FOREACH_SAFE(cmd, &dp->reo_cmd_list, entry, tmp) {
 		TAILQ_REMOVE(&dp->reo_cmd_list, cmd, entry);
 		rx_tid = &cmd->data;
-		if (rx_tid->mem) {
-			qwz_dmamem_free(sc->sc_dmat, rx_tid->mem);
-			rx_tid->mem = NULL;
-			rx_tid->vaddr = NULL;
-			rx_tid->paddr = 0ULL;
-			rx_tid->size = 0;
-		}
+		qwz_dp_rx_tid_clear(sc, rx_tid);
 		free(cmd, M_DEVBUF, sizeof(*cmd));
 	}
 
@@ -8749,13 +8924,7 @@ qwz_dp_reo_cmd_list_cleanup(struct qwz_softc *sc)
 		TAILQ_REMOVE(&dp->reo_cmd_cache_flush_list, cmd_cache, entry);
 		dp->reo_cmd_cache_flush_count--;
 		rx_tid = &cmd_cache->data;
-		if (rx_tid->mem) {
-			qwz_dmamem_free(sc->sc_dmat, rx_tid->mem);
-			rx_tid->mem = NULL;
-			rx_tid->vaddr = NULL;
-			rx_tid->paddr = 0ULL;
-			rx_tid->size = 0;
-		}
+		qwz_dp_rx_tid_clear(sc, rx_tid);
 		free(cmd_cache, M_DEVBUF, sizeof(*cmd_cache));
 	}
 #ifdef notyet
@@ -8789,6 +8958,13 @@ qwz_dp_free(struct qwz_softc *sc)
 		free(dp->tx_ring[i].tx_status, M_DEVBUF,
 		    sizeof(struct hal_wbm_release_ring) * DP_TX_COMP_RING_SIZE);
 		dp->tx_ring[i].tx_status = NULL;
+	}
+
+	for (i = 0; i <= HAL_DESC_REO_NON_QOS_TID; i++) {
+		if (dp->rx_tid_mem[i]) {
+			qwz_dmamem_free(sc->sc_dmat, dp->rx_tid_mem[i]);
+			dp->rx_tid_mem[i] = NULL;
+		}
 	}
 
 	/* Deinit any SOC level resource */
@@ -9913,9 +10089,19 @@ qwz_wmi_tlv_svc_rdy_ext2_parse(struct qwz_softc *sc,
     uint16_t tag, uint16_t len, const void *ptr, void *data)
 {
 	struct wmi_tlv_svc_rdy_ext2_parse *parse = data;
+	const struct wmi_service_ready_ext2_event *ev;
 	int ret;
 
 	switch (tag) {
+	case WMI_TAG_SERVICE_READY_EXT2_EVENT:
+		if (len < sizeof(*ev))
+			return EPROTO;
+
+		ev = ptr;
+		sc->dp.peer_metadata_ver = FIELD_GET(
+		    WMI_TARGET_CAP_FLAGS_RX_PEER_METADATA_VERSION,
+		    ev->target_cap_flags);
+		break;
 	case WMI_TAG_ARRAY_STRUCT:
 		if (!parse->dma_ring_cap_done) {
 			ret = qwz_wmi_tlv_dma_ring_caps(sc, len, ptr,
@@ -10009,10 +10195,6 @@ qwz_peer_assoc_conf_event(struct qwz_softc *sc, struct mbuf *m)
 		   sc->sc_dev.dv_xname);
 		return;
 	}
-
-	DNPRINTF(QWZ_D_WMI, "%s: event peer assoc conf ev vdev id %d "
-	    "macaddr %s\n", __func__, peer_assoc_conf.vdev_id,
-	    ether_sprintf((u_char *)peer_assoc_conf.macaddr));
 
 	sc->peer_assoc_done = 1;
 	wakeup(&sc->peer_assoc_done);
@@ -10355,6 +10537,57 @@ qwz_create_reg_rules_from_wmi(uint32_t num_reg_rules,
 	return reg_rule_ptr;
 }
 
+struct cur_reg_rule *
+qwz_create_ext_reg_rules_from_wmi(uint32_t num_reg_rules,
+    struct wmi_regulatory_ext_rule *wmi_reg_rule)
+{
+	struct cur_reg_rule *reg_rule_ptr;
+	uint32_t count;
+
+	reg_rule_ptr = mallocarray(num_reg_rules, sizeof(*reg_rule_ptr),
+	    M_DEVBUF, M_NOWAIT | M_ZERO);
+	if (!reg_rule_ptr)
+		return NULL;
+
+	for (count = 0; count < num_reg_rules; count++) {
+		reg_rule_ptr[count].start_freq = FIELD_GET(REG_RULE_START_FREQ,
+		    wmi_reg_rule[count].freq_info);
+		reg_rule_ptr[count].end_freq = FIELD_GET(REG_RULE_END_FREQ,
+		    wmi_reg_rule[count].freq_info);
+		reg_rule_ptr[count].max_bw = FIELD_GET(REG_RULE_MAX_BW,
+		    wmi_reg_rule[count].bw_pwr_info);
+		reg_rule_ptr[count].reg_power = FIELD_GET(REG_RULE_REG_PWR,
+		    wmi_reg_rule[count].bw_pwr_info);
+		reg_rule_ptr[count].ant_gain = FIELD_GET(REG_RULE_ANT_GAIN,
+		    wmi_reg_rule[count].bw_pwr_info);
+		reg_rule_ptr[count].flags = FIELD_GET(REG_RULE_FLAGS,
+		    wmi_reg_rule[count].flag_info);
+		reg_rule_ptr[count].psd_flag = FIELD_GET(REG_RULE_PSD_INFO,
+		    wmi_reg_rule[count].psd_power_info);
+		reg_rule_ptr[count].psd_eirp = FIELD_GET(REG_RULE_PSD_EIRP,
+		    wmi_reg_rule[count].psd_power_info);
+	}
+
+	return reg_rule_ptr;
+}
+
+static uint8_t
+qwz_wmi_ignore_num_extra_rules(struct wmi_regulatory_ext_rule *wmi_reg_rule,
+    uint32_t num_reg_rules)
+{
+	uint8_t num_invalid_5ghz_rules = 0;
+	uint32_t count, start_freq;
+
+	for (count = 0; count < num_reg_rules; count++) {
+		start_freq = FIELD_GET(REG_RULE_START_FREQ,
+		    wmi_reg_rule[count].freq_info);
+		if (start_freq >= ATH12K_MIN_6G_FREQ)
+			num_invalid_5ghz_rules++;
+	}
+
+	return num_invalid_5ghz_rules;
+}
+
 int
 qwz_pull_reg_chan_list_update_ev(struct qwz_softc *sc, struct mbuf *m,
     struct cur_regulatory_info *reg_info)
@@ -10471,8 +10704,193 @@ int
 qwz_pull_reg_chan_list_ext_update_ev(struct qwz_softc *sc, struct mbuf *m,
     struct cur_regulatory_info *reg_info)
 {
-	printf("%s: not implemented\n", __func__);
-	return ENOTSUP;
+	const void **tb;
+	const struct wmi_reg_chan_list_cc_ext_event *chan_list_event_hdr;
+	struct wmi_regulatory_ext_rule *wmi_reg_rule;
+	uint32_t num_2ghz_reg_rules, num_5ghz_reg_rules;
+	uint8_t num_invalid_5ghz_ext_rules;
+	int ret;
+
+	DNPRINTF(QWZ_D_WMI, "%s: processing regulatory ext channel list\n",
+	    __func__);
+
+	tb = qwz_wmi_tlv_parse_alloc(sc, mtod(m, void *), m->m_pkthdr.len);
+	if (tb == NULL) {
+		ret = ENOMEM; /* XXX allocation failure or parsing failure? */
+		printf("%s: failed to parse tlv: %d\n", __func__, ret);
+		return ENOMEM;
+	}
+
+	chan_list_event_hdr = tb[WMI_TAG_REG_CHAN_LIST_CC_EXT_EVENT];
+	if (!chan_list_event_hdr) {
+		printf("%s: failed to fetch reg chan list ext update ev\n",
+		    __func__);
+		free(tb, M_DEVBUF, WMI_TAG_MAX * sizeof(*tb));
+		return EPROTO;
+	}
+
+	reg_info->num_2ghz_reg_rules = chan_list_event_hdr->num_2ghz_reg_rules;
+	reg_info->num_5ghz_reg_rules = chan_list_event_hdr->num_5ghz_reg_rules;
+
+	if (reg_info->num_2ghz_reg_rules > MAX_REG_RULES ||
+	    reg_info->num_5ghz_reg_rules > MAX_REG_RULES) {
+		printf("%s: Num reg rules for 2 GHz/5 GHz exceeds max "
+		    "limit (num_2ghz_reg_rules: %d num_5ghz_reg_rules: %d "
+		    "max_rules: %d)\n", __func__, reg_info->num_2ghz_reg_rules,
+		    reg_info->num_5ghz_reg_rules, MAX_REG_RULES);
+		free(tb, M_DEVBUF, WMI_TAG_MAX * sizeof(*tb));
+		return EINVAL;
+	}
+
+	if (!(reg_info->num_2ghz_reg_rules + reg_info->num_5ghz_reg_rules)) {
+		printf("%s: No 2 GHz/5 GHz regulatory rules available in "
+		    "the ext event info\n", __func__);
+		free(tb, M_DEVBUF, WMI_TAG_MAX * sizeof(*tb));
+		return EINVAL;
+	}
+
+	memcpy(reg_info->alpha2, &chan_list_event_hdr->alpha2, REG_ALPHA2_LEN);
+	reg_info->dfs_region = chan_list_event_hdr->dfs_region;
+	reg_info->phybitmap = chan_list_event_hdr->phybitmap;
+	reg_info->num_phy = chan_list_event_hdr->num_phy;
+	reg_info->phy_id = chan_list_event_hdr->phy_id;
+	reg_info->ctry_code = chan_list_event_hdr->country_id;
+	reg_info->reg_dmn_pair = chan_list_event_hdr->domain_code;
+	reg_info->status_code = qwz_wmi_cc_setting_code_to_reg(
+	    chan_list_event_hdr->status_code);
+	reg_info->is_ext_reg_event = true;
+
+	reg_info->min_bw_2ghz = chan_list_event_hdr->min_bw_2ghz;
+	reg_info->max_bw_2ghz = chan_list_event_hdr->max_bw_2ghz;
+	reg_info->min_bw_5ghz = chan_list_event_hdr->min_bw_5ghz;
+	reg_info->max_bw_5ghz = chan_list_event_hdr->max_bw_5ghz;
+
+	num_2ghz_reg_rules = reg_info->num_2ghz_reg_rules;
+	num_5ghz_reg_rules = reg_info->num_5ghz_reg_rules;
+
+	DNPRINTF(QWZ_D_WMI,
+	    "%s: cc_ext %s dfs %d BW: min_2ghz %d max_2ghz %d min_5ghz %d "
+	    "max_5ghz %d phybitmap 0x%x\n", __func__, reg_info->alpha2,
+	    reg_info->dfs_region, reg_info->min_bw_2ghz,
+	    reg_info->max_bw_2ghz, reg_info->min_bw_5ghz,
+	    reg_info->max_bw_5ghz, reg_info->phybitmap);
+
+	DNPRINTF(QWZ_D_WMI,
+	    "%s: num_2ghz_reg_rules %d num_5ghz_reg_rules %d\n", __func__,
+	    num_2ghz_reg_rules, num_5ghz_reg_rules);
+
+	wmi_reg_rule = (struct wmi_regulatory_ext_rule *)
+	    ((uint8_t *)chan_list_event_hdr + sizeof(*chan_list_event_hdr)
+	    + sizeof(struct wmi_tlv));
+
+	if (num_2ghz_reg_rules) {
+		reg_info->reg_rules_2ghz_ptr =
+		    qwz_create_ext_reg_rules_from_wmi(num_2ghz_reg_rules,
+		    wmi_reg_rule);
+		if (!reg_info->reg_rules_2ghz_ptr) {
+			free(tb, M_DEVBUF, WMI_TAG_MAX * sizeof(*tb));
+			printf("%s: Unable to allocate memory for "
+			    "2 GHz rules\n", __func__);
+			return ENOMEM;
+		}
+
+		qwz_print_reg_rule(sc, "2 GHz", num_2ghz_reg_rules,
+		    reg_info->reg_rules_2ghz_ptr);
+	}
+
+	wmi_reg_rule += num_2ghz_reg_rules;
+
+	/*
+	 * Firmware may include 6 GHz rules in the 5 GHz ext rule list.
+	 * Ignore them here until the stack grows real 6 GHz support.
+	 * XXX implement the 6 GHz regulatory rule path as well.
+	 */
+	num_invalid_5ghz_ext_rules = qwz_wmi_ignore_num_extra_rules(
+	    wmi_reg_rule, num_5ghz_reg_rules);
+	if (num_invalid_5ghz_ext_rules) {
+		DNPRINTF(QWZ_D_WMI,
+		    "%s: cc %s 5 GHz reg rules %d from fw, %d invalid "
+		    "5 GHz rules\n", __func__, reg_info->alpha2,
+		    reg_info->num_5ghz_reg_rules,
+		    num_invalid_5ghz_ext_rules);
+		num_5ghz_reg_rules -= num_invalid_5ghz_ext_rules;
+		reg_info->num_5ghz_reg_rules = num_5ghz_reg_rules;
+	}
+
+	if (num_5ghz_reg_rules) {
+		reg_info->reg_rules_5ghz_ptr =
+		    qwz_create_ext_reg_rules_from_wmi(num_5ghz_reg_rules,
+		    wmi_reg_rule);
+		if (!reg_info->reg_rules_5ghz_ptr) {
+			free(tb, M_DEVBUF, WMI_TAG_MAX * sizeof(*tb));
+			printf("%s: Unable to allocate memory for "
+			    "5 GHz rules\n", __func__);
+			return ENOMEM;
+		}
+
+		qwz_print_reg_rule(sc, "5 GHz", num_5ghz_reg_rules,
+		    reg_info->reg_rules_5ghz_ptr);
+	}
+
+	DNPRINTF(QWZ_D_WMI, "%s: processed regulatory ext channel list\n",
+	    __func__);
+
+	free(tb, M_DEVBUF, WMI_TAG_MAX * sizeof(*tb));
+	return 0;
+}
+
+void
+qwz_init_channels_world(struct qwz_softc *sc)
+{
+	struct ieee80211com *ic = &sc->sc_ic;
+	struct ieee80211_channel *chan;
+	uint32_t supported_bands = 0;
+	int i;
+
+	/* Same world fallback channels as ath12k reg.c. */
+	static const uint8_t channels_2ghz[] = {
+		1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11
+	};
+	static const uint8_t channels_5ghz[] = {
+		36, 40, 44, 48, 52, 56, 60, 64,
+		149, 153, 157, 161, 165
+	};
+
+	for (i = 0; i < sc->num_radios; i++)
+		supported_bands |= sc->pdevs[i].cap.supported_bands;
+
+	if (!(supported_bands & (WMI_HOST_WLAN_2G_CAP | WMI_HOST_WLAN_5G_CAP)))
+		supported_bands = WMI_HOST_WLAN_2G_CAP | WMI_HOST_WLAN_5G_CAP;
+
+	memset(ic->ic_channels, 0, sizeof(ic->ic_channels));
+
+	if (supported_bands & WMI_HOST_WLAN_2G_CAP) {
+		for (i = 0; i < nitems(channels_2ghz); i++) {
+			chan = &ic->ic_channels[channels_2ghz[i]];
+			chan->ic_freq = ieee80211_ieee2mhz(channels_2ghz[i],
+			    IEEE80211_CHAN_2GHZ);
+			chan->ic_flags = IEEE80211_CHAN_CCK |
+			    IEEE80211_CHAN_OFDM |
+			    IEEE80211_CHAN_DYN |
+			    IEEE80211_CHAN_2GHZ |
+			    IEEE80211_CHAN_40MHZ |
+			    IEEE80211_CHAN_HT;
+		}
+	}
+
+	if (supported_bands & WMI_HOST_WLAN_5G_CAP) {
+		for (i = 0; i < nitems(channels_5ghz); i++) {
+			chan = &ic->ic_channels[channels_5ghz[i]];
+			chan->ic_freq = ieee80211_ieee2mhz(channels_5ghz[i],
+			    IEEE80211_CHAN_5GHZ);
+			chan->ic_flags = IEEE80211_CHAN_A |
+			    IEEE80211_CHAN_40MHZ |
+			    IEEE80211_CHAN_HT |
+			    IEEE80211_CHAN_PASSIVE;
+		}
+	}
+
+	ieee80211_channel_init(&ic->ic_if);
 }
 
 void
@@ -10512,7 +10930,11 @@ qwz_init_channels(struct qwz_softc *sc, struct cur_regulatory_info *reg_info)
 				chan->ic_flags = IEEE80211_CHAN_CCK |
 				    IEEE80211_CHAN_OFDM |
 				    IEEE80211_CHAN_DYN |
-				    IEEE80211_CHAN_2GHZ;
+				    IEEE80211_CHAN_2GHZ |
+				    IEEE80211_CHAN_HT;
+				if ((rule->flags & REGULATORY_CHAN_NO_HT40) == 0)
+					chan->ic_flags |=
+					    IEEE80211_CHAN_40MHZ;
 			}
 			chnum++;
 			freq = ieee80211_ieee2mhz(chnum, IEEE80211_CHAN_2GHZ);
@@ -10546,7 +10968,11 @@ qwz_init_channels(struct qwz_softc *sc, struct cur_regulatory_info *reg_info)
 				chan->ic_flags = 0;
 			} else {
 				chan->ic_freq = freq;
-				chan->ic_flags = IEEE80211_CHAN_A;
+				chan->ic_flags = IEEE80211_CHAN_A |
+				    IEEE80211_CHAN_HT;
+				if ((rule->flags & REGULATORY_CHAN_NO_HT40) == 0)
+					chan->ic_flags |=
+					    IEEE80211_CHAN_40MHZ;
 				if (rule->flags & (REGULATORY_CHAN_RADAR |
 				    REGULATORY_CHAN_NO_IR |
 				    REGULATORY_CHAN_INDOOR_ONLY)) {
@@ -10587,6 +11013,7 @@ qwz_reg_chan_list_event(struct qwz_softc *sc, struct mbuf *m,
 	if (ret) {
 		printf("%s: failed to extract regulatory info from "
 		    "received event\n", sc->sc_dev.dv_xname);
+		qwz_init_channels_world(sc);
 		goto fallback;
 	}
 
@@ -10599,6 +11026,7 @@ qwz_reg_chan_list_event(struct qwz_softc *sc, struct mbuf *m,
 		 */
 		printf("%s: Failed to set the requested Country "
 		    "regulatory setting\n", __func__);
+		qwz_init_channels_world(sc);
 		goto mem_free;
 	}
 
@@ -11706,7 +12134,8 @@ qwz_wmi_tlv_op_rx(struct qwz_softc *sc, struct mbuf *m)
 		DPRINTF("%s: 0x%x: update fw mem dump\n", __func__, id);
 		break;
 	case WMI_PDEV_SET_HW_MODE_RESP_EVENTID:
-		DPRINTF("%s: 0x%x: set HW mode response event\n", __func__, id);
+		sc->wmi.hw_mode_ready = 1;
+		wakeup(&sc->wmi.hw_mode_ready);
 		break;
 	case WMI_WLAN_FREQ_AVOID_EVENTID:
 		DPRINTF("%s: 0x%x: wlan freq avoid event\n", __func__, id);
@@ -12411,9 +12840,27 @@ qwz_peer_map_event(struct qwz_softc *sc, uint8_t vdev_id, uint16_t peer_id,
 #ifdef notyet
 	spin_lock_bh(&ab->base_lock);
 #endif
-	ni = ieee80211_find_node(ic, mac_addr);
-	if (ni == NULL)
+	/*
+	 * For STA mode the only peer is the AP, and the per-peer state
+	 * we care about (FW-assigned ast_hash / hw_peer_id) is consumed
+	 * later via ic->ic_bss in qwz_peer_create.  ieee80211_find_node
+	 * may return a DIFFERENT node from the RB-tree (a stale scan
+	 * entry for the same BSSID), and updating that wrong node
+	 * leaves ic_bss's qwz_peer with ast_hash=0 / hw_peer_id=0
+	 * forever -- causing the FW to AST-look-up slot 0 on the first
+	 * protected post-AUTHORIZE frame and dlpager-fault.  Prefer
+	 * ic_bss whenever the MAC matches.
+	 */
+	if (ic->ic_opmode == IEEE80211_M_STA && ic->ic_bss != NULL &&
+	    IEEE80211_ADDR_EQ(ic->ic_bss->ni_macaddr, mac_addr))
+		ni = ic->ic_bss;
+	else
+		ni = ieee80211_find_node(ic, mac_addr);
+	if (ni == NULL) {
+		printf("%s: peer_map: no node for %s\n", sc->sc_dev.dv_xname,
+		    ether_sprintf(mac_addr));
 		return;
+	}
 	nq = (struct qwz_node *)ni;
 	peer = &nq->peer;
 
@@ -12425,6 +12872,16 @@ qwz_peer_map_event(struct qwz_softc *sc, uint8_t vdev_id, uint16_t peer_id,
 	ether_addr_copy(peer->addr, mac_addr);
 	list_add(&peer->list, &ab->peers);
 #endif
+	/* Propagate FW-assigned AST values to STA arvif for qwz_dp_tx(). */
+	{
+		struct qwz_vif *arvif = TAILQ_FIRST(&sc->vif_list);
+		if (ic->ic_opmode == IEEE80211_M_STA &&
+		    arvif != NULL && arvif->vdev_id == vdev_id) {
+			arvif->ast_hash = ast_hash;
+			arvif->ast_idx = hw_peer_id;
+		}
+	}
+
 	sc->peer_mapped = 1;
 	wakeup(&sc->peer_mapped);
 
@@ -12461,25 +12918,30 @@ qwz_peer_unmap_event(struct qwz_softc *sc, uint16_t peer_id)
 	spin_lock_bh(&ab->base_lock);
 #endif
 	ni = qwz_peer_find_by_id(sc, peer_id);
-	if (!ni) {
-		printf("%s: peer-unmap-event: unknown peer id %d\n",
-		    sc->sc_dev.dv_xname, peer_id);
-		goto exit;
+	if (ni) {
+		DNPRINTF(QWZ_D_HTT, "%s: peer unmap peer %s id %d\n",
+		    __func__, ether_sprintf(ni->ni_macaddr), peer_id);
+	} else {
+		/*
+		 * The node may already have been removed from ic_tree
+		 * by ieee80211 cleanup before this event arrived (e.g.
+		 * during a soft ifconfig down/up cycle).  The unmap
+		 * event is FW's confirmation that the peer is gone, so
+		 * still signal the waiter in qwz_peer_delete().
+		 */
+		DNPRINTF(QWZ_D_HTT, "%s: peer unmap for unknown id %d\n",
+		    __func__, peer_id);
 	}
 
-	DNPRINTF(QWZ_D_HTT, "%s: peer unmap peer %s id %d\n",
-	    __func__, ether_sprintf(ni->ni_macaddr), peer_id);
 #if 0
 	list_del(&peer->list);
 	kfree(peer);
 #endif
 	sc->peer_mapped = 1;
 	wakeup(&sc->peer_mapped);
-exit:
 #ifdef notyet
 	spin_unlock_bh(&ab->base_lock);
 #endif
-	return;
 }
 
 void
@@ -12554,6 +13016,9 @@ qwz_dp_htt_htc_t2h_msg_handler(struct qwz_softc *sc, struct mbuf *m)
 		ath12k_htt_backpressure_event_handler(ab, skb);
 		break;
 #endif
+	case HTT_T2H_MSG_TYPE_PRIMARY_LINK_PEER_MIGRATE_IND:
+		/* MLO peer migration; no action needed for non-MLO ops. */
+		break;
 	default:
 		printf("%s: htt event %d not handled\n", __func__, type);
 		break;
@@ -12940,13 +13405,6 @@ qwz_dp_rxbufs_replenish(struct qwz_softc *sc,
 		if (rx_desc == NULL)
 			goto fail_free_mbuf;
 
-		if (rx_desc->map == NULL) {
-			ret = bus_dmamap_create(sc->sc_dmat, size, 1,
-			    size, 0, BUS_DMA_NOWAIT, &rx_desc->map);
-			if (ret)
-				goto fail_free_mbuf;
-		}
-
 		ret = bus_dmamap_load_mbuf(sc->sc_dmat, rx_desc->map, m,
 		    BUS_DMA_READ | BUS_DMA_NOWAIT);
 		if (ret) {
@@ -12954,6 +13412,13 @@ qwz_dp_rxbufs_replenish(struct qwz_softc *sc,
 			    sc->sc_dev.dv_xname, ret);
 			goto fail_free_mbuf;
 		}
+
+		/*
+		 * Invalidate any stale cache lines covering this buffer
+		 * before the FW writes RX data into it.
+		 */
+		bus_dmamap_sync(sc->sc_dmat, rx_desc->map, 0,
+		    rx_desc->map->dm_mapsize, BUS_DMASYNC_PREREAD);
 
 		cookie = rx_desc->cookie;
 
@@ -12964,6 +13429,7 @@ qwz_dp_rxbufs_replenish(struct qwz_softc *sc,
 		TAILQ_REMOVE(used_list, rx_desc, entry);
 
 		rx_desc->m = m;
+		rx_desc->in_use = 1;
 		m = NULL;
 
 		num_remain--;
@@ -13314,6 +13780,9 @@ qwz_dp_tx_htt_rx_filter_setup(struct qwz_softc *sc, uint32_t ring_id,
 	    !!(params.flags & HAL_SRNG_FLAGS_MSI_SWAP));
 	cmd->info0 |= FIELD_PREP(HTT_RX_RING_SELECTION_CFG_CMD_INFO0_PS,
 	    !!(params.flags & HAL_SRNG_FLAGS_DATA_TLV_SWAP));
+	cmd->info0 |= FIELD_PREP(
+	    HTT_RX_RING_SELECTION_CFG_CMD_INFO0_OFFSET_VALID,
+	    !!tlv_filter->offset_valid);
 
 	cmd->info1 = FIELD_PREP(HTT_RX_RING_SELECTION_CFG_CMD_INFO1_BUF_SIZE,
 	    rx_buf_size);
@@ -13322,6 +13791,33 @@ qwz_dp_tx_htt_rx_filter_setup(struct qwz_softc *sc, uint32_t ring_id,
 	cmd->pkt_type_en_flags2 = tlv_filter->pkt_filter_flags2;
 	cmd->pkt_type_en_flags3 = tlv_filter->pkt_filter_flags3;
 	cmd->rx_filter_tlv = tlv_filter->rx_filter;
+
+	if (tlv_filter->offset_valid) {
+		cmd->rx_packet_offset = FIELD_PREP(
+		    HTT_RX_RING_SELECTION_CFG_RX_PACKET_OFFSET,
+		    tlv_filter->rx_packet_offset);
+		cmd->rx_packet_offset |= FIELD_PREP(
+		    HTT_RX_RING_SELECTION_CFG_RX_HEADER_OFFSET,
+		    tlv_filter->rx_header_offset);
+
+		cmd->rx_mpdu_offset = FIELD_PREP(
+		    HTT_RX_RING_SELECTION_CFG_RX_MPDU_END_OFFSET,
+		    tlv_filter->rx_mpdu_end_offset);
+		cmd->rx_mpdu_offset |= FIELD_PREP(
+		    HTT_RX_RING_SELECTION_CFG_RX_MPDU_START_OFFSET,
+		    tlv_filter->rx_mpdu_start_offset);
+
+		cmd->rx_msdu_offset = FIELD_PREP(
+		    HTT_RX_RING_SELECTION_CFG_RX_MSDU_END_OFFSET,
+		    tlv_filter->rx_msdu_end_offset);
+		cmd->rx_msdu_offset |= FIELD_PREP(
+		    HTT_RX_RING_SELECTION_CFG_RX_MSDU_START_OFFSET,
+		    tlv_filter->rx_msdu_start_offset);
+
+		cmd->rx_attn_offset = FIELD_PREP(
+		    HTT_RX_RING_SELECTION_CFG_RX_ATTENTION_OFFSET,
+		    tlv_filter->rx_attn_offset);
+	}
 
 	ret = qwz_htc_send(&sc->htc, sc->dp.eid, m);
 	if (ret)
@@ -13368,6 +13864,101 @@ qwz_dp_rx_pdev_alloc(struct qwz_softc *sc, int mac_id)
 	return 0;
 }
 
+int
+qwz_dp_rxdma_ring_sel_config_wcn7850(struct qwz_softc *sc)
+{
+	struct qwz_dp *dp = &sc->dp;
+	struct htt_rx_ring_tlv_filter tlv_filter = { 0 };
+	uint32_t ring_id;
+	int i, ret = 0;
+
+	tlv_filter.rx_filter = HTT_RX_FILTER_TLV_FLAGS_MPDU_START |
+	    HTT_RX_FILTER_TLV_FLAGS_RX_PACKET |
+	    HTT_RX_FILTER_TLV_FLAGS_MSDU_END;
+	tlv_filter.pkt_filter_flags2 = HTT_RX_FP_CTRL_PKT_FILTER_TLV_FLAGS2_BAR;
+	tlv_filter.pkt_filter_flags3 = HTT_RX_FP_DATA_FILTER_FLASG3;
+
+	/*
+	 * WCN7850 FW requires explicit RX TLV offsets within our
+	 * hal_rx_desc layout.  Without these the FW DMAs the various
+	 * RX TLVs at default offsets that don't match our struct
+	 * layout, internal FW state corrupts as packets flow, and the
+	 * dlpager eventually faults at a stale function pointer.
+	 * Mirror of Linux ath12k_dp_rxdma_ring_sel_config_wcn7850.
+	 */
+	tlv_filter.offset_valid = 1;
+	/*
+	 * rx_packet_offset uses sc->hal.hal_desc_sz (=512 on WCN7850),
+	 * NOT sizeof(struct hal_rx_desc) (=472).  WCN7850 FW empirically
+	 * places the packet at offset 512 even though our struct is only
+	 * 472; using sizeof here would tell the FW to DMA the packet 40
+	 * bytes earlier than our driver reads it from, and EAPOL never
+	 * reaches net80211 -> 4-way handshake never starts.
+	 */
+	tlv_filter.rx_packet_offset = sc->hal.hal_desc_sz;
+	tlv_filter.rx_header_offset =
+	    offsetof(struct hal_rx_desc_wcn7850, pkt_hdr_tlv);
+	tlv_filter.rx_mpdu_start_offset =
+	    offsetof(struct hal_rx_desc_wcn7850, mpdu_start_tag);
+	tlv_filter.rx_msdu_end_offset =
+	    offsetof(struct hal_rx_desc_wcn7850, msdu_end_tag);
+
+	for (i = 0; i < sc->hw_params.num_rxmda_per_pdev; i++) {
+		ring_id = dp->rx_mac_buf_ring[i].ring_id;
+		ret = qwz_dp_tx_htt_rx_filter_setup(sc, ring_id, i,
+		    HAL_RXDMA_BUF, DP_RXDMA_REFILL_RING_SIZE, &tlv_filter);
+		if (ret) {
+			printf("%s: failed to configure rx_mac_buf_ring%d "
+			    "filter %d\n", sc->sc_dev.dv_xname, i, ret);
+			return ret;
+		}
+	}
+
+	return ret;
+}
+
+int
+qwz_dp_rx_htt_setup(struct qwz_softc *sc)
+{
+	struct qwz_dp *dp = &sc->dp;
+	uint32_t ring_id;
+	int i, ret;
+
+	/* TODO: Need to verify the HTT setup for QCN9224 */
+	ring_id = dp->rx_refill_buf_ring.refill_buf_ring.ring_id;
+	ret = qwz_dp_tx_htt_srng_setup(sc, ring_id, 0, HAL_RXDMA_BUF);
+	if (ret) {
+		printf("%s: failed to configure rx_refill_buf_ring %d\n",
+		    sc->sc_dev.dv_xname, ret);
+		return ret;
+	}
+
+	if (sc->hw_params.rx_mac_buf_ring) {
+		for (i = 0; i < sc->hw_params.num_rxmda_per_pdev; i++) {
+			ring_id = dp->rx_mac_buf_ring[i].ring_id;
+			ret = qwz_dp_tx_htt_srng_setup(sc, ring_id, i,
+			    HAL_RXDMA_BUF);
+			if (ret) {
+				printf("%s: failed to configure rx_mac_buf_ring"
+				    "%d %d\n", sc->sc_dev.dv_xname, i, ret);
+				return ret;
+			}
+		}
+	}
+
+	for (i = 0; i < sc->hw_params.num_rxdma_dst_ring; i++) {
+		ring_id = dp->rxdma_err_dst_ring[i].ring_id;
+		ret = qwz_dp_tx_htt_srng_setup(sc, ring_id, i, HAL_RXDMA_DST);
+		if (ret) {
+			printf("%s: failed to configure rxdma_err_dst_ring"
+			    "%d %d\n", sc->sc_dev.dv_xname, i, ret);
+			return ret;
+		}
+	}
+
+	return qwz_dp_rxdma_ring_sel_config_wcn7850(sc);
+}
+
 void
 qwz_dp_pdev_free(struct qwz_softc *sc)
 {
@@ -13392,6 +13983,13 @@ qwz_dp_pdev_alloc(struct qwz_softc *sc)
 			    "for pdev_id %d\n", sc->sc_dev.dv_xname, i);
 			goto err;
 		}
+	}
+
+	ret = qwz_dp_rx_htt_setup(sc);
+	if (ret) {
+		printf("%s: failed to setup rx htt %d\n",
+		    sc->sc_dev.dv_xname, ret);
+		goto err;
 	}
 
 	return 0;
@@ -13474,6 +14072,97 @@ qwz_dp_update_vdev_search(struct qwz_softc *sc, struct qwz_vif *arvif)
 	}
 }
 
+/*
+ * Compute the 32-bit TX bank config for this VDEV. Mirror of Linux
+ * ath12k_wifi7_dp_tx_get_vdev_bank_config().
+ */
+uint32_t
+qwz_dp_tx_get_vdev_bank_config(struct qwz_softc *sc, struct qwz_vif *arvif)
+{
+	uint32_t bank_config = 0;
+	enum hal_tcl_encap_type encap_type;
+
+	if (test_bit(ATH12K_FLAG_RAW_MODE, sc->sc_flags))
+		encap_type = HAL_TCL_ENCAP_TYPE_RAW;
+	else
+		encap_type = HAL_TCL_ENCAP_TYPE_NATIVE_WIFI;
+
+	bank_config |= FIELD_PREP(HAL_TX_BANK_CONFIG_ENCAP_TYPE, encap_type);
+	bank_config |= FIELD_PREP(HAL_TX_BANK_CONFIG_SRC_BUFFER_SWAP, 0) |
+	    FIELD_PREP(HAL_TX_BANK_CONFIG_LINK_META_SWAP, 0) |
+	    FIELD_PREP(HAL_TX_BANK_CONFIG_EPD, 0);
+
+	if (arvif->vdev_type == WMI_VDEV_TYPE_STA)
+		bank_config |= FIELD_PREP(HAL_TX_BANK_CONFIG_INDEX_LOOKUP_EN, 1);
+
+	bank_config |= FIELD_PREP(HAL_TX_BANK_CONFIG_ADDRX_EN,
+	    !!(arvif->hal_addr_search_flags & HAL_TX_ADDRX_EN)) |
+	    FIELD_PREP(HAL_TX_BANK_CONFIG_ADDRY_EN,
+	    !!(arvif->hal_addr_search_flags & HAL_TX_ADDRY_EN));
+
+	bank_config |= FIELD_PREP(HAL_TX_BANK_CONFIG_MESH_EN, 0) |
+	    FIELD_PREP(HAL_TX_BANK_CONFIG_VDEV_ID_CHECK_EN, 1);
+	bank_config |= FIELD_PREP(HAL_TX_BANK_CONFIG_DSCP_TIP_MAP_ID, 0);
+
+	return bank_config;
+}
+
+/*
+ * Write the per-bank TX config register so the FW picks up the encap/
+ * encrypt/search settings when it processes a tcl_data_cmd with this
+ * bank_id. Mirror of Linux ath12k_wifi7_hal_tx_configure_bank_register().
+ */
+void
+qwz_hal_tx_configure_bank_register(struct qwz_softc *sc, uint32_t bank_config,
+    uint8_t bank_id)
+{
+	sc->ops.write32(sc, HAL_TCL_SW_CONFIG_BANK_ADDR + 4 * bank_id,
+	    bank_config);
+}
+
+/*
+ * Allocate (or reuse) a TX bank profile that matches the requested
+ * bank_config. Configures the FW register on first use of a bank.
+ * Returns -1 if no bank slot is available.
+ */
+int
+qwz_dp_tx_get_bank_profile(struct qwz_softc *sc, struct qwz_vif *arvif)
+{
+	struct qwz_dp *dp = &sc->dp;
+	uint32_t bank_config = qwz_dp_tx_get_vdev_bank_config(sc, arvif);
+	int i, bank_id = -1, configure_register = 0;
+
+	for (i = 0; i < dp->num_bank_profiles; i++) {
+		if (dp->bank_profiles[i].is_configured &&
+		    dp->bank_profiles[i].bank_config == bank_config) {
+			bank_id = i;
+			goto inc_ref_and_return;
+		}
+		if (!dp->bank_profiles[i].is_configured ||
+		    dp->bank_profiles[i].num_users == 0) {
+			bank_id = i;
+			goto configure_and_return;
+		}
+	}
+
+	if (bank_id == -1) {
+		printf("%s: out of TX bank slots\n", sc->sc_dev.dv_xname);
+		return -1;
+	}
+
+configure_and_return:
+	dp->bank_profiles[bank_id].is_configured = 1;
+	dp->bank_profiles[bank_id].bank_config = bank_config;
+	configure_register = 1;
+inc_ref_and_return:
+	dp->bank_profiles[bank_id].num_users++;
+
+	if (configure_register)
+		qwz_hal_tx_configure_bank_register(sc, bank_config, bank_id);
+
+	return bank_id;
+}
+
 void
 qwz_dp_vdev_tx_attach(struct qwz_softc *sc, struct qwz_pdev *pdev,
     struct qwz_vif *arvif)
@@ -13486,6 +14175,15 @@ qwz_dp_vdev_tx_attach(struct qwz_softc *sc, struct qwz_pdev *pdev,
 	arvif->tcl_metadata &= ~HTT_TCL_META_DATA_VALID_HTT;
 
 	qwz_dp_update_vdev_search(sc, arvif);
+
+	/*
+	 * Allocate and configure a TX bank for this VDEV. The bank
+	 * register holds encap_type, encrypt_type, addrx/y_en, etc., and
+	 * the per-frame tcl_data_cmd descriptor only references it by
+	 * bank_id. WCN7850 (WiFi7) requires this; the older inline
+	 * encoding crashes the FW.
+	 */
+	arvif->bank_id = qwz_dp_tx_get_bank_profile(sc, arvif);
 }
 
 void
@@ -13565,14 +14263,9 @@ qwz_dp_tx_process_htt_tx_complete(struct qwz_softc *sc, void *desc,
 	case HAL_WBM_REL_HTT_TX_COMP_STATUS_TTL:
 		ts.acked = (wbm_status == HAL_WBM_REL_HTT_TX_COMP_STATUS_OK);
 		ts.msdu_id = msdu_id;
-		ts.ack_rssi = FIELD_GET(HTT_TX_WBM_COMP_INFO1_ACK_RSSI,
-		    status_desc->info1);
-
-		if (FIELD_GET(HTT_TX_WBM_COMP_INFO2_VALID, status_desc->info2))
-			ts.peer_id = FIELD_GET(HTT_TX_WBM_COMP_INFO2_SW_PEER_ID,
-			    status_desc->info2);
-		else
-			ts.peer_id = HTT_INVALID_PEER_ID;
+		ts.ack_rssi = FIELD_GET(HTT_TX_WBM_COMP_INFO2_ACK_RSSI,
+		    status_desc->info2);
+		ts.peer_id = HTT_INVALID_PEER_ID;
 
 		qwz_dp_tx_htt_tx_complete_buf(sc, tx_ring, &ts);
 		break;
@@ -13676,6 +14369,8 @@ qwz_dp_tx_complete_msdu(struct qwz_softc *sc, struct dp_tx_ring *tx_ring,
 		return;
 	}
 
+	bus_dmamap_sync(sc->sc_dmat, tx_data->map, 0,
+	    tx_data->map->dm_mapsize, BUS_DMASYNC_POSTWRITE);
 	bus_dmamap_unload(sc->sc_dmat, tx_data->map);
 	m_freem(tx_data->m);
 	tx_data->m = NULL;
@@ -13934,7 +14629,7 @@ qwz_dp_process_rx_err_buf(struct qwz_softc *sc, uint32_t *ring_desc,
 	struct qwz_rx_data *rx_data;
 	struct hal_rx_desc *rx_desc;
 	uint16_t msdu_len;
-	uint32_t hal_rx_desc_sz = sc->hw_params.hal_desc_sz;
+	uint32_t hal_rx_desc_sz = sc->hal.hal_desc_sz;
 
 	if (buf_id >= rx_ring->bufs_max || isset(rx_ring->freemap, buf_id))
 		return;
@@ -14082,7 +14777,6 @@ qwz_dp_process_rx_err(struct qwz_softc *sc)
 
 	return tot_n_bufs_reaped;
 #endif
-	printf("%s:%d\n", __func__, __LINE__);
 	return 0;
 }
 
@@ -14331,7 +15025,6 @@ done:
 
 	return total_num_buffs_reaped;
 #endif
-	printf("%s:%d\n", __func__, __LINE__);
 	return 0;
 }
 
@@ -14430,13 +15123,68 @@ void
 qwz_dp_rx_h_undecap_nwifi(struct qwz_softc *sc, struct qwz_rx_msdu *msdu,
     uint8_t *first_hdr, enum hal_encrypt_type enctype)
 {
-	/*
-	* This function will need to do some work once we are receiving
-	* aggregated frames. For now, it needs to do nothing.
-	*/
+	struct rx_mpdu_start_qcn9274 *mpdu;
+	struct ieee80211_frame *wh;
+	struct mbuf *m = msdu->m;
+	uint8_t decap_hdr[IEEE80211_MAX_FRAME_HDR_LEN];
+	size_t hdrlen;
+	uint16_t qos_ctl;
 
-	if (!msdu->is_first_msdu)
-		printf("%s: not implemented\n", __func__);
+	if (m == NULL)
+		return;
+
+	if (m->m_len < sizeof(*wh) &&
+	    (m = m_pullup(m, sizeof(*wh))) == NULL) {
+		msdu->m = NULL;
+		return;
+	}
+	msdu->m = m;
+
+	mpdu = &msdu->rx_desc->u.wcn7850.mpdu_start;
+	wh = mtod(m, struct ieee80211_frame *);
+	if ((le32toh(mpdu->info6) & RX_MPDU_START_INFO6_NON_QOS) ||
+	    ieee80211_has_qos(wh))
+		return;
+
+	hdrlen = ieee80211_get_hdrlen(wh);
+	if (hdrlen > sizeof(decap_hdr))
+		return;
+
+	if (m->m_len < hdrlen &&
+	    (m = m_pullup(m, hdrlen)) == NULL) {
+		msdu->m = NULL;
+		return;
+	}
+	msdu->m = m;
+
+	wh = mtod(m, struct ieee80211_frame *);
+	hdrlen = ieee80211_get_hdrlen(wh);
+	if (hdrlen > sizeof(decap_hdr))
+		return;
+
+	memcpy(decap_hdr, wh, hdrlen);
+	wh = (struct ieee80211_frame *)decap_hdr;
+	wh->i_fc[0] |= IEEE80211_FC0_SUBTYPE_QOS;
+	wh->i_fc[1] &= ~IEEE80211_FC1_ORDER;
+	qos_ctl = htole16(sc->hal_rx_ops->rx_desc_get_mpdu_tid(msdu->rx_desc) &
+	    IEEE80211_QOS_TID);
+
+	m_adj(m, hdrlen);
+
+	M_PREPEND(m, sizeof(qos_ctl), M_DONTWAIT);
+	if (m == NULL) {
+		msdu->m = NULL;
+		return;
+	}
+	memcpy(mtod(m, void *), &qos_ctl, sizeof(qos_ctl));
+
+	M_PREPEND(m, hdrlen, M_DONTWAIT);
+	if (m == NULL) {
+		msdu->m = NULL;
+		return;
+	}
+	msdu->m = m;
+	memcpy(mtod(m, void *), decap_hdr, hdrlen);
 }
 
 void
@@ -14497,11 +15245,6 @@ qwz_dp_rx_h_undecap_raw(struct qwz_softc *sc, struct qwz_rx_msdu *msdu,
 #endif
 }
 
-static inline uint8_t *
-qwz_dp_rx_h_80211_hdr(struct qwz_softc *sc, struct hal_rx_desc *desc)
-{
-	return sc->hal_rx_ops->rx_desc_get_hdr_status(desc);
-}
 
 static inline enum hal_encrypt_type
 qwz_dp_rx_h_enctype(struct qwz_softc *sc, struct hal_rx_desc *desc)
@@ -14519,46 +15262,95 @@ qwz_dp_rx_h_msdu_start_decap_type(struct qwz_softc *sc, struct hal_rx_desc *desc
 }
 
 void
+qwz_dp_rx_h_undecap_eth(struct qwz_softc *sc, struct qwz_rx_msdu *msdu,
+    struct hal_rx_desc *rx_desc)
+{
+	struct rx_mpdu_start_qcn9274 *mpdu = &rx_desc->u.wcn7850.mpdu_start;
+	struct ether_header *eth;
+	uint8_t da[IEEE80211_ADDR_LEN], sa[IEEE80211_ADDR_LEN];
+	uint8_t llc[8] = { 0xaa, 0xaa, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00 };
+	struct ieee80211_frame tmpwh;
+	int hdrlen;
+	uint8_t *p;
+	struct mbuf *m = msdu->m;
+
+	if (m->m_pkthdr.len < ETHER_HDR_LEN)
+		return;
+
+	eth = mtod(m, struct ether_header *);
+	memcpy(da, eth->ether_dhost, IEEE80211_ADDR_LEN);
+	memcpy(sa, eth->ether_shost, IEEE80211_ADDR_LEN);
+	memcpy(&llc[6], &eth->ether_type, 2); /* SNAP type = ethertype (BE) */
+
+	/* Determine 802.11 header length from mpdu_start frame_ctrl. */
+	tmpwh.i_fc[0] = le16toh(mpdu->frame_ctrl) & 0xff;
+	tmpwh.i_fc[1] = (le16toh(mpdu->frame_ctrl) >> 8) & 0xff;
+	hdrlen = sizeof(struct ieee80211_frame);
+	if (ieee80211_has_addr4(&tmpwh))
+		hdrlen += IEEE80211_ADDR_LEN;
+	if (ieee80211_has_qos(&tmpwh))
+		hdrlen += 2;
+
+	/* Strip Ethernet header. */
+	m_adj(m, ETHER_HDR_LEN);
+
+	/* Prepend LLC/SNAP header. */
+	M_PREPEND(m, 8, M_DONTWAIT);
+	if (m == NULL) {
+		msdu->m = NULL;
+		return;
+	}
+	msdu->m = m;
+	memcpy(mtod(m, void *), llc, 8);
+
+	/* Prepend 802.11 header. */
+	M_PREPEND(m, hdrlen, M_DONTWAIT);
+	if (m == NULL) {
+		msdu->m = NULL;
+		return;
+	}
+	msdu->m = m;
+	p = mtod(m, uint8_t *);
+	memset(p, 0, hdrlen);
+	p[0] = tmpwh.i_fc[0];
+	p[1] = tmpwh.i_fc[1];
+	memcpy(p + 2, &mpdu->duration, 2);
+	memcpy(p + 4, mpdu->addr1, IEEE80211_ADDR_LEN);
+	memcpy(p + 10, mpdu->addr2, IEEE80211_ADDR_LEN);
+	memcpy(p + 16, mpdu->addr3, IEEE80211_ADDR_LEN);
+	memcpy(p + 22, &mpdu->seq_ctrl, 2);
+	if (ieee80211_has_addr4(&tmpwh)) {
+		memcpy(p + 24, mpdu->addr4, IEEE80211_ADDR_LEN);
+		if (ieee80211_has_qos(&tmpwh))
+			memcpy(p + 30, &mpdu->qos_ctrl, 2);
+	} else if (ieee80211_has_qos(&tmpwh)) {
+		memcpy(p + 24, &mpdu->qos_ctrl, 2);
+	}
+
+	/* Override addr1/addr3 with actual DA/SA from Ethernet header. */
+	memcpy(p + 4, da, IEEE80211_ADDR_LEN);
+	memcpy(p + 16, sa, IEEE80211_ADDR_LEN);
+}
+
+void
 qwz_dp_rx_h_undecap(struct qwz_softc *sc, struct qwz_rx_msdu *msdu,
     struct hal_rx_desc *rx_desc, enum hal_encrypt_type enctype,
     int decrypted)
 {
-	uint8_t *first_hdr;
 	uint8_t decap;
 
-	first_hdr = qwz_dp_rx_h_80211_hdr(sc, rx_desc);
 	decap = qwz_dp_rx_h_msdu_start_decap_type(sc, rx_desc);
 
 	switch (decap) {
 	case DP_RX_DECAP_TYPE_NATIVE_WIFI:
-		qwz_dp_rx_h_undecap_nwifi(sc, msdu, first_hdr, enctype);
+		qwz_dp_rx_h_undecap_nwifi(sc, msdu, NULL, enctype);
 		break;
 	case DP_RX_DECAP_TYPE_RAW:
 		qwz_dp_rx_h_undecap_raw(sc, msdu, enctype, decrypted);
 		break;
-#if 0
 	case DP_RX_DECAP_TYPE_ETHERNET2_DIX:
-		ehdr = (struct ethhdr *)msdu->data;
-
-		/* mac80211 allows fast path only for authorized STA */
-		if (ehdr->h_proto == cpu_to_be16(ETH_P_PAE)) {
-			ATH12K_SKB_RXCB(msdu)->is_eapol = true;
-			ath12k_dp_rx_h_undecap_eth(ar, msdu, first_hdr,
-						   enctype, status);
-			break;
-		}
-
-		/* PN for mcast packets will be validated in mac80211;
-		 * remove eth header and add 802.11 header.
-		 */
-		if (ATH12K_SKB_RXCB(msdu)->is_mcbc && decrypted)
-			ath12k_dp_rx_h_undecap_eth(ar, msdu, first_hdr,
-						   enctype, status);
+		qwz_dp_rx_h_undecap_eth(sc, msdu, rx_desc);
 		break;
-	case DP_RX_DECAP_TYPE_8023:
-		/* TODO: Handle undecap for these formats */
-		break;
-#endif
 	}
 }
 
@@ -14666,7 +15458,8 @@ qwz_dp_rx_process_msdu(struct qwz_softc *sc, struct qwz_rx_msdu *msdu,
 	uint8_t l3_pad_bytes;
 	uint16_t msdu_len;
 	int ret;
-	uint32_t hal_rx_desc_sz = sc->hw_params.hal_desc_sz;
+	uint32_t hal_rx_desc_sz = sc->hal.hal_desc_sz;
+	struct rx_mpdu_start_qcn9274 *mpdu;
 
 	last_buf = qwz_dp_rx_get_msdu_last_buf(msdu_list, msdu);
 	if (!last_buf) {
@@ -14682,6 +15475,23 @@ qwz_dp_rx_process_msdu(struct qwz_softc *sc, struct qwz_rx_msdu *msdu,
 		    __func__);
 		return EIO;
 	}
+
+	/* Drop non-802.11 frames (e.g. WCN7850 FW internal messages). */
+	if (!sc->hal_rx_ops->rx_desc_get_mpdu_fc_valid(rx_desc))
+		return EIO;
+
+	/*
+	 * WCN7850 FW injects internal messages into the REO ring with
+	 * fc_valid=1 but garbage 802.11 contents; their synthetic addr1
+	 * ends in 84:e1.  Drop those and any unicast frames not addressed
+	 * to our own MAC.
+	 */
+	mpdu = &rx_desc->u.wcn7850.mpdu_start;
+	if (mpdu->addr1[4] == 0x84 && mpdu->addr1[5] == 0xe1)
+		return EIO;
+	if (!(mpdu->addr1[0] & 0x01) &&
+	    !IEEE80211_ADDR_EQ(mpdu->addr1, sc->sc_ic.ic_myaddr))
+		return EIO;
 
 	msdu->rx_desc = rx_desc;
 	msdu_len = qwz_dp_rx_h_msdu_start_msdu_len(sc, rx_desc);
@@ -14773,27 +15583,25 @@ qwz_dp_rx_process_received_packets(struct qwz_softc *sc,
 int
 qwz_dp_process_rx(struct qwz_softc *sc, int ring_id)
 {
-#if 0
 	struct qwz_dp *dp = &sc->dp;
-	struct qwz_pdev_dp *pdev_dp = &sc->pdev_dp;
-	struct dp_rxdma_ring *rx_ring;
 	int num_buffs_reaped[MAX_RADIOS] = {0};
 	struct qwz_rx_msdu_list msdu_list[MAX_RADIOS];
+	TAILQ_HEAD(, ath12k_rx_desc_info) rx_desc_used_list;
+	struct ath12k_rx_desc_info *desc_info;
 	struct qwz_rx_msdu *msdu;
 	struct mbuf *m;
-	struct qwz_rx_data *rx_data;
 	int total_msdu_reaped = 0;
 	struct hal_srng *srng;
 	int done = 0;
-	int idx;
+	int budget = 512;
 	unsigned int mac_id;
 	struct hal_reo_dest_ring *desc;
 	enum hal_reo_dest_ring_push_reason push_reason;
-	uint32_t cookie;
 	int i;
 
 	for (i = 0; i < MAX_RADIOS; i++)
 		TAILQ_INIT(&msdu_list[i]);
+	TAILQ_INIT(&rx_desc_used_list);
 
 	srng = &sc->hal.srng_list[dp->reo_dst_ring[ring_id].ring_id];
 #ifdef notyet
@@ -14802,41 +15610,60 @@ qwz_dp_process_rx(struct qwz_softc *sc, int ring_id)
 try_again:
 	qwz_hal_srng_access_begin(sc, srng);
 
-	while ((desc = (struct hal_reo_dest_ring *)
+	while (budget > 0 && (desc = (struct hal_reo_dest_ring *)
 	    qwz_hal_srng_dst_get_next_entry(sc, srng))) {
+		budget--;
+		uint64_t desc_va;
+		uint32_t cookie;
+
 		cookie = FIELD_GET(BUFFER_ADDR_INFO1_SW_COOKIE,
 		    desc->buf_addr_info.info1);
-		idx = FIELD_GET(DP_RXDMA_BUF_COOKIE_BUF_ID, cookie);
-		mac_id = FIELD_GET(DP_RXDMA_BUF_COOKIE_PDEV_ID, cookie);
+		desc_va = (uint64_t)desc->buf_va_hi << 32 | desc->buf_va_lo;
 
-		if (mac_id >= MAX_RADIOS)
+		/* Validate VA looks like a kernel address before dereferencing */
+		if (desc_va >= 0xffff800000000000ULL)
+			desc_info = (struct ath12k_rx_desc_info *)desc_va;
+		else
+			desc_info = NULL;
+
+		/* Fall back to cookie-based lookup if HW CC gave invalid VA */
+		if (desc_info == NULL ||
+		    desc_info->magic != ATH12K_DP_RX_DESC_MAGIC) {
+			desc_info = qwz_dp_get_rx_desc(sc, cookie);
+			if (desc_info == NULL ||
+			    desc_info->magic != ATH12K_DP_RX_DESC_MAGIC)
+				continue;
+		}
+
+		if (!desc_info->in_use)
 			continue;
 
-		rx_ring = &pdev_dp->rx_refill_buf_ring;
-		if (idx >= rx_ring->bufs_max || isset(rx_ring->freemap, idx))
-			continue;
+		/*
+		 * Sync the DMA buffer for CPU read before reading the
+		 * descriptor / MSDU data.
+		 */
+		bus_dmamap_sync(sc->sc_dmat, desc_info->map, 0,
+		    desc_info->map->dm_mapsize, BUS_DMASYNC_POSTREAD);
+		bus_dmamap_unload(sc->sc_dmat, desc_info->map);
+		m = desc_info->m;
+		desc_info->m = NULL;
+		desc_info->in_use = 0;
 
-		rx_data = &rx_ring->rx_data[idx];
-		bus_dmamap_unload(sc->sc_dmat, rx_data->map);
-		m = rx_data->m;
-		rx_data->m = NULL;
-		setbit(rx_ring->freemap, idx);
-
+		/* WCN7850 is single-radio */
+		mac_id = 0;
 		num_buffs_reaped[mac_id]++;
+
+		TAILQ_INSERT_TAIL(&rx_desc_used_list, desc_info, entry);
 
 		push_reason = FIELD_GET(HAL_REO_DEST_RING_INFO0_PUSH_REASON,
 		    desc->info0);
 		if (push_reason !=
 		    HAL_REO_DEST_RING_PUSH_REASON_ROUTING_INSTRUCTION) {
 			m_freem(m);
-#if 0
-			sc->soc_stats.hal_reo_error[
-			    dp->reo_dst_ring[ring_id].ring_id]++;
-#endif
 			continue;
 		}
 
-		msdu = &rx_data->rx_msdu;
+		msdu = &desc_info->rx_msdu;
 		msdu->m = m;
 		msdu->is_first_msdu = !!(desc->rx_msdu_info.info0 &
 		    RX_MSDU_DESC_INFO0_FIRST_MSDU_IN_MPDU);
@@ -14848,8 +15675,7 @@ try_again:
 		    desc->rx_mpdu_info.meta_data);
 		msdu->seq_no = FIELD_GET(RX_MPDU_DESC_INFO0_SEQ_NUM,
 		    desc->rx_mpdu_info.info0);
-		msdu->tid = FIELD_GET(HAL_REO_DEST_RING_INFO0_RX_QUEUE_NUM,
-		    desc->info0);
+		msdu->tid = 0; /* no RX_QUEUE_NUM in wifi7 */
 
 		msdu->mac_id = mac_id;
 		TAILQ_INSERT_TAIL(&msdu_list[mac_id], msdu, entry);
@@ -14868,7 +15694,7 @@ try_again:
 	 * head pointer so that we can reap complete MPDU in the current
 	 * rx processing.
 	 */
-	if (!done && qwz_hal_srng_dst_num_free(sc, srng, 1)) {
+	if (!done && budget > 0 && qwz_hal_srng_dst_num_free(sc, srng, 1)) {
 		qwz_hal_srng_access_end(sc, srng);
 		goto try_again;
 	}
@@ -14886,16 +15712,11 @@ try_again:
 
 		qwz_dp_rx_process_received_packets(sc, &msdu_list[i], i);
 
-		rx_ring = &sc->pdev_dp.rx_refill_buf_ring;
-
-		qwz_dp_rxbufs_replenish(sc, i, rx_ring, num_buffs_reaped[i],
-		    sc->hw_params.hal_params->rx_buf_rbm);
+		qwz_dp_rxbufs_replenish(sc, &dp->rx_refill_buf_ring,
+		    &rx_desc_used_list, num_buffs_reaped[i]);
 	}
 exit:
 	return total_msdu_reaped;
-#endif
-	printf("%s:%d\n", __func__, __LINE__);
-	return 0;
 }
 
 #if 0
@@ -15199,6 +16020,7 @@ qwz_dp_wmask_compaction_rx_tlv_supported(struct qwz_softc *sc)
 void
 qwz_dp_hal_rx_desc_init(struct qwz_softc *sc)
 {
+	sc->hal_rx_ops = &hal_rx_wcn7850_ops;
 	if (qwz_dp_wmask_compaction_rx_tlv_supported(sc)) {
 		/* RX TLVS compaction is supported, hence change the hal_rx_ops
 		 * to compact hal_rx_ops.
@@ -15733,7 +16555,6 @@ qwz_wmi_cmd_send_nowait(struct qwz_pdev_wmi *wmi, struct mbuf *m,
 	    sizeof(struct ath12k_htc_hdr));
 	cmd_hdr->cmd_id = htole32(cmd);
 
-	DNPRINTF(QWZ_D_WMI, "%s: sending WMI command 0x%u\n", __func__, cmd);
 	return qwz_htc_send(&sc->htc, wmi->eid, m);
 }
 
@@ -16434,21 +17255,45 @@ qwz_wmi_send_peer_create_cmd(struct qwz_softc *sc, uint8_t pdev_id,
 {
 	struct qwz_pdev_wmi *wmi = &sc->wmi.wmi[pdev_id];
 	struct wmi_peer_create_cmd *cmd;
+	struct wmi_peer_create_mlo_params *ml_param;
+	struct wmi_tlv *tlv;
 	struct mbuf *m;
-	int ret;
+	void *ptr;
+	int ret, len;
 
-	m = qwz_wmi_alloc_mbuf(sizeof(*cmd));
+	/*
+	 * The FW expects a trailing WMI_TAG_ARRAY_STRUCT containing a
+	 * WMI_TAG_MLO_PEER_CREATE_PARAMS struct after the cmd, even when
+	 * MLO is unused.  Without it the FW reads past our buffer when
+	 * walking the TLV stream, stores garbage MLO flags in per-peer
+	 * state, and crashes later when it consumes that state.
+	 */
+	len = sizeof(*cmd) + TLV_HDR_SIZE + sizeof(*ml_param);
+
+	m = qwz_wmi_alloc_mbuf(len);
 	if (!m)
 		return ENOMEM;
 
-	cmd = (struct wmi_peer_create_cmd *)(mtod(m, uint8_t *) +
-	    sizeof(struct ath12k_htc_hdr) + sizeof(struct wmi_cmd_hdr));
+	ptr = (void *)(mtod(m, uint8_t *) + sizeof(struct ath12k_htc_hdr) +
+	    sizeof(struct wmi_cmd_hdr));
+	cmd = ptr;
 	cmd->tlv_header = FIELD_PREP(WMI_TLV_TAG, WMI_TAG_PEER_CREATE_CMD) |
 	    FIELD_PREP(WMI_TLV_LEN, sizeof(*cmd) - TLV_HDR_SIZE);
 
 	IEEE80211_ADDR_COPY(cmd->peer_macaddr.addr, param->peer_addr);
 	cmd->peer_type = param->peer_type;
 	cmd->vdev_id = param->vdev_id;
+
+	ptr = (uint8_t *)ptr + sizeof(*cmd);
+	tlv = ptr;
+	tlv->header = FIELD_PREP(WMI_TLV_TAG, WMI_TAG_ARRAY_STRUCT) |
+	    FIELD_PREP(WMI_TLV_LEN, sizeof(*ml_param));
+	ptr = (uint8_t *)ptr + TLV_HDR_SIZE;
+	ml_param = ptr;
+	ml_param->tlv_header =
+	    FIELD_PREP(WMI_TLV_TAG, WMI_TAG_MLO_PEER_CREATE_PARAMS) |
+	    FIELD_PREP(WMI_TLV_LEN, sizeof(*ml_param) - TLV_HDR_SIZE);
+	/* flags=0: MLO disabled (mbuf is zero-initialized). */
 
 	ret = qwz_wmi_cmd_send(wmi, m, WMI_PEER_CREATE_CMDID);
 	if (ret) {
@@ -16669,7 +17514,18 @@ qwz_wmi_send_peer_assoc_cmd(struct qwz_softc *sc, uint8_t pdev_id,
 	      TLV_HDR_SIZE + (peer_legacy_rates_align * sizeof(uint8_t)) +
 	      TLV_HDR_SIZE + (peer_ht_rates_align * sizeof(uint8_t)) +
 	      sizeof(*mcs) + TLV_HDR_SIZE +
-	      (sizeof(*he_mcs) * param->peer_he_mcs_count);
+	      (sizeof(*he_mcs) * param->peer_he_mcs_count) +
+	      /*
+	       * The FW expects three trailing TLVs (in this order) after
+	       * the HE rate set, even when the corresponding features are
+	       * unused.  Without these placeholder TLV headers the FW reads
+	       * past the end of our buffer when walking the TLV stream and
+	       * crashes inside dlpager.  Mirror of Linux ath12k.
+	       *   1. WMI_TAG_ARRAY_STRUCT (ML params)
+	       *   2. WMI_TAG_ARRAY_STRUCT (EHT rate set)
+	       *   3. WMI_TAG_ARRAY_STRUCT (ML partner info)
+	       */
+	      3 * TLV_HDR_SIZE;
 
 	m = qwz_wmi_alloc_mbuf(len);
 	if (!m)
@@ -16783,6 +17639,28 @@ qwz_wmi_send_peer_assoc_cmd(struct qwz_softc *sc, uint8_t pdev_id,
 		ptr += sizeof(*he_mcs);
 	}
 
+	/*
+	 * Three trailing placeholder TLVs the FW always expects after the
+	 * HE rate set: ML params, EHT rate set, ML partner info.  All
+	 * empty (length 0) since we don't support MLO or WiFi7 EHT rates.
+	 * Without these the FW walks past our buffer end and crashes in
+	 * dlpager.  Mirror of Linux ath12k_wmi_send_peer_assoc_cmd().
+	 */
+	tlv = ptr;
+	tlv->header = FIELD_PREP(WMI_TLV_TAG, WMI_TAG_ARRAY_STRUCT) |
+	    FIELD_PREP(WMI_TLV_LEN, 0);	/* ML params */
+	ptr += TLV_HDR_SIZE;
+
+	tlv = ptr;
+	tlv->header = FIELD_PREP(WMI_TLV_TAG, WMI_TAG_ARRAY_STRUCT) |
+	    FIELD_PREP(WMI_TLV_LEN, 0);	/* EHT rate set */
+	ptr += TLV_HDR_SIZE;
+
+	tlv = ptr;
+	tlv->header = FIELD_PREP(WMI_TLV_TAG, WMI_TAG_ARRAY_STRUCT) |
+	    FIELD_PREP(WMI_TLV_LEN, 0);	/* ML partner info */
+	ptr += TLV_HDR_SIZE;
+
 	ret = qwz_wmi_cmd_send(wmi, m, WMI_PEER_ASSOC_CMDID);
 	if (ret) {
 		if (ret != ESHUTDOWN) {
@@ -16793,21 +17671,6 @@ qwz_wmi_send_peer_assoc_cmd(struct qwz_softc *sc, uint8_t pdev_id,
 		return ret;
 	}
 
-	DNPRINTF(QWZ_D_WMI, "%s: cmd peer assoc vdev id %d assoc id %d "
-	    "peer mac %s peer_flags %x rate_caps %x peer_caps %x "
-	    "listen_intval %d ht_caps %x max_mpdu %d nss %d phymode %d "
-	    "peer_mpdu_density %d vht_caps %x he cap_info %x he ops %x "
-	    "he cap_info_ext %x he phy %x %x %x peer_bw_rxnss_override %x\n",
-	    __func__, cmd->vdev_id, cmd->peer_associd,
-	    ether_sprintf(param->peer_mac),
-	    cmd->peer_flags, cmd->peer_rate_caps, cmd->peer_caps,
-	    cmd->peer_listen_intval, cmd->peer_ht_caps,
-	    cmd->peer_max_mpdu, cmd->peer_nss, cmd->peer_phymode,
-	    cmd->peer_mpdu_density, cmd->peer_vht_caps, cmd->peer_he_cap_info,
-	    cmd->peer_he_ops, cmd->peer_he_cap_info_ext,
-	    cmd->peer_he_cap_phy[0], cmd->peer_he_cap_phy[1],
-	    cmd->peer_he_cap_phy[2], cmd->peer_bw_rxnss_override);
-
 	return 0;
 }
 
@@ -16815,6 +17678,8 @@ void
 qwz_wmi_copy_resource_config(struct wmi_resource_config *wmi_cfg,
     struct wmi_resource_config_arg *tg_cfg)
 {
+	memset(wmi_cfg, 0, sizeof(*wmi_cfg));
+
 	wmi_cfg->num_vdevs = tg_cfg->num_vdevs;
 	wmi_cfg->num_peers = tg_cfg->num_peers;
 	wmi_cfg->num_offload_peers = tg_cfg->num_offload_peers;
@@ -16868,20 +17733,19 @@ qwz_wmi_copy_resource_config(struct wmi_resource_config *wmi_cfg,
 	wmi_cfg->bpf_instruction_size = tg_cfg->bpf_instruction_size;
 	wmi_cfg->max_bssid_rx_filters = tg_cfg->max_bssid_rx_filters;
 	wmi_cfg->use_pdev_id = tg_cfg->use_pdev_id;
-	wmi_cfg->flag1 = tg_cfg->atf_config | WMI_RSRC_CFG_FLAG1_BSS_CHANNEL_INFO_64;
+	wmi_cfg->flag1 = tg_cfg->atf_config | WMI_RSRC_CFG_FLAG1_BSS_CHANNEL_INFO_64 |
+	    WMI_RSRC_CFG_FLAG1_ACK_RSSI;
 	wmi_cfg->peer_map_unmap_version = tg_cfg->peer_map_unmap_version;
 	wmi_cfg->sched_params = tg_cfg->sched_params;
 	wmi_cfg->twt_ap_pdev_count = tg_cfg->twt_ap_pdev_count;
 	wmi_cfg->twt_ap_sta_count = tg_cfg->twt_ap_sta_count;
-#ifdef notyet /* 6 GHz support */
-	wmi_cfg->host_service_flags &=
-	    ~(1 << WMI_CFG_HOST_SERVICE_FLAG_REG_CC_EXT);
-	wmi_cfg->host_service_flags |= (tg_cfg->is_reg_cc_ext_event_supported <<
-	    WMI_CFG_HOST_SERVICE_FLAG_REG_CC_EXT);
-	wmi_cfg->flags2 = WMI_RSRC_CFG_FLAG2_CALC_NEXT_DTIM_COUNT_SET;
+	wmi_cfg->flags2 = FIELD_PREP(WMI_RSRC_CFG_FLAGS2_RX_PEER_METADATA_VERSION,
+	    tg_cfg->peer_metadata_ver);
+	wmi_cfg->host_service_flags =
+	    tg_cfg->is_reg_cc_ext_event_supported << WMI_CFG_HOST_SERVICE_FLAG_REG_CC_EXT;
 	wmi_cfg->ema_max_vap_cnt = tg_cfg->ema_max_vap_cnt;
 	wmi_cfg->ema_max_profile_period = tg_cfg->ema_max_profile_period;
-#endif
+	wmi_cfg->flags2 |= WMI_RSRC_CFG_FLAG2_CALC_NEXT_DTIM_COUNT_SET;
 }
 
 int
@@ -17046,6 +17910,21 @@ qwz_wmi_wait_for_unified_ready(struct qwz_softc *sc)
 }
 
 int
+qwz_wmi_wait_for_hw_mode_ready(struct qwz_softc *sc)
+{
+	int ret;
+
+	while (!sc->wmi.hw_mode_ready) {
+		ret = tsleep_nsec(&sc->wmi.hw_mode_ready, 0, "qwzhwmode",
+		    SEC_TO_NSEC(5));
+		if (ret)
+			return -1;
+	}
+
+	return 0;
+}
+
+int
 qwz_wmi_set_hw_mode(struct qwz_softc *sc,
     enum wmi_host_hw_mode_config_type mode)
 {
@@ -17134,7 +18013,7 @@ qwz_wmi_mgmt_send(struct qwz_softc *sc, struct qwz_vif *arvif, uint8_t pdev_id,
 	struct wmi_mgmt_send_cmd *cmd;
 	struct wmi_tlv *frame_tlv;
 	struct mbuf *m;
-	uint32_t buf_len;
+	uint32_t buf_len, buf_len_aligned;
 	int ret, len;
 	uint64_t paddr;
 
@@ -17143,7 +18022,9 @@ qwz_wmi_mgmt_send(struct qwz_softc *sc, struct qwz_vif *arvif, uint8_t pdev_id,
 	buf_len = frame->m_pkthdr.len < WMI_MGMT_SEND_DOWNLD_LEN ?
 	    frame->m_pkthdr.len : WMI_MGMT_SEND_DOWNLD_LEN;
 
-	len = sizeof(*cmd) + sizeof(*frame_tlv) + roundup(buf_len, 4);
+	buf_len_aligned = roundup(buf_len, sizeof(uint32_t));
+
+	len = sizeof(*cmd) + sizeof(*frame_tlv) + buf_len_aligned;
 
 	m = qwz_wmi_alloc_mbuf(len);
 	if (!m)
@@ -17166,12 +18047,13 @@ qwz_wmi_mgmt_send(struct qwz_softc *sc, struct qwz_vif *arvif, uint8_t pdev_id,
 	    sizeof(struct ath12k_htc_hdr) + sizeof(struct wmi_cmd_hdr) +
 	    sizeof(*cmd));
 	frame_tlv->header = FIELD_PREP(WMI_TLV_TAG, WMI_TAG_ARRAY_BYTE) |
-	    FIELD_PREP(WMI_TLV_LEN, buf_len);
+	    FIELD_PREP(WMI_TLV_LEN, buf_len_aligned);
 
 	memcpy(frame_tlv->value, mtod(frame, void *), buf_len);
 #if 0 /* Not needed on OpenBSD? */
 	ath12k_ce_byte_swap(frame_tlv->value, buf_len);
 #endif
+
 	ret = qwz_wmi_cmd_send(wmi, m, WMI_MGMT_TX_SEND_CMDID);
 	if (ret) {
 		if (ret != ESHUTDOWN) {
@@ -17670,6 +18552,8 @@ qwz_core_start(struct qwz_softc *sc)
 
 	qwz_dp_hal_rx_desc_init(sc);
 
+	sc->wmi.unified_ready = 0;
+
 	ret = qwz_wmi_cmd_init(sc);
 	if (ret) {
 		printf("%s: failed to send wmi init cmd: %d\n", __func__, ret);
@@ -17685,11 +18569,19 @@ qwz_core_start(struct qwz_softc *sc)
 
 	/* put hardware to DBS mode */
 	if (sc->hw_params.single_pdev_only) {
+		sc->wmi.hw_mode_ready = 0;
 		ret = qwz_wmi_set_hw_mode(sc, WMI_HOST_HW_MODE_DBS);
 		if (ret) {
 			printf("%s: failed to send dbs mode: %d\n",
 			    __func__, ret);
 			goto err_hif_stop;
+		}
+
+		ret = qwz_wmi_wait_for_hw_mode_ready(sc);
+		if (ret) {
+			printf("%s: failed to receive dbs mode response: %d\n",
+			    __func__, ret);
+			goto err_reo_cleanup;
 		}
 	}
 
@@ -17810,6 +18702,8 @@ qwz_core_deinit(struct qwz_softc *sc)
 	qwz_qmi_deinit_service(sc);
 
 	hal->num_shadow_reg_configured = 0;
+
+	sc->fw_initialized = 0;
 
 	splx(s);
 }
@@ -19073,9 +19967,6 @@ qwz_htc_process_credit_report(struct qwz_htc *htc,
 		ep = &htc->endpoint[report->eid];
 		ep->tx_credits += report->credits;
 
-		DNPRINTF(QWZ_D_HTC, "%s: ep %d credits got %d total %d\n",
-		    __func__, report->eid, report->credits, ep->tx_credits);
-
 		if (ep->ep_ops.ep_tx_credits) {
 #ifdef notyet
 			spin_unlock_bh(&htc->tx_lock);
@@ -20222,13 +21113,29 @@ qwz_reg_update_chan_list(struct qwz_softc *sc, uint8_t pdev_id)
 	int num_channels = 0;
 	size_t params_size;
 	int ret;
+	int scan_2ghz = 1, scan_5ghz = 1;
 #if 0
 	if (ar->state == ATH12K_STATE_RESTARTING)
 		return 0;
 #endif
+	/*
+	 * Scan an appropriate subset of channels if we are running
+	 * in a fixed, user-specified phy mode.
+	 */
+	if (IFM_MODE(ic->ic_media.ifm_cur->ifm_media) != IFM_AUTO) {
+		if (ic->ic_curmode == IEEE80211_MODE_11A)
+			scan_2ghz = 0;
+		if (ic->ic_curmode == IEEE80211_MODE_11B ||
+		    ic->ic_curmode == IEEE80211_MODE_11G)
+			scan_5ghz = 0;
+	}
+
 	lastc = &ic->ic_channels[IEEE80211_CHAN_MAX];
 	for (channel = &ic->ic_channels[1]; channel <= lastc; channel++) {
 		if (channel->ic_flags == 0)
+			continue;
+		if ((!scan_2ghz && IEEE80211_IS_CHAN_2GHZ(channel)) ||
+		    (!scan_5ghz && IEEE80211_IS_CHAN_5GHZ(channel)))
 			continue;
 		num_channels++;
 	}
@@ -20255,12 +21162,16 @@ qwz_reg_update_chan_list(struct qwz_softc *sc, uint8_t pdev_id)
 	for (channel = &ic->ic_channels[1]; channel <= lastc; channel++) {
 		if (channel->ic_flags == 0)
 			continue;
-#ifdef notyet
-		/* TODO: Set to true/false based on some condition? */
+		if ((!scan_2ghz && IEEE80211_IS_CHAN_2GHZ(channel)) ||
+		    (!scan_5ghz && IEEE80211_IS_CHAN_5GHZ(channel)))
+			continue;
+		/*
+		 * XXX We do not populate 6 GHz channels here yet.
+		 * Linux sets these scan capability bits unconditionally too.
+		 */
 		ch->allow_ht = true;
 		ch->allow_vht = true;
 		ch->allow_he = true;
-#endif
 		ch->dfs_set = !!(IEEE80211_IS_CHAN_5GHZ(channel) &&
 		    (channel->ic_flags & IEEE80211_CHAN_PASSIVE));
 		ch->is_chan_passive = !!(channel->ic_flags &
@@ -20274,13 +21185,24 @@ qwz_reg_update_chan_list(struct qwz_softc *sc, uint8_t pdev_id)
 		ch->maxregpower = ch->maxpower;
 		ch->antennamax = 0;
 
-		/* TODO: Use appropriate phymodes */
-		if (IEEE80211_IS_CHAN_A(channel))
+		switch (IFM_MODE(ic->ic_media.ifm_cur->ifm_media)) {
+		case IFM_IEEE80211_11A:
 			ch->phy_mode = MODE_11A;
-		else if (IEEE80211_IS_CHAN_G(channel))
+			break;
+		case IFM_IEEE80211_11G:
 			ch->phy_mode = MODE_11G;
-		else
+			break;
+		case IFM_IEEE80211_11B:
 			ch->phy_mode = MODE_11B;
+			break;
+		case IFM_IEEE80211_11N:
+		default:
+			if (IEEE80211_IS_CHAN_A(channel))
+				ch->phy_mode = MODE_11NA_HT20;
+			else
+				ch->phy_mode = MODE_11NG_HT20;
+			break;
+		}
 #ifdef notyet
 		if (channel->band == NL80211_BAND_6GHZ &&
 		    cfg80211_channel_is_psc(channel))
@@ -20416,6 +21338,7 @@ int
 qwz_mac_op_start(struct qwz_pdev *pdev)
 {
 	struct qwz_softc *sc = pdev->sc;
+	struct ieee80211com *ic = &sc->sc_ic;
 	int ret;
 
 	ret = qwz_wmi_pdev_set_param(sc, WMI_PDEV_PARAM_PMF_QOS, 1,
@@ -20466,6 +21389,15 @@ qwz_mac_op_start(struct qwz_pdev *pdev)
 	}
 
 	qwz_set_antenna(pdev, pdev->cap.tx_chain_mask, pdev->cap.rx_chain_mask);
+
+	memset(ic->ic_sup_mcs, 0, sizeof(ic->ic_sup_mcs));
+	ic->ic_sup_mcs[0] = 0xff;		/* MCS 0-7 */
+	if (sc->num_rx_chains > 1)
+		ic->ic_sup_mcs[1] = 0xff;	/* MCS 8-15 */
+	if (sc->num_rx_chains > 2)
+		ic->ic_sup_mcs[2] = 0xff;	/* MCS 16-23 */
+	if (sc->num_rx_chains > 3)
+		ic->ic_sup_mcs[3] = 0xff;	/* MCS 24-31 */
 
 	/* TODO: Do we need to enable ANI? */
 
@@ -20689,6 +21621,7 @@ qwz_mac_vdev_start_restart(struct qwz_softc *sc, struct qwz_vif *arvif,
 	struct ieee80211com *ic = &sc->sc_ic;
 	struct ieee80211_channel *chan = ic->ic_bss->ni_chan;
 	struct wmi_vdev_start_req_arg arg = {};
+	uint8_t sco = IEEE80211_HTOP0_SCO_SCN;
 	int ret = 0;
 #ifdef notyet
 	lockdep_assert_held(&ar->conf_mutex);
@@ -20704,29 +21637,38 @@ qwz_mac_vdev_start_restart(struct qwz_softc *sc, struct qwz_vif *arvif,
 	arg.channel.band_center_freq1 = chan->ic_freq;
 	arg.channel.band_center_freq2 = chan->ic_freq;
 
-	switch (ic->ic_curmode) {
-	case IEEE80211_MODE_11A:
+	if (ieee80211_node_supports_ht(ic->ic_bss) &&
+	    (chan->ic_flags & IEEE80211_CHAN_HT)) {
+		arg.channel.allow_ht = true;
+		if (IEEE80211_CHAN_40MHZ_ALLOWED(chan) &&
+		    ieee80211_node_supports_ht_chan40(ic->ic_bss))
+			sco = ic->ic_bss->ni_htop0 &
+			    IEEE80211_HTOP0_SCO_MASK;
+		if (sco == IEEE80211_HTOP0_SCO_SCA) {
+			arg.channel.band_center_freq1 = chan->ic_freq + 10;
+			arg.channel.mode = IEEE80211_IS_CHAN_5GHZ(chan) ?
+			    MODE_11NA_HT40 : MODE_11NG_HT40;
+		} else if (sco == IEEE80211_HTOP0_SCO_SCB) {
+			arg.channel.band_center_freq1 = chan->ic_freq - 10;
+			arg.channel.mode = IEEE80211_IS_CHAN_5GHZ(chan) ?
+			    MODE_11NA_HT40 : MODE_11NG_HT40;
+		} else
+			arg.channel.mode = IEEE80211_IS_CHAN_5GHZ(chan) ?
+			    MODE_11NA_HT20 : MODE_11NG_HT20;
+	} else if (IEEE80211_IS_CHAN_5GHZ(chan))
 		arg.channel.mode = MODE_11A;
-		break;
-	case IEEE80211_MODE_11B:
-		arg.channel.mode = MODE_11B;
-		break;
-	case IEEE80211_MODE_11G:
+	else if (ic->ic_bss->ni_flags & IEEE80211_NODE_ERP)
 		arg.channel.mode = MODE_11G;
-		break;
-	default:
-		printf("%s: unsupported phy mode %d\n",
-		    sc->sc_dev.dv_xname, ic->ic_curmode);
-		return ENOTSUP;
-	}
+	else
+		arg.channel.mode = MODE_11B;
 
 	arg.channel.min_power = 0;
 	arg.channel.max_power = 20; /* XXX */
 	arg.channel.max_reg_power = 20; /* XXX */
 	arg.channel.max_antenna_gain = 0; /* XXX */
 
-	arg.pref_tx_streams = 1;
-	arg.pref_rx_streams = 1;
+	arg.pref_tx_streams = sc->num_tx_chains;
+	arg.pref_rx_streams = sc->num_rx_chains;
 
 	arg.mbssid_flags = 0;
 	arg.mbssid_tx_vdev_id = 0;
@@ -20858,6 +21800,7 @@ qwz_vif_alloc(struct qwz_softc *sc)
 	arvif = malloc(sizeof(*arvif), M_DEVBUF, M_NOWAIT | M_ZERO);
 	if (arvif == NULL)
 		return NULL;
+	arvif->bank_id = -1;
 
 	txmgmt = &arvif->txmgmt;
 	for (i = 0; i < nitems(txmgmt->data); i++) {
@@ -21192,6 +22135,12 @@ qwz_init_task(void *arg)
 void
 qwz_mac_11d_scan_start(struct qwz_softc *sc, struct qwz_vif *arvif)
 {
+/*
+ * XXX:
+ * The 802.11d scanning command is currently causing a firmware error,
+ * hence disabling this function for now.
+ */
+#if 0
 	struct ieee80211com *ic = &sc->sc_ic;
 	struct wmi_11d_scan_start_params param;
 	int ret;
@@ -21240,6 +22189,7 @@ fin:
 #ifdef notyet
 	mutex_unlock(&ar->ab->vdev_id_11d_lock);
 #endif
+#endif
 }
 
 void
@@ -21269,6 +22219,7 @@ qwz_mac_scan_finish(struct qwz_softc *sc)
 		sc->scan.roc_freq = 0;
 
 		timeout_del(&sc->scan.timeout);
+		wakeup(&sc->scan.state);
 		if (!sc->scan.is_roc)
 			ieee80211_end_scan(ifp);
 #if 0
@@ -21409,22 +22360,21 @@ qwz_peer_create(struct qwz_softc *sc, struct qwz_vif *arvif, uint8_t pdev_id,
 	spin_lock_bh(&ar->ab->base_lock);
 #endif
 	peer = &nq->peer;
-	if (peer) {
-		if (peer->peer_id != HAL_INVALID_PEERID &&
-		    peer->vdev_id == param->vdev_id) {
-#ifdef notyet
-			spin_unlock_bh(&ar->ab->base_lock);
-			mutex_unlock(&ar->ab->tbl_mtx_lock);
-#endif
-			return EINVAL;
-		}
-#if 0
-		/* Assume sta is transitioning to another band.
-		 * Remove here the peer from rhash.
-		 */
-		ath12k_peer_rhash_delete(ar->ab, peer);
-#endif
-	}
+	/*
+	 * Reset stale peer state from any prior attempt.  After a
+	 * fatal_firmware_error the FW peer table is wiped but the
+	 * host-side qwz_node persists with peer->peer_id and
+	 * peer->vdev_id from the last attempt.  Without this reset
+	 * the subsequent peer_create returns EINVAL and we get stuck
+	 * in a recovery loop (peer_create fail -> wlan mode off fail
+	 * -> mhi_start -> repeat).  The stale ast_hash / hw_peer_id
+	 * are also reset because they will be re-populated by the
+	 * next peer_map_event.
+	 */
+	peer->peer_id = HAL_INVALID_PEERID;
+	peer->vdev_id = 0;
+	peer->ast_hash = 0;
+	peer->hw_peer_id = 0;
 #ifdef notyet
 	spin_unlock_bh(&ar->ab->base_lock);
 	mutex_unlock(&ar->ab->tbl_mtx_lock);
@@ -21680,13 +22630,7 @@ qwz_dp_reo_cmd_free(struct qwz_dp *dp, void *ctx,
 		printf("%s: failed to flush rx tid hw desc, tid %d status %d\n",
 		    sc->sc_dev.dv_xname, rx_tid->tid, status);
 
-	if (rx_tid->mem) {
-		qwz_dmamem_free(sc->sc_dmat, rx_tid->mem);
-		rx_tid->mem = NULL;
-		rx_tid->vaddr = NULL;
-		rx_tid->paddr = 0ULL;
-		rx_tid->size = 0;
-	}
+	qwz_dp_rx_tid_clear(sc, rx_tid);
 }
 
 void
@@ -21721,13 +22665,7 @@ qwz_dp_reo_cache_flush(struct qwz_softc *sc, struct dp_rx_tid *rx_tid)
 	if (ret) {
 		printf("%s: failed to send HAL_REO_CMD_FLUSH_CACHE cmd, "
 		    "tid %d (%d)\n", sc->sc_dev.dv_xname, rx_tid->tid, ret);
-		if (rx_tid->mem) {
-			qwz_dmamem_free(sc->sc_dmat, rx_tid->mem);
-			rx_tid->mem = NULL;
-			rx_tid->vaddr = NULL;
-			rx_tid->paddr = 0ULL;
-			rx_tid->size = 0;
-		}
+		qwz_dp_rx_tid_clear(sc, rx_tid);
 	}
 }
 
@@ -21741,7 +22679,8 @@ qwz_dp_rx_tid_del_func(struct qwz_dp *dp, void *ctx,
 	uint64_t now;
 
 	if (status == HAL_REO_CMD_DRAIN) {
-		goto free_desc;
+		qwz_dp_rx_tid_clear(sc, rx_tid);
+		return;
 	} else if (status != HAL_REO_CMD_SUCCESS) {
 		/* Shouldn't happen! Cleanup in case of other failure? */
 		printf("%s: failed to delete rx tid %d hw descriptor %d\n",
@@ -21750,17 +22689,16 @@ qwz_dp_rx_tid_del_func(struct qwz_dp *dp, void *ctx,
 	}
 
 	elem = malloc(sizeof(*elem), M_DEVBUF, M_ZERO | M_NOWAIT);
-	if (!elem)
-		goto free_desc;
+	if (!elem) {
+		qwz_dp_rx_tid_clear(sc, rx_tid);
+		return;
+	}
 
 	now = getnsecuptime();
 	elem->ts = now;
 	memcpy(&elem->data, rx_tid, sizeof(*rx_tid));
 
-	rx_tid->mem = NULL;
-	rx_tid->vaddr = NULL;
-	rx_tid->paddr = 0ULL;
-	rx_tid->size = 0;
+	qwz_dp_rx_tid_clear(sc, rx_tid);
 
 #ifdef notyet
 	spin_lock_bh(&dp->reo_cmd_lock);
@@ -21787,15 +22725,6 @@ qwz_dp_rx_tid_del_func(struct qwz_dp *dp, void *ctx,
 #ifdef notyet
 	spin_unlock_bh(&dp->reo_cmd_lock);
 #endif
-	return;
-free_desc:
-	if (rx_tid->mem) {
-		qwz_dmamem_free(sc->sc_dmat, rx_tid->mem);
-		rx_tid->mem = NULL;
-		rx_tid->vaddr = NULL;
-		rx_tid->paddr = 0ULL;
-		rx_tid->size = 0;
-	}
 }
 
 void
@@ -21824,13 +22753,7 @@ qwz_peer_rx_tid_delete(struct qwz_softc *sc, struct ath12k_peer *peer,
 			    sc->sc_dev.dv_xname, tid, ret);
 		}
 
-		if (rx_tid->mem) {
-			qwz_dmamem_free(sc->sc_dmat, rx_tid->mem);
-			rx_tid->mem = NULL;
-			rx_tid->vaddr = NULL;
-			rx_tid->paddr = 0ULL;
-			rx_tid->size = 0;
-		}
+		qwz_dp_rx_tid_clear(sc, rx_tid);
 	}
 }
 
@@ -21866,7 +22789,7 @@ qwz_peer_frags_flush(struct qwz_softc *sc, struct ath12k_peer *peer)
 #ifdef notyet
 	lockdep_assert_held(&ar->ab->base_lock);
 #endif
-	for (i = 0; i < IEEE80211_NUM_TID; i++) {
+	for (i = 0; i <= HAL_DESC_REO_NON_QOS_TID; i++) {
 		rx_tid = &peer->rx_tid[i];
 
 		qwz_dp_rx_frags_cleanup(sc, rx_tid, 1);
@@ -21886,7 +22809,7 @@ qwz_peer_rx_tid_cleanup(struct qwz_softc *sc, struct ath12k_peer *peer)
 #ifdef notyet
 	lockdep_assert_held(&ar->ab->base_lock);
 #endif
-	for (i = 0; i < IEEE80211_NUM_TID; i++) {
+	for (i = 0; i <= HAL_DESC_REO_NON_QOS_TID; i++) {
 		rx_tid = &peer->rx_tid[i];
 
 		qwz_peer_rx_tid_delete(sc, peer, i);
@@ -21943,13 +22866,11 @@ qwz_dp_rx_tid_mem_free(struct qwz_softc *sc, struct ieee80211_node *ni,
 #endif
 	rx_tid = &peer->rx_tid[tid];
 
-	if (rx_tid->mem) {
-		qwz_dmamem_free(sc->sc_dmat, rx_tid->mem);
-		rx_tid->mem = NULL;
-		rx_tid->vaddr = NULL;
-		rx_tid->paddr = 0ULL;
-		rx_tid->size = 0;
-	}
+	/*
+	 * Nothing to free here since DMA memory pointers are
+	 * managed as part of qwz_softc.
+	 */
+	qwz_dp_rx_tid_clear(sc, rx_tid);
 
 	rx_tid->active = 0;
 #ifdef notyet
@@ -21962,6 +22883,7 @@ qwz_peer_rx_tid_setup(struct qwz_softc *sc, struct ieee80211_node *ni,
     int vdev_id, int pdev_id, uint8_t tid, uint32_t ba_win_sz, uint16_t ssn,
     enum hal_pn_type pn_type)
 {
+	struct qwz_dp *dp = &sc->dp;
 	struct qwz_node *nq = (struct qwz_node *)ni;
 	struct ath12k_peer *peer = &nq->peer;
 	struct dp_rx_tid *rx_tid;
@@ -22009,18 +22931,25 @@ qwz_peer_rx_tid_setup(struct qwz_softc *sc, struct ieee80211_node *ni,
 	else
 		hw_desc_sz = qwz_hal_reo_qdesc_size(DP_BA_WIN_SZ_MAX, tid);
 
-	rx_tid->mem = qwz_dmamem_alloc(sc->sc_dmat, hw_desc_sz,
-	    HAL_LINK_DESC_ALIGN);
-	if (rx_tid->mem == NULL) {
+	if (dp->rx_tid_mem[tid] == NULL) {
+		dp->rx_tid_mem[tid] = qwz_dmamem_alloc(sc->sc_dmat, hw_desc_sz,
+		    HAL_LINK_DESC_ALIGN);
+		if (dp->rx_tid_mem[tid] == NULL) {
 #ifdef notyet
-		spin_unlock_bh(&ab->base_lock);
+			spin_unlock_bh(&ab->base_lock);
 #endif
-		return ENOMEM;
+			return ENOMEM;
+		}
 	}
+
+	rx_tid->mem = dp->rx_tid_mem[tid];
 
 	vaddr = QWZ_DMA_KVA(rx_tid->mem);
 
 	qwz_hal_reo_qdesc_setup(vaddr, tid, ba_win_sz, ssn, pn_type);
+
+	bus_dmamap_sync(sc->sc_dmat, rx_tid->mem->map,
+	    0, rx_tid->mem->size, BUS_DMASYNC_PREWRITE);
 
 	paddr = QWZ_DMA_DVA(rx_tid->mem);
 
@@ -22090,7 +23019,7 @@ qwz_dp_peer_setup(struct qwz_softc *sc, int vdev_id, int pdev_id,
 		return ret;
 	}
 
-	for (tid = 0; tid < IEEE80211_NUM_TID; tid++) {
+	for (tid = 0; tid <= HAL_DESC_REO_NON_QOS_TID; tid++) {
 		ret = qwz_peer_rx_tid_setup(sc, ni, vdev_id, pdev_id,
 		    tid, 1, 0, HAL_PN_TYPE_NONE);
 		if (ret) {
@@ -22212,12 +23141,74 @@ uint8_t
 qwz_dp_tx_get_tid(struct mbuf *m)
 {
 	struct ieee80211_frame *wh = mtod(m, struct ieee80211_frame *);
-	uint16_t qos = ieee80211_get_qos(wh);
-	uint8_t tid = qos & IEEE80211_QOS_TID;
 
-	return tid;
+	/*
+	 * Mirror of Linux ath12k_dp_tx_get_tid: non-QoS data frames go
+	 * onto the special HAL_DESC_REO_NON_QOS_TID (=16), not TID 0.
+	 * qwz used to return 0 for every frame, which made the FW believe
+	 * the non-QoS DHCP/ARP frames belonged in TID 0 (AC_BE) queue;
+	 * the resulting mismatch (TCL desc says TID 0, frame has no QoS
+	 * Control field) tripped a QURT internal-state assertion after
+	 * a handful of such frames post-AUTHORIZE.
+	 */
+	if (!ieee80211_has_qos(wh))
+		return HAL_DESC_REO_NON_QOS_TID;
+
+	return ieee80211_get_qos(wh) & IEEE80211_QOS_TID;
 }
 
+int
+qwz_dp_tx_encap_nwifi(struct mbuf **mp)
+{
+	struct mbuf *m = *mp;
+	struct ieee80211_frame *wh;
+	uint8_t *qos_ctl;
+	int hdrlen;
+
+	if (m->m_len < sizeof(*wh) &&
+	    (m = m_pullup(m, sizeof(*wh))) == NULL) {
+		*mp = NULL;
+		return ENOBUFS;
+	}
+
+	wh = mtod(m, struct ieee80211_frame *);
+	if (!ieee80211_has_qos(wh)) {
+		*mp = m;
+		return 0;
+	}
+
+	hdrlen = ieee80211_get_hdrlen(wh);
+	if (m->m_len < hdrlen &&
+	    (m = m_pullup(m, hdrlen)) == NULL) {
+		*mp = NULL;
+		return ENOBUFS;
+	}
+
+	wh = mtod(m, struct ieee80211_frame *);
+	if (ieee80211_has_addr4(wh))
+		qos_ctl = ((struct ieee80211_qosframe_addr4 *)wh)->i_qos;
+	else
+		qos_ctl = ((struct ieee80211_qosframe *)wh)->i_qos;
+
+	memmove(mtod(m, uint8_t *) + sizeof(uint16_t), mtod(m, uint8_t *),
+	    qos_ctl - mtod(m, uint8_t *));
+	m_adj(m, sizeof(uint16_t));
+
+	wh = mtod(m, struct ieee80211_frame *);
+	wh->i_fc[0] &= ~IEEE80211_FC0_SUBTYPE_QOS;
+
+	*mp = m;
+	return 0;
+}
+
+/*
+ * Build a WCN7850 / ath12k WiFi7 TCL data descriptor. Encap/encrypt/
+ * search settings live in the bank addressed by ti->bank_id; the
+ * descriptor only carries DESC_TYPE | BANK_ID + per-frame fields.
+ * Each TCL_DATA ring slot is just a hal_tcl_data_cmd (no per-entry
+ * TLV header, unlike ath11k); FW reads info0 from offset 0.
+ * Mirror of Linux ath12k_wifi7_hal_tx_cmd_desc_setup().
+ */
 void
 qwz_hal_tx_cmd_desc_setup(struct qwz_softc *sc, void *cmd,
     struct hal_tx_info *ti)
@@ -22234,29 +23225,24 @@ qwz_hal_tx_cmd_desc_setup(struct qwz_softc *sc, void *cmd,
 
 	tcl_cmd->info0 =
 	    FIELD_PREP(HAL_TCL_DATA_CMD_INFO0_DESC_TYPE, ti->type) |
-	    FIELD_PREP(HAL_TCL_DATA_CMD_INFO0_ENCAP_TYPE, ti->encap_type) |
-	    FIELD_PREP(HAL_TCL_DATA_CMD_INFO0_ENCRYPT_TYPE, ti->encrypt_type) |
-	    FIELD_PREP(HAL_TCL_DATA_CMD_INFO0_SEARCH_TYPE, ti->search_type) |
-	    FIELD_PREP(HAL_TCL_DATA_CMD_INFO0_ADDR_EN, ti->addr_search_flags) |
-	    FIELD_PREP(HAL_TCL_DATA_CMD_INFO0_CMD_NUM, ti->meta_data_flags);
+	    FIELD_PREP(HAL_TCL_DATA_CMD_INFO0_BANK_ID, ti->bank_id);
 
-	tcl_cmd->info1 = ti->flags0 |
-	    FIELD_PREP(HAL_TCL_DATA_CMD_INFO1_DATA_LEN, ti->data_len) |
-	    FIELD_PREP(HAL_TCL_DATA_CMD_INFO1_PKT_OFFSET, ti->pkt_offset);
+	tcl_cmd->info1 = FIELD_PREP(HAL_TCL_DATA_CMD_INFO1_CMD_NUM,
+	    ti->meta_data_flags);
 
-	tcl_cmd->info2 = ti->flags1 |
-	    FIELD_PREP(HAL_TCL_DATA_CMD_INFO2_TID, ti->tid) |
-	    FIELD_PREP(HAL_TCL_DATA_CMD_INFO2_LMAC_ID, ti->lmac_id);
+	tcl_cmd->info2 = ti->flags0 |
+	    FIELD_PREP(HAL_TCL_DATA_CMD_INFO2_DATA_LEN, ti->data_len) |
+	    FIELD_PREP(HAL_TCL_DATA_CMD_INFO2_PKT_OFFSET, ti->pkt_offset);
 
-	tcl_cmd->info3 = FIELD_PREP(HAL_TCL_DATA_CMD_INFO3_DSCP_TID_TABLE_IDX,
-	    ti->dscp_tid_tbl_idx) |
-	    FIELD_PREP(HAL_TCL_DATA_CMD_INFO3_SEARCH_INDEX, ti->bss_ast_idx) |
-	    FIELD_PREP(HAL_TCL_DATA_CMD_INFO3_CACHE_SET_NUM, ti->bss_ast_hash);
-	tcl_cmd->info4 = 0;
-#ifdef notyet
-	if (ti->enable_mesh)
-		ab->hw_params.hw_ops->tx_mesh_enable(ab, tcl_cmd);
-#endif
+	tcl_cmd->info3 = ti->flags1 |
+	    FIELD_PREP(HAL_TCL_DATA_CMD_INFO3_TID, ti->tid) |
+	    FIELD_PREP(HAL_TCL_DATA_CMD_INFO3_PMAC_ID, ti->lmac_id) |
+	    FIELD_PREP(HAL_TCL_DATA_CMD_INFO3_VDEV_ID, ti->vdev_id);
+
+	tcl_cmd->info4 =
+	    FIELD_PREP(HAL_TCL_DATA_CMD_INFO4_SEARCH_INDEX, ti->bss_ast_idx) |
+	    FIELD_PREP(HAL_TCL_DATA_CMD_INFO4_CACHE_SET_NUM, ti->bss_ast_hash);
+	tcl_cmd->info5 = 0;
 }
 
 int
@@ -22282,6 +23268,23 @@ qwz_dp_tx(struct qwz_softc *sc, struct qwz_vif *arvif, uint8_t pdev_id,
 		m_freem(m);
 		return ESHUTDOWN;
 	}
+
+	if (arvif->bank_id < 0) {
+		printf("%s: TX before TX bank is configured, dropping\n",
+		    sc->sc_dev.dv_xname);
+		m_freem(m);
+		return EIO;
+	}
+
+	/*
+	 * Default to no encryption. enum hal_encrypt_type starts with
+	 * HAL_ENCRYPT_TYPE_WEP_40 = 0, and the {0} initializer would
+	 * otherwise silently select WEP40.
+	 */
+	ti.encrypt_type = HAL_ENCRYPT_TYPE_OPEN;
+	ti.bank_id = arvif->bank_id;
+	ti.vdev_id = arvif->vdev_id;
+
 #if 0
 	if (unlikely(!(info->flags & IEEE80211_TX_CTL_HW_80211_ENCAP) &&
 		     !ieee80211_is_data(hdr->frame_control)))
@@ -22316,8 +23319,21 @@ qwz_dp_tx(struct qwz_softc *sc, struct qwz_vif *arvif, uint8_t pdev_id,
 
 	ti.meta_data_flags = arvif->tcl_metadata;
 
-	if ((wh->i_fc[1] & IEEE80211_FC1_PROTECTED) &&
-	    ti.encap_type == HAL_TCL_ENCAP_TYPE_RAW) {
+	/*
+	 * Set the per-frame encrypt_type so the FW knows which cipher
+	 * to apply.  This must run for ALL encap types, not only RAW:
+	 * leaving encrypt_type at HAL_ENCRYPT_TYPE_OPEN for protected
+	 * data frames in NATIVE_WIFI encap caused the FW to crash on
+	 * the first post-AUTHORIZE data TX (e.g. DHCP DISCOVER) because
+	 * the FW saw a frame with FC1_PROTECTED=1 but a TX descriptor
+	 * saying "no encryption" -- inconsistent state -> dlpager fault.
+	 *
+	 * For RAW encap with HW crypto, we additionally need to make
+	 * room in the mbuf for the cipher MIC (FW writes it in place).
+	 * For NATIVE_WIFI encap the FW does the full encrypt path on
+	 * its side, so no host-side space reservation is required.
+	 */
+	if (wh->i_fc[1] & IEEE80211_FC1_PROTECTED) {
 		k = ieee80211_get_txkey(ic, wh, ni);
 		if (test_bit(ATH12K_FLAG_HW_CRYPTO_DISABLED, sc->sc_flags)) {
 			ti.encrypt_type = HAL_ENCRYPT_TYPE_OPEN;
@@ -22325,16 +23341,18 @@ qwz_dp_tx(struct qwz_softc *sc, struct qwz_vif *arvif, uint8_t pdev_id,
 			switch (k->k_cipher) {
 			case IEEE80211_CIPHER_CCMP:
 				ti.encrypt_type = HAL_ENCRYPT_TYPE_CCMP_128;
-				if (m_makespace(m, m->m_pkthdr.len,
-				    IEEE80211_CCMP_MICLEN, &off) == NULL) {
+				if (ti.encap_type == HAL_TCL_ENCAP_TYPE_RAW &&
+				    m_makespace(m, m->m_pkthdr.len,
+					IEEE80211_CCMP_MICLEN, &off) == NULL) {
 					m_freem(m);
 					return ENOSPC;
 				}
 				break;
 			case IEEE80211_CIPHER_TKIP:
 				ti.encrypt_type = HAL_ENCRYPT_TYPE_TKIP_MIC;
-				if (m_makespace(m, m->m_pkthdr.len,
-				    IEEE80211_TKIP_MICLEN, &off) == NULL) {
+				if (ti.encap_type == HAL_TCL_ENCAP_TYPE_RAW &&
+				    m_makespace(m, m->m_pkthdr.len,
+					IEEE80211_TKIP_MICLEN, &off) == NULL) {
 					m_freem(m);
 					return ENOSPC;
 				}
@@ -22345,7 +23363,8 @@ qwz_dp_tx(struct qwz_softc *sc, struct qwz_vif *arvif, uint8_t pdev_id,
 			}
 		}
 
-		if (ti.encrypt_type == HAL_ENCRYPT_TYPE_OPEN) {
+		if (ti.encrypt_type == HAL_ENCRYPT_TYPE_OPEN &&
+		    ti.encap_type == HAL_TCL_ENCAP_TYPE_RAW) {
 			/* Using software crypto. */
 			if ((m = ieee80211_encrypt(ic, m, k)) == NULL)
 				return ENOBUFS;
@@ -22375,31 +23394,17 @@ qwz_dp_tx(struct qwz_softc *sc, struct qwz_vif *arvif, uint8_t pdev_id,
 	if (ieee80211_vif_is_mesh(arvif->vif))
 		ti.enable_mesh = true;
 #endif
-	ti.flags1 |= FIELD_PREP(HAL_TCL_DATA_CMD_INFO2_TID_OVERWRITE, 1);
+	ti.flags1 |= FIELD_PREP(HAL_TCL_DATA_CMD_INFO3_TID_OVERWRITE, 1);
 
 	ti.tid = qwz_dp_tx_get_tid(m);
-#if 0
-	switch (ti.encap_type) {
-	case HAL_TCL_ENCAP_TYPE_NATIVE_WIFI:
-		ath12k_dp_tx_encap_nwifi(skb);
-		break;
-	case HAL_TCL_ENCAP_TYPE_RAW:
-		if (!test_bit(ATH12K_FLAG_RAW_MODE, &ab->dev_flags)) {
-			ret = -EINVAL;
-			goto fail_remove_idr;
+	if (ti.encap_type == HAL_TCL_ENCAP_TYPE_NATIVE_WIFI) {
+		ret = qwz_dp_tx_encap_nwifi(&m);
+		if (ret) {
+			m_freem(m);
+			return ret;
 		}
-		break;
-	case HAL_TCL_ENCAP_TYPE_ETHERNET:
-		/* no need to encap */
-		break;
-	case HAL_TCL_ENCAP_TYPE_802_3:
-	default:
-		/* TODO: Take care of other encap modes as well */
-		ret = -EINVAL;
-		atomic_inc(&ab->soc_stats.tx_err.misc_fail);
-		goto fail_remove_idr;
 	}
-#endif
+
 	ret = bus_dmamap_load_mbuf(sc->sc_dmat, tx_data->map,
 	    m, BUS_DMA_WRITE | BUS_DMA_NOWAIT);
 	if (ret && ret != EFBIG) {
@@ -22424,6 +23429,9 @@ qwz_dp_tx(struct qwz_softc *sc, struct qwz_vif *arvif, uint8_t pdev_id,
 		}
 	}
 	ti.paddr = tx_data->map->dm_segs[0].ds_addr;
+
+	bus_dmamap_sync(sc->sc_dmat, tx_data->map, 0,
+	    tx_data->map->dm_mapsize, BUS_DMASYNC_PREWRITE);
 
 	ti.data_len = m->m_pkthdr.len;
 
@@ -22454,8 +23462,7 @@ qwz_dp_tx(struct qwz_softc *sc, struct qwz_vif *arvif, uint8_t pdev_id,
 	tx_data->m = m;
 	tx_data->ni = ni;
 
-	qwz_hal_tx_cmd_desc_setup(sc,
-	    hal_tcl_desc + sizeof(struct hal_tlv_hdr), &ti);
+	qwz_hal_tx_cmd_desc_setup(sc, hal_tcl_desc, &ti);
 
 	qwz_hal_srng_access_end(sc, tcl_ring);
 
@@ -22632,7 +23639,7 @@ qwz_wmi_start_scan_init(struct qwz_softc *sc, struct scan_req_params *arg)
 	/* fill bssid_list[0] with 0xff, otherwise bssid and RA will be
 	 * ZEROs in probe request
 	 */
-	IEEE80211_ADDR_COPY(arg->bssid_list[0].addr, etheranyaddr);
+	IEEE80211_ADDR_COPY(arg->bssid_list[0].addr, etherbroadcastaddr);
 }
 
 int
@@ -22834,6 +23841,9 @@ qwz_start_scan(struct qwz_softc *sc, struct scan_req_params *arg)
 			break;
 		}
 	}
+
+	if (ret == 0 && sc->scan.state == ATH12K_SCAN_IDLE)
+		ret = EIO;
 
 #ifdef notyet
 	spin_lock_bh(&ar->data_lock);
@@ -23141,11 +24151,14 @@ qwz_auth(struct qwz_softc *sc)
 	qwz_recalculate_mgmt_rate(sc, ni, arvif->vdev_id, pdev->pdev_id);
 	ni->ni_txrate = 0;
 
-	ret = qwz_mac_station_add(sc, arvif, pdev->pdev_id, ni);
-	if (ret)
-		return ret;
-
-	/* Start vdev. */
+	/*
+	 * Start vdev BEFORE creating the peer.  Linux ath12k starts the
+	 * vdev at chanctx-assignment time, well before any PEER_CREATE.
+	 * If we instead PEER_CREATE first, the FW creates the peer entry
+	 * against an unstarted vdev: the entry is half-initialized (no
+	 * channel binding) and AUTHORIZE later dispatches through a stale
+	 * function pointer in dlpager and crashes.
+	 */
 	ret = qwz_mac_vdev_start(sc, arvif, pdev->pdev_id);
 	if (ret) {
 		printf("%s: failed to start MAC for VDEV: %d\n",
@@ -23158,6 +24171,10 @@ qwz_auth(struct qwz_softc *sc)
 	 * Set it once more.
 	 */
 	qwz_recalculate_mgmt_rate(sc, ni, arvif->vdev_id, pdev->pdev_id);
+
+	ret = qwz_mac_station_add(sc, arvif, pdev->pdev_id, ni);
+	if (ret)
+		return ret;
 
 	return ret;
 }
@@ -23206,11 +24223,30 @@ qwz_peer_assoc_h_basic(struct qwz_softc *sc, struct qwz_vif *arvif,
 
 	IEEE80211_ADDR_COPY(arg->peer_mac, ni->ni_macaddr);
 	arg->vdev_id = arvif->vdev_id;
-	arg->peer_associd = ni->ni_associd;
+	arg->peer_associd = IEEE80211_AID(ni->ni_associd);
 	arg->auth_flag = 1;
-	arg->peer_listen_intval = ni->ni_intval;
+	/*
+	 * peer_listen_intval is the STA wake interval in BEACONS, not in
+	 * TUs.  Linux ath12k passes hw->conf.listen_interval which is 1
+	 * (wake every beacon).  ni->ni_intval would be the beacon
+	 * interval in TUs (~100); using that here causes the FW to set
+	 * up power-save logic with an unrealistic interval, which is
+	 * then dispatched after AUTHORIZE and crashes dlpager.
+	 */
+	arg->peer_listen_intval = 1;
 	arg->peer_nss = 1;
 	arg->peer_caps = ni->ni_capinfo;
+
+	/*
+	 * Modern WCN7850 FW expects WMI_PEER_QOS for any STA peer.
+	 * Without it the FW peer state is internally inconsistent and
+	 * AUTHORIZE later dispatches into a stale function pointer,
+	 * crashing dlpager.  Linux ath12k sets these in
+	 * ath12k_peer_assoc_h_qos based on sta->wme; we don't have an
+	 * easy net80211 equivalent so set them unconditionally for STA.
+	 */
+	arg->is_wme_set = 1;
+	arg->qos_flag = 1;
 }
 
 void
@@ -23261,6 +24297,7 @@ qwz_peer_assoc_h_phymode(struct qwz_softc *sc, struct ieee80211_node *ni,
 {
 	struct ieee80211com *ic = &sc->sc_ic;
 	enum wmi_phy_mode phymode;
+	uint8_t sco;
 
 	switch (ic->ic_curmode) {
 	case IEEE80211_MODE_11A:
@@ -23272,6 +24309,19 @@ qwz_peer_assoc_h_phymode(struct qwz_softc *sc, struct ieee80211_node *ni,
 	case IEEE80211_MODE_11G:
 		phymode = MODE_11G;
 		break;
+	case IEEE80211_MODE_11N:
+		sco = IEEE80211_HTOP0_SCO_SCN;
+		if (IEEE80211_CHAN_40MHZ_ALLOWED(ni->ni_chan) &&
+		    ieee80211_node_supports_ht_chan40(ni))
+			sco = ni->ni_htop0 & IEEE80211_HTOP0_SCO_MASK;
+		if (sco == IEEE80211_HTOP0_SCO_SCA ||
+		    sco == IEEE80211_HTOP0_SCO_SCB)
+			phymode = IEEE80211_IS_CHAN_5GHZ(ni->ni_chan) ?
+			    MODE_11NA_HT40 : MODE_11NG_HT40;
+		else
+			phymode = IEEE80211_IS_CHAN_5GHZ(ni->ni_chan) ?
+			    MODE_11NA_HT20 : MODE_11NG_HT20;
+		break;
 	default:
 		phymode = MODE_UNKNOWN;
 		break;
@@ -23281,6 +24331,118 @@ qwz_peer_assoc_h_phymode(struct qwz_softc *sc, struct ieee80211_node *ni,
 	    ether_sprintf(ni->ni_macaddr), qwz_wmi_phymode_str(phymode));
 
 	arg->peer_phymode = phymode;
+}
+
+uint8_t
+qwz_parse_mpdudensity(uint8_t mpdudensity)
+{
+	switch (mpdudensity) {
+	case 0:
+		return 0;
+	case 1:
+	case 2:
+	case 3:
+		return 1;
+	case 4:
+		return 2;
+	case 5:
+		return 4;
+	case 6:
+		return 8;
+	case 7:
+		return 16;
+	default:
+		return 0;
+	}
+}
+
+void
+qwz_peer_assoc_h_ht(struct qwz_softc *sc, struct ieee80211_node *ni,
+    struct peer_assoc_params *arg)
+{
+	struct ieee80211com *ic = &sc->sc_ic;
+	int i, n;
+	uint8_t max_nss, sco;
+	uint32_t stbc, aggsize, mpdu_density;
+#ifdef notyet
+	lockdep_assert_held(&ar->conf_mutex);
+#endif
+	if ((ni->ni_flags & IEEE80211_NODE_HT) == 0)
+		return;
+
+	sco = IEEE80211_HTOP0_SCO_SCN;
+	if (IEEE80211_CHAN_40MHZ_ALLOWED(ni->ni_chan) &&
+	    ieee80211_node_supports_ht_chan40(ni))
+		sco = ni->ni_htop0 & IEEE80211_HTOP0_SCO_MASK;
+
+	arg->ht_flag = true;
+
+	aggsize = (ni->ni_ampdu_param & IEEE80211_AMPDU_PARAM_LE);
+	arg->peer_max_mpdu = (1 << (13 + aggsize)) - 1;
+
+	mpdu_density = (ni->ni_ampdu_param & IEEE80211_AMPDU_PARAM_SS) >> 2;
+	arg->peer_mpdu_density = qwz_parse_mpdudensity(mpdu_density);
+
+	arg->peer_ht_caps = ni->ni_htcaps;
+	arg->peer_rate_caps |= WMI_HOST_RC_HT_FLAG;
+
+	if (ni->ni_htcaps & IEEE80211_HTCAP_LDPC)
+		arg->ldpc_flag = true;
+	if (sco == IEEE80211_HTOP0_SCO_SCA ||
+	    sco == IEEE80211_HTOP0_SCO_SCB) {
+		arg->bw_40 = true;
+		arg->peer_rate_caps |= WMI_HOST_RC_CW40_FLAG;
+	}
+	if (ieee80211_node_supports_ht_sgi20(ni) ||
+	    ieee80211_node_supports_ht_sgi40(ni))
+		arg->peer_rate_caps |= WMI_HOST_RC_SGI_FLAG;
+
+	if (ni->ni_htcaps & IEEE80211_HTCAP_TXSTBC) {
+		arg->peer_rate_caps |= WMI_HOST_RC_TX_STBC_FLAG;
+		arg->stbc_flag = true;
+	}
+
+	if (ni->ni_htcaps & IEEE80211_HTCAP_TXSTBC) {
+		stbc = ni->ni_htcaps & IEEE80211_HTCAP_RXSTBC_MASK;
+		stbc = stbc >> IEEE80211_HTCAP_RXSTBC_SHIFT;
+		stbc = stbc << WMI_HOST_RC_RX_STBC_FLAG_S;
+		arg->peer_rate_caps |= stbc;
+		arg->stbc_flag = true;
+	}
+
+	if (ni->ni_rxmcs[1] && ni->ni_rxmcs[2])
+		arg->peer_rate_caps |= WMI_HOST_RC_TS_FLAG;
+	else if (ni->ni_rxmcs[1])
+		arg->peer_rate_caps |= WMI_HOST_RC_DS_FLAG;
+
+	for (i = 0, n = 0, max_nss = 0; i < nitems(ni->ni_rxmcs) * 8; i++)
+		if ((ic->ic_sup_mcs[i / 8] & BIT(i % 8)) &&
+		    (ni->ni_rxmcs[i / 8] & BIT(i % 8))) {
+			max_nss = (i / 8) + 1;
+			arg->peer_ht_rates.rates[n++] = i;
+		}
+
+	if (n == 0) {
+		arg->peer_ht_rates.num_rates = 8;
+		for (i = 0; i < arg->peer_ht_rates.num_rates; i++)
+			arg->peer_ht_rates.rates[i] = i;
+	} else {
+		arg->peer_ht_rates.num_rates = n;
+		arg->peer_nss = max_nss;
+	}
+
+	DNPRINTF(QWZ_D_MAC, "%s: ht peer %s mcs cnt %d nss %d\n", __func__,
+	    ether_sprintf(arg->peer_mac), arg->peer_ht_rates.num_rates,
+	    arg->peer_nss);
+}
+
+void
+qwz_peer_assoc_h_qos(struct ieee80211_node *ni, struct peer_assoc_params *arg)
+{
+	if (ni->ni_flags & IEEE80211_NODE_QOS) {
+		arg->is_wme_set = 1;
+		arg->qos_flag = 1;
+	}
 }
 
 void
@@ -23294,12 +24456,12 @@ qwz_peer_assoc_prepare(struct qwz_softc *sc, struct qwz_vif *arvif,
 	qwz_peer_assoc_h_crypto(sc, arvif, ni, arg);
 	qwz_peer_assoc_h_rates(ni, arg);
 	qwz_peer_assoc_h_phymode(sc, ni, arg);
+	qwz_peer_assoc_h_ht(sc, ni, arg);
+	qwz_peer_assoc_h_qos(ni, arg);
 #if 0
-	qwz_peer_assoc_h_ht(sc, arvif, ni, arg);
 	qwz_peer_assoc_h_vht(sc, arvif, ni, arg);
 	qwz_peer_assoc_h_he(sc, arvif, ni, arg);
 	qwz_peer_assoc_h_he_6ghz(sc, arvif, ni, arg);
-	qwz_peer_assoc_h_qos(sc, arvif, ni, arg);
 	qwz_peer_assoc_h_smps(ni, arg);
 #endif
 #if 0
@@ -23308,11 +24470,122 @@ qwz_peer_assoc_prepare(struct qwz_softc *sc, struct qwz_vif *arvif,
 	/* TODO: amsdu_disable req? */
 }
 
+void
+qwz_rx_agg_start(struct qwz_softc *sc, struct ieee80211_node *ni, uint8_t tid,
+    uint16_t ssn, uint16_t winsize)
+{
+	struct ieee80211com *ic = &sc->sc_ic;
+	struct qwz_vif *arvif = TAILQ_FIRST(&sc->vif_list); /* XXX */
+	uint8_t pdev_id = 0; /* XXX derive pdev ID somehow */
+	enum hal_pn_type pn_type;
+
+	if (!test_bit(ATH12K_FLAG_HW_CRYPTO_DISABLED, sc->sc_flags) &&
+	    (ic->ic_flags & IEEE80211_F_RSNON))
+		pn_type = HAL_PN_TYPE_WPA;
+	else
+		pn_type = HAL_PN_TYPE_NONE;
+
+	if (qwz_peer_rx_tid_setup(sc, ni, arvif->vdev_id, pdev_id, tid,
+	    winsize, ssn, pn_type))
+		ieee80211_addba_req_refuse(ic, ni, tid);
+	else
+		ieee80211_addba_req_accept(ic, ni, tid);
+}
+
+void
+qwz_rx_agg_stop(struct qwz_softc *sc, struct ieee80211_node *ni, uint8_t tid)
+{
+	struct qwz_vif *arvif = TAILQ_FIRST(&sc->vif_list); /* XXX */
+	uint8_t pdev_id = 0; /* XXX derive pdev ID somehow */
+	struct qwz_node *nq = (struct qwz_node *)ni;
+	struct ath12k_peer *peer = &nq->peer;
+	uint64_t paddr;
+	int ret;
+
+	if (peer->peer_id == HAL_INVALID_PEERID)
+		return;
+
+	if (!peer->rx_tid[tid].active)
+		return;
+
+	ret = qwz_peer_rx_tid_reo_update(sc, peer, &peer->rx_tid[tid],
+	    1, 0, 0);
+	if (ret) {
+		printf("%s: failed to update reo for rx tid %d: %d\n",
+		    sc->sc_dev.dv_xname, tid, ret);
+	}
+
+	paddr = peer->rx_tid[tid].paddr;
+	ret = qwz_wmi_peer_rx_reorder_queue_setup(sc, arvif->vdev_id, pdev_id,
+	    ni->ni_macaddr, paddr, tid, 1, 1);
+	if (ret) {
+		printf("%s: failed to send wmi to delete rx tid %d\n",
+		    sc->sc_dev.dv_xname, ret);
+	}
+}
+
+void
+qwz_ba_task(void *arg)
+{
+	struct qwz_softc *sc = arg;
+	struct ieee80211com *ic = &sc->sc_ic;
+	struct ieee80211_node *ni = ic->ic_bss;
+	int s = splnet();
+	int tid;
+
+	for (tid = 0; tid < IEEE80211_NUM_TID; tid++) {
+		if (test_bit(ATH12K_FLAG_CRASH_FLUSH, sc->sc_flags))
+			break;
+		if (sc->ba_rx.start_tidmask & (1 << tid)) {
+			struct ieee80211_rx_ba *ba = &ni->ni_rx_ba[tid];
+			qwz_rx_agg_start(sc, ni, tid, ba->ba_winstart,
+			    ba->ba_winsize);
+			sc->ba_rx.start_tidmask &= ~(1 << tid);
+		} else if (sc->ba_rx.stop_tidmask & (1 << tid)) {
+			qwz_rx_agg_stop(sc, ni, tid);
+			sc->ba_rx.stop_tidmask &= ~(1 << tid);
+		}
+	}
+
+	refcnt_rele_wake(&sc->task_refs);
+	splx(s);
+}
+
+int
+qwz_ampdu_rx_start(struct ieee80211com *ic, struct ieee80211_node *ni,
+    uint8_t tid)
+{
+	struct qwz_softc *sc = ic->ic_softc;
+
+	sc->ba_rx.start_tidmask |= (1 << tid);
+	qwz_add_task(sc, systq, &sc->ba_task);
+	return EBUSY;
+}
+
+void
+qwz_ampdu_rx_stop(struct ieee80211com *ic, struct ieee80211_node *ni,
+    uint8_t tid)
+{
+	struct qwz_softc *sc = ic->ic_softc;
+
+	sc->ba_rx.stop_tidmask |= (1 << tid);
+	qwz_add_task(sc, systq, &sc->ba_task);
+}
+
+int
+qwz_ampdu_tx_start(struct ieee80211com *ic, struct ieee80211_node *ni,
+    uint8_t tid)
+{
+	/* Firmware handles Tx aggregation internally. */
+	return 0;
+}
+
 int
 qwz_run(struct qwz_softc *sc)
 {
 	struct ieee80211com *ic = &sc->sc_ic;
 	struct ieee80211_node *ni = ic->ic_bss;
+	struct qwz_node *nq = (struct qwz_node *)ni;
 	struct qwz_vif *arvif = TAILQ_FIRST(&sc->vif_list); /* XXX */
 	uint8_t pdev_id = 0; /* TODO: derive pdev ID somehow? */
 	struct peer_assoc_params peer_arg;
@@ -23324,7 +24597,40 @@ qwz_run(struct qwz_softc *sc)
 	DNPRINTF(QWZ_D_MAC, "%s: vdev %i assoc bssid %pM aid %d\n",
 	    __func__, arvif->vdev_id, arvif->bssid, arvif->aid);
 
+	/*
+	 * Clear stale per-node key-install flags before this association
+	 * attempt.  qwz_run_stop normally resets them on RUN -> lower
+	 * transitions, but a fatal_firmware_error mid-association doesn't
+	 * always tear down through RUN, so flags survive into the next
+	 * cycle.  When that happens, qwz_add_sta_key's "(flags &
+	 * want_keymask) == want_keymask" check passes after the very
+	 * first INSTALL_KEY (because the OTHER bit was carried over),
+	 * AUTHORIZE fires mid-key-install, and the FW ends up authorizing
+	 * an only-half-keyed peer.  The first protected data TX after
+	 * that crashes dlpager.
+	 */
+	nq->flags &= ~(QWZ_NODE_FLAG_HAVE_PAIRWISE_KEY |
+	    QWZ_NODE_FLAG_HAVE_GROUP_KEY);
+
 	qwz_peer_assoc_prepare(sc, arvif, ni, &peer_arg, 0);
+
+	/*
+	 * Tell the FW the per-vdev HE MU mode before peer_assoc.  Linux
+	 * ath12k_bss_assoc explicitly comments "keep this before
+	 * ath12k_wmi_send_peer_assoc_cmd()": the FW configures HE MU
+	 * structures from this value at peer_assoc time, and we don't
+	 * want a stale boot-default left over from earlier configuration.
+	 * For our non-HE peer the computed hemode is always 0 (Linux's
+	 * ath12k_mac_vif_recalc_sta_he_txbf early-returns when
+	 * !he_support, leaving the local "hemode = 0" intact).
+	 */
+	ret = qwz_wmi_vdev_set_param_cmd(sc, arvif->vdev_id, pdev_id,
+	    WMI_VDEV_PARAM_SET_HEMU_MODE, 0);
+	if (ret) {
+		printf("%s: failed to submit vdev param SET_HEMU_MODE 0: %d\n",
+		    sc->sc_dev.dv_xname, ret);
+		return ret;
+	}
 
 	peer_arg.is_assoc = 1;
 
@@ -23366,7 +24672,12 @@ qwz_run(struct qwz_softc *sc)
 	WARN_ON(arvif->is_up);
 #endif
 
-	arvif->aid = ni->ni_associd;
+	/*
+	 * ni->ni_associd carries the raw on-wire AID field including the
+	 * top two reserved bits (which are always 11 on the wire). The FW
+	 * wants the 14-bit AID value only.
+	 */
+	arvif->aid = IEEE80211_AID(ni->ni_associd);
 	IEEE80211_ADDR_COPY(arvif->bssid, ni->ni_bssid);
 
 	ret = qwz_wmi_vdev_up(sc, arvif->vdev_id, pdev_id, arvif->aid,
@@ -23384,14 +24695,6 @@ qwz_run(struct qwz_softc *sc)
 
 	DNPRINTF(QWZ_D_MAC, "%s: vdev %d up (associated) bssid %s aid %d\n",
 	    __func__, arvif->vdev_id, ether_sprintf(ni->ni_bssid), arvif->aid);
-
-	ret = qwz_wmi_set_peer_param(sc, ni->ni_macaddr, arvif->vdev_id,
-	    pdev_id, WMI_PEER_AUTHORIZE, 1);
-	if (ret) {
-		printf("%s: unable to authorize BSS peer: %d\n",
-		   sc->sc_dev.dv_xname, ret);
-		return ret;
-	}
 
 	/* Enable "ext" IRQs for datapath. */
 	sc->ops.irq_enable(sc);
@@ -23453,6 +24756,7 @@ qwz_attach(struct qwz_softc *sc)
 	task_set(&sc->init_task, qwz_init_task, sc);
 	task_set(&sc->newstate_task, qwz_newstate_task, sc);
 	task_set(&sc->setkey_task, qwz_setkey_task, sc);
+	task_set(&sc->ba_task, qwz_ba_task, sc);
 	timeout_set_proc(&sc->scan.timeout, qwz_scan_timeout, sc);
 #if NBPFILTER > 0
 	qwz_radiotap_attach(sc);
@@ -23494,25 +24798,23 @@ qwz_dmamem_alloc(bus_dma_tag_t dmat, bus_size_t size, bus_size_t align)
 	struct qwz_dmamem *adm;
 	int nsegs;
 
-	adm = malloc(sizeof(*adm), M_DEVBUF, M_NOWAIT | M_ZERO);
-	if (adm == NULL)
-		return NULL;
+	adm = malloc(sizeof(*adm), M_DEVBUF, M_WAITOK | M_ZERO);
 	adm->size = size;
 
 	if (bus_dmamap_create(dmat, size, 1, size, 0,
-	    BUS_DMA_NOWAIT | BUS_DMA_ALLOCNOW, &adm->map) != 0)
+	    BUS_DMA_WAITOK | BUS_DMA_ALLOCNOW, &adm->map) != 0)
 		goto admfree;
 
 	if (bus_dmamem_alloc_range(dmat, size, align, 0, &adm->seg, 1,
-	    &nsegs, BUS_DMA_NOWAIT | BUS_DMA_ZERO, 0, 0xffffffff) != 0)
+	    &nsegs, BUS_DMA_WAITOK | BUS_DMA_ZERO, 0, 0xffffffff) != 0)
 		goto destroy;
 
 	if (bus_dmamem_map(dmat, &adm->seg, nsegs, size,
-	    &adm->kva, BUS_DMA_NOWAIT | BUS_DMA_COHERENT) != 0)
+	    &adm->kva, BUS_DMA_WAITOK | BUS_DMA_COHERENT) != 0)
 		goto free;
 
 	if (bus_dmamap_load_raw(dmat, adm->map, &adm->seg, nsegs, size,
-	    BUS_DMA_NOWAIT) != 0)
+	    BUS_DMA_WAITOK) != 0)
 		goto unmap;
 
 	bzero(adm->kva, size);
@@ -23534,6 +24836,7 @@ admfree:
 void
 qwz_dmamem_free(bus_dma_tag_t dmat, struct qwz_dmamem *adm)
 {
+	bus_dmamap_unload(dmat, adm->map);
 	bus_dmamem_unmap(dmat, adm->kva, adm->size);
 	bus_dmamem_free(dmat, &adm->seg, 1);
 	bus_dmamap_destroy(dmat, adm->map);
@@ -23554,8 +24857,14 @@ qwz_activate(struct device *self, int act)
 			qwz_stop(ifp);
 			rw_exit(&sc->ioctl_rwl);
 		}
+		if (sc->fw_initialized)
+			qwz_core_deinit(sc);
 		break;
 	case DVACT_RESUME:
+		err = qwz_hal_srng_init(sc);
+		if (err)
+			printf("%s: could not initialize hal\n",
+			    sc->sc_dev.dv_xname);
 		break;
 	case DVACT_WAKEUP:
 		if ((ifp->if_flags & (IFF_UP | IFF_RUNNING)) == IFF_UP) {

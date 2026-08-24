@@ -1,4 +1,4 @@
-/*	$OpenBSD: dhcpleased.h,v 1.18 2025/09/18 11:37:01 florian Exp $	*/
+/*	$OpenBSD: dhcpleased.h,v 1.21 2026/06/15 17:09:29 florian Exp $	*/
 
 /*
  * Copyright (c) 2017, 2021 Florian Obser <florian@openbsd.org>
@@ -240,7 +240,7 @@ struct ctl_engine_info {
 	struct in_addr		requested_ip;
 	struct in_addr		mask;
 	struct dhcp_route	routes[MAX_DHCP_ROUTES];
-	int			routes_len;
+	uint32_t		routes_len;
 	struct in_addr		nameservers[MAX_RDNS_COUNT];
 	uint32_t		lease_time;
 	uint32_t		renewal_time;
@@ -267,6 +267,15 @@ struct dhcpleased_conf {
 
 #endif	/* SMALL */
 
+/* keep in sync with iface_conf */
+struct imsg_iface_conf {
+	char				 name[IF_NAMESIZE];
+	int				 ignore;
+	struct in_addr			 ignore_servers[MAX_SERVERS];
+	int				 ignore_servers_len;
+	int				 prefer_ipv6;
+};
+
 struct imsg_ifinfo {
 	uint32_t		if_index;
 	char			if_name[IF_NAMESIZE];
@@ -280,7 +289,7 @@ struct imsg_ifinfo {
 struct imsg_propose_rdns {
 	uint32_t		if_index;
 	int			rdomain;
-	int			rdns_count;
+	size_t			rdns_count;
 	struct in_addr		rdns[MAX_RDNS_COUNT];
 };
 

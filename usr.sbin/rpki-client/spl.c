@@ -1,4 +1,4 @@
-/*	$OpenBSD: spl.c,v 1.16 2025/08/24 12:34:39 tb Exp $ */
+/*	$OpenBSD: spl.c,v 1.18 2026/06/25 07:51:58 tb Exp $ */
 /*
  * Copyright (c) 2024 Job Snijders <job@fastly.com>
  * Copyright (c) 2022 Theo Buehler <tb@openbsd.org>
@@ -98,9 +98,10 @@ prefix_cmp(enum afi afi, const struct ip_addr *a, const struct ip_addr *b)
  * Returns zero on failure, non-zero on success.
  */
 static int
-spl_parse_econtent(const char *fn, struct spl *spl, const unsigned char *d,
+spl_parse_econtent(const char *fn, void *obj, const unsigned char *d,
     size_t dsz)
 {
+	struct spl			*spl = obj;
 	const unsigned char		*oder;
 	SignedPrefixList		*spl_asn1;
 	const AddressFamilyPrefixes	*afp;
@@ -209,6 +210,70 @@ spl_parse_econtent(const char *fn, struct spl *spl, const unsigned char *d,
 	return rc;
 }
 
+static int
+spl_cert_info(const char *fn, void *obj, const struct cert *cert)
+{
+	if (x509_any_inherits(cert->x509)) {
+		warnx("%s: inherit elements not allowed in EE cert", fn);
+		return 0;
+	}
+
+	if (cert->num_ases == 0) {
+		warnx("%s: AS Resources extension missing", fn);
+		return 0;
+	}
+
+	if (cert->num_ips > 0) {
+		warnx("%s: superfluous IP Resources extension present", fn);
+		return 0;
+	}
+
+	return 1;
+}
+
+static int
+spl_validate(const char *fn, void *obj, struct cert *cert)
+{
+	struct spl *spl = obj;
+
+	spl->valid = valid_spl(fn, cert, spl);
+
+	return 1; /* XXX */
+}
+
+static void *
+spl_obj_new(size_t der_len, time_t signtime)
+{
+	struct spl *spl;
+
+	if ((spl = calloc(1, sizeof(*spl))) == NULL)
+		err(1, NULL);
+	spl->signtime = signtime;
+
+	return spl;
+}
+
+static void
+spl_obj_free(void *obj)
+{
+	spl_free(obj);
+}
+
+static const struct signed_obj spl_signed_obj = {
+	.rtype = RTYPE_SPL,
+	.new = spl_obj_new,
+	.free = spl_obj_free,
+	.cert_info = spl_cert_info,
+	.parse_econtent = spl_parse_econtent,
+	.validate = spl_validate,
+};
+
+const struct signed_obj *
+spl_obj(void)
+{
+	return &spl_signed_obj;
+}
+
 /*
  * Parse a full Signed Prefix List file.
  * Returns the SPL, or NULL if the object was malformed.
@@ -231,33 +296,12 @@ spl_parse(struct cert **out_cert, const char *fn, int talid,
 	if (cms == NULL)
 		return NULL;
 
-	if ((spl = calloc(1, sizeof(*spl))) == NULL)
-		err(1, NULL);
-	spl->signtime = signtime;
-
+	spl = spl_obj_new(len, signtime);
+	if (!spl_cert_info(fn, spl, cert))
+		goto out;
 	if (!spl_parse_econtent(fn, spl, cms, cmsz))
 		goto out;
-
-	if (x509_any_inherits(cert->x509)) {
-		warnx("%s: inherit elements not allowed in EE cert", fn);
-		goto out;
-	}
-
-	if (cert->num_ases == 0) {
-		warnx("%s: AS Resources extension missing", fn);
-		goto out;
-	}
-
-	if (cert->num_ips > 0) {
-		warnx("%s: superfluous IP Resources extension present", fn);
-		goto out;
-	}
-
-	/*
-	 * If the SPL isn't valid, we accept it anyway and depend upon
-	 * the code around spl_read() to check the "valid" field itself.
-	 */
-	spl->valid = valid_spl(fn, cert, spl);
+	(void)spl_validate(fn, spl, cert);
 
 	*out_cert = cert;
 	cert = NULL;

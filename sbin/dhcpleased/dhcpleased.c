@@ -1,4 +1,4 @@
-/*	$OpenBSD: dhcpleased.c,v 1.41 2025/04/26 17:58:02 florian Exp $	*/
+/*	$OpenBSD: dhcpleased.c,v 1.47 2026/08/04 12:49:04 claudio Exp $	*/
 
 /*
  * Copyright (c) 2017, 2021 Florian Obser <florian@openbsd.org>
@@ -438,8 +438,7 @@ main_dispatch_frontend(int fd, short event, void *bula)
 	struct imsgbuf		*ibuf;
 	struct imsg		 imsg;
 	struct imsg_ifinfo	 imsg_ifinfo;
-	ssize_t			 n;
-	int			 shut = 0;
+	int			 n, shut = 0;
 	uint32_t		 if_index, type;
 #ifndef	SMALL
 	int			 verbose;
@@ -463,8 +462,8 @@ main_dispatch_frontend(int fd, short event, void *bula)
 	}
 
 	for (;;) {
-		if ((n = imsg_get(ibuf, &imsg)) == -1)
-			fatal("imsg_get");
+		if ((n = imsgbuf_get(ibuf, &imsg)) == -1)
+			fatal("imsgbuf_get");
 		if (n == 0)	/* No more messages. */
 			break;
 
@@ -523,9 +522,8 @@ main_dispatch_engine(int fd, short event, void *bula)
 	struct imsgev			*iev = bula;
 	struct imsgbuf			*ibuf;
 	struct imsg			 imsg;
-	ssize_t				 n;
 	uint32_t			 type;
-	int				 shut = 0;
+	int				 n, shut = 0;
 
 	ibuf = &iev->ibuf;
 
@@ -545,8 +543,8 @@ main_dispatch_engine(int fd, short event, void *bula)
 	}
 
 	for (;;) {
-		if ((n = imsg_get(ibuf, &imsg)) == -1)
-			fatal("imsg_get");
+		if ((n = imsgbuf_get(ibuf, &imsg)) == -1)
+			fatal("imsgbuf_get");
 		if (n == 0)	/* No more messages. */
 			break;
 
@@ -568,7 +566,7 @@ main_dispatch_engine(int fd, short event, void *bula)
 			if (imsg_interface.hostname[
 			    sizeof(imsg_interface.hostname) - 1] != '\0')
 				fatalx("%s: invalid %s", __func__, i2s(type));
-			if (imsg_interface.routes_len >= MAX_DHCP_ROUTES)
+			if (imsg_interface.routes_len > MAX_DHCP_ROUTES)
 				fatalx("%s: too many routes in imsg", __func__);
 
 			configure_interface(&imsg_interface);
@@ -589,7 +587,7 @@ main_dispatch_engine(int fd, short event, void *bula)
 			if (imsg_interface.hostname[
 			    sizeof(imsg_interface.hostname) - 1] != '\0')
 				fatalx("%s: invalid %s", __func__, i2s(type));
-			if (imsg_interface.routes_len >= MAX_DHCP_ROUTES)
+			if (imsg_interface.routes_len > MAX_DHCP_ROUTES)
 				fatalx("%s: too many routes in imsg", __func__);
 
 			deconfigure_interface(&imsg_interface);
@@ -613,7 +611,7 @@ main_dispatch_engine(int fd, short event, void *bula)
 			if (imsg_interface.hostname[
 			    sizeof(imsg_interface.hostname) - 1] != '\0')
 				fatalx("%s: invalid %s", __func__, i2s(type));
-			if (imsg_interface.routes_len >= MAX_DHCP_ROUTES)
+			if (imsg_interface.routes_len > MAX_DHCP_ROUTES)
 				fatalx("%s: too many routes in imsg", __func__);
 
 			if (imsg_interface.routes_len > 0)
@@ -627,10 +625,10 @@ main_dispatch_engine(int fd, short event, void *bula)
 				fatalx("%s: invalid %s", __func__, i2s(type));
 			if ((2 + rdns.rdns_count * sizeof(struct in_addr)) >
 			    sizeof(struct sockaddr_rtdns))
-				fatalx("%s: rdns_count too big: %d", __func__,
+				fatalx("%s: rdns_count too big: %zu", __func__,
 				    rdns.rdns_count);
 			if (rdns.rdns_count > MAX_RDNS_COUNT)
-				fatalx("%s: rdns_count too big: %d", __func__,
+				fatalx("%s: rdns_count too big: %zu", __func__,
 				    rdns.rdns_count);
 
 			propose_rdns(&rdns);
@@ -642,7 +640,7 @@ main_dispatch_engine(int fd, short event, void *bula)
 			if (imsg_get_data(&imsg, &rdns, sizeof(rdns)) == -1)
 				fatalx("%s: invalid %s", __func__, i2s(type));
 			if (rdns.rdns_count != 0)
-				fatalx("%s: expected rdns_count == 0: %d",
+				fatalx("%s: expected rdns_count == 0: %zu",
 				    __func__, rdns.rdns_count);
 
 			propose_rdns(&rdns);
@@ -761,16 +759,28 @@ int
 main_imsg_send_config(struct dhcpleased_conf *xconf)
 {
 	struct iface_conf	*iface_conf;
+	struct imsg_iface_conf	 imsg_iface_conf;
 
 	main_imsg_compose_frontend(IMSG_RECONF_CONF, -1, NULL, 0);
 	main_imsg_compose_engine(IMSG_RECONF_CONF, -1, NULL, 0);
 
 	/* Send the interface list to the frontend & engine. */
 	SIMPLEQ_FOREACH(iface_conf, &xconf->iface_list, entry) {
-		main_imsg_compose_frontend(IMSG_RECONF_IFACE, -1, iface_conf,
-		    sizeof(*iface_conf));
-		main_imsg_compose_engine(IMSG_RECONF_IFACE, -1, iface_conf,
-		    sizeof(*iface_conf));
+		memset(&imsg_iface_conf, 0, sizeof(imsg_iface_conf));
+		memcpy(imsg_iface_conf.name, iface_conf->name,
+		    sizeof(imsg_iface_conf.name));
+		imsg_iface_conf.ignore = iface_conf->ignore;
+		memcpy(imsg_iface_conf.ignore_servers,
+		    iface_conf->ignore_servers,
+		    sizeof(imsg_iface_conf.ignore_servers));
+		imsg_iface_conf.ignore_servers_len =
+		    iface_conf->ignore_servers_len;
+		imsg_iface_conf.prefer_ipv6 = iface_conf->prefer_ipv6;
+
+		main_imsg_compose_frontend(IMSG_RECONF_IFACE, -1,
+		    &imsg_iface_conf, sizeof(imsg_iface_conf));
+		main_imsg_compose_engine(IMSG_RECONF_IFACE, -1,
+		    &imsg_iface_conf, sizeof(imsg_iface_conf));
 		if (iface_conf->vc_id_len) {
 			main_imsg_compose_frontend(IMSG_RECONF_VC_ID, -1,
 			    iface_conf->vc_id, iface_conf->vc_id_len);
@@ -1010,7 +1020,7 @@ configure_routes(uint8_t rtm_type, struct imsg_configure_interface *imsg)
 {
 	struct sockaddr_in	 dst, mask, gw, ifa;
 	in_addr_t		 addrnet, gwnet;
-	int			 i;
+	uint32_t		 i;
 
 	memset(&ifa, 0, sizeof(ifa));
 	ifa.sin_family = AF_INET;

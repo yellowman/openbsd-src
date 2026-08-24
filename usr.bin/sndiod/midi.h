@@ -1,4 +1,4 @@
-/*	$OpenBSD: midi.h,v 1.17 2024/12/20 07:35:56 ratchov Exp $	*/
+/*	$OpenBSD: midi.h,v 1.26 2026/08/12 08:30:22 ratchov Exp $	*/
 /*
  * Copyright (c) 2008-2012 Alexandre Ratchov <alex@caoua.org>
  *
@@ -19,6 +19,11 @@
 
 #include "abuf.h"
 #include "miofile.h"
+
+/*
+ * max number of midithru structures
+ */
+#define MIDITHRU_NMAX	16
 
 /*
  * masks to extract command and channel of status byte
@@ -91,15 +96,32 @@ struct port {
 	unsigned int state;
 	unsigned int num;		/* port serial number */
 	char *path;
-	struct port *alt_next;
 	int hold;			/* hold the port open ? */
+	int refcnt;
 	struct midi *midi;
+	struct midithru *midithru;
+};
+
+struct midithru {
+	struct midithru *next;
+	char name[CTL_NAMEMAX];
+	unsigned int portmask;
+	unsigned int progmask;
+	unsigned int prefportmask;
+	int refcnt;
+	int thru;
+	int fixed;
 };
 
 /*
  * midi ports
  */
 extern struct port *port_list;
+
+/*
+ * midithru ports
+ */
+extern struct midithru *midithru_list;
 
 void midi_init(void);
 void midi_done(void);
@@ -111,10 +133,9 @@ void midi_in(struct midi *, unsigned char *, int);
 void midi_out(struct midi *, unsigned char *, int);
 void midi_send(struct midi *, unsigned char *, int);
 void midi_fill(struct midi *);
-void midi_tag(struct midi *, unsigned int);
-unsigned int midi_tags(struct midi *);
 unsigned int midi_rxmask(struct midi *);
 void midi_link(struct midi *, struct midi *);
+void midi_unlink(struct midi *, struct midi *);
 void midi_abort(struct midi *);
 void midi_migrate(struct midi *, struct midi *);
 
@@ -126,8 +147,21 @@ void port_unref(struct port *);
 int  port_init(struct port *);
 void port_done(struct port *);
 void port_drain(struct port *);
+int  port_open(struct port *);
 int  port_close(struct port *);
 struct port *port_alt_ref(int);
-struct port *port_migrate(struct port *);
+void port_abort(struct port *p);
+
+struct midithru *midithru_new(const char *);
+struct midithru *midithru_byname(const char *);
+void midithru_del(struct midithru *);
+int  midithru_ref(struct midithru *);
+void midithru_unref(struct midithru *);
+void midithru_addport(struct midithru *, struct port *);
+void midithru_addprog(struct midithru *, struct midi *);
+void midithru_rm(struct midithru *, struct midi *);
+int  midithru_setport(struct midithru *, struct port *, int);
+int  midithru_setthru(struct midithru *, int);
+void midithru_scanports(void);
 
 #endif /* !defined(MIDI_H) */

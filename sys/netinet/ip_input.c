@@ -1,4 +1,4 @@
-/*	$OpenBSD: ip_input.c,v 1.426 2025/11/12 10:00:27 hshoexer Exp $	*/
+/*	$OpenBSD: ip_input.c,v 1.433 2026/08/11 14:28:59 bluhm Exp $	*/
 /*	$NetBSD: ip_input.c,v 1.30 1996/03/16 23:53:58 christos Exp $	*/
 
 /*
@@ -151,7 +151,7 @@ int	ip_dooptions(struct mbuf *, struct ifnet *, int);
 int	in_ouraddr(struct mbuf *, struct ifnet *, struct route *, int);
 
 int		ip_fragcheck(struct mbuf **, int *);
-struct mbuf *	ip_reass(struct ipqent *, struct ipq *);
+struct mbuf *	ip_reass(struct ipqent *, struct ipq *, u_int);
 void		ip_freef(struct ipq *);
 void		ip_flush(int);
 
@@ -191,6 +191,8 @@ ip_init(void)
 	const u_int16_t defbaddynamicports_udp[] = DEFBADDYNAMICPORTS_UDP;
 	const u_int16_t defrootonlyports_tcp[] = DEFROOTONLYPORTS_TCP;
 	const u_int16_t defrootonlyports_udp[] = DEFROOTONLYPORTS_UDP;
+
+	ip_randomid_init();
 
 	ipcounters = counters_alloc(ips_ncounters);
 
@@ -530,7 +532,7 @@ ip_input_if(struct mbuf **mp, int *offp, int nxt, int af, struct ifnet *ifp,
 
 #ifdef MROUTING
 		if (atomic_load_int(&ipmforwarding) &&
-		    ip_mrouter[ifp->if_rdomain]) {
+		    ip_mrouter_active(ifp->if_rdomain)) {
 			int error;
 
 			if (m->m_flags & M_EXT) {
@@ -636,6 +638,7 @@ ip_fragcheck(struct mbuf **mp, int *offp)
 	struct ipq *fp;
 	struct ipqent *ipqe;
 	int hlen;
+	u_int rdomain;
 	uint16_t mff;
 
 	ip = mtod(*mp, struct ip *);
@@ -684,11 +687,13 @@ ip_fragcheck(struct mbuf **mp, int *offp)
 		 * Look for queue of fragments
 		 * of this datagram.
 		 */
+		rdomain = rtable_l2((*mp)->m_pkthdr.ph_rtableid);
 		LIST_FOREACH(fp, &ipq, ipq_q) {
 			if (ip->ip_id == fp->ipq_id &&
 			    ip->ip_src.s_addr == fp->ipq_src.s_addr &&
 			    ip->ip_dst.s_addr == fp->ipq_dst.s_addr &&
-			    ip->ip_p == fp->ipq_p)
+			    ip->ip_p == fp->ipq_p &&
+			    rdomain == fp->ipq_rdomain)
 				break;
 		}
 
@@ -716,7 +721,7 @@ ip_fragcheck(struct mbuf **mp, int *offp)
 			ipqe->ipqe_mff = mff;
 			ipqe->ipqe_m = *mp;
 			ipqe->ipqe_ip = ip;
-			*mp = ip_reass(ipqe, fp);
+			*mp = ip_reass(ipqe, fp, rdomain);
 			if (*mp == NULL)
 				goto bad;
 			ipstat_inc(ips_reassembled);
@@ -953,7 +958,7 @@ in_ouraddr(struct mbuf *m, struct ifnet *ifp, struct route *ro, int flags)
  * is given as fp; otherwise have to make a chain.
  */
 struct mbuf *
-ip_reass(struct ipqent *ipqe, struct ipq *fp)
+ip_reass(struct ipqent *ipqe, struct ipq *fp, u_int rdomain)
 {
 	struct mbuf *m = ipqe->ipqe_m;
 	struct ipqent *nq, *p, *q;
@@ -980,9 +985,10 @@ ip_reass(struct ipqent *ipqe, struct ipq *fp)
 		if (fp == NULL)
 			goto dropfrag;
 		LIST_INSERT_HEAD(&ipq, fp, ipq_q);
+		fp->ipq_rdomain = rdomain;
+		fp->ipq_id = ipqe->ipqe_ip->ip_id;
 		fp->ipq_ttl = IPFRAGTTL;
 		fp->ipq_p = ipqe->ipqe_ip->ip_p;
-		fp->ipq_id = ipqe->ipqe_ip->ip_id;
 		LIST_INIT(&fp->ipq_fragq);
 		fp->ipq_src = ipqe->ipqe_ip->ip_src;
 		fp->ipq_dst = ipqe->ipqe_ip->ip_dst;
@@ -1403,9 +1409,7 @@ ip_dooptions(struct mbuf *m, struct ifnet *ifp, int flags)
 				break;
 
 			default:
-				/* XXX can't take &ipt->ipt_flg */
-				code = (u_char *)&ipt.ipt_ptr -
-				    (u_char *)ip + 1;
+				code = &cp[IPOPT_OFFSET + 1] - (u_char *)ip;
 				goto bad;
 			}
 			ntime = iptime();
@@ -1515,7 +1519,7 @@ ip_srcroute(struct mbuf *m0)
 	 * Last hop goes to final destination.
 	 */
 	*q = isr->isr_dst;
-	m_tag_delete(m0, (struct m_tag *)isr);
+	m_tag_delete(m0, mtag);
 	return (m);
 }
 
@@ -1581,7 +1585,9 @@ ip_forward(struct mbuf *m, struct ifnet *ifp, struct route *ro, int flags)
 	u_int32_t dest;
 
 	dest = 0;
-	if (m->m_flags & (M_BCAST|M_MCAST) || in_canforward(ip->ip_dst) == 0) {
+	if (m->m_flags & (M_BCAST|M_MCAST) ||
+	    in_canforward(ip->ip_dst) == 0 ||
+	    ip->ip_src.s_addr == INADDR_ANY) {
 		ipstat_inc(ips_cantforward);
 		m_freem(m);
 		goto done;
@@ -1952,11 +1958,11 @@ ip_send_do_dispatch(void *xmq, int flags)
 
 	NET_LOCK_SHARED();
 	while ((m = ml_dequeue(&ml)) != NULL) {
-		u_int32_t ipsecflowinfo = 0;
+		uint32_t ipsecflowinfo = 0;
 
 		if ((mtag = m_tag_find(m, PACKET_TAG_IPSEC_FLOWINFO, NULL))
 		    != NULL) {
-			ipsecflowinfo = *(u_int32_t *)(mtag + 1);
+			ipsecflowinfo = *(uint32_t *)(mtag + 1);
 			m_tag_delete(m, mtag);
 		}
 		ip_output(m, NULL, NULL, flags, NULL, NULL, ipsecflowinfo);

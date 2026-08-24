@@ -1,4 +1,4 @@
-/* $OpenBSD: ssl_tlsext.c,v 1.159 2025/12/04 21:16:17 beck Exp $ */
+/* $OpenBSD: ssl_tlsext.c,v 1.166 2026/08/21 17:15:22 tb Exp $ */
 /*
  * Copyright (c) 2016, 2017, 2019 Joel Sing <jsing@openbsd.org>
  * Copyright (c) 2017 Doug Hogan <doug@openbsd.org>
@@ -193,6 +193,10 @@ tlsext_alpn_client_process(SSL *s, uint16_t msg_type, CBS *cbs, int *alert)
 static int
 tlsext_supportedgroups_client_needs(SSL *s, uint16_t msg_type)
 {
+	/*
+	 * XXX - Don't send an empty named_group_list. For TLSv1.3 we error
+	 * earlier; for TLSv1.2 ensure we don't send the extension.
+	 */
 	return ssl_has_ecc_ciphers(s) ||
 	    (s->s3->hs.our_max_tls_version >= TLS1_3_VERSION);
 }
@@ -215,7 +219,7 @@ tlsext_supportedgroups_client_build(SSL *s, uint16_t msg_type, CBB *cbb)
 		return 0;
 
 	for (i = 0; i < groups_len; i++) {
-		if (!ssl_security_supported_group(s, groups[i]))
+		if (!tls1_check_group(s, groups[i]))
 			continue;
 		if (!CBB_add_u16(&grouplist, groups[i]))
 			return 0;
@@ -277,10 +281,8 @@ tlsext_supportedgroups_server_process(SSL *s, uint16_t msg_type, CBS *cbs,
 		if (!CBS_get_u16(&grouplist, &groups[i]))
 			goto err;
 		/*
-		 * Do not allow duplicate groups to be sent. This is not
-		 * currently specified in RFC 8446 or earlier, but there is no
-		 * legitimate justification for this to occur in TLS 1.2 or TLS
-		 * 1.3.
+		 * RFC 9846 section 4.3.7: The "named_group_list" MUST NOT
+		 * contain any duplicate entries.
 		 */
 		for (j = 0; j < i; j++) {
 			if (groups[i] == groups[j]) {
@@ -332,7 +334,7 @@ tlsext_supportedgroups_client_process(SSL *s, uint16_t msg_type, CBS *cbs,
 		return 0;
 
 	/*
-	 * RFC 8446, section 4.2.7: TLSv1.3 servers can send this extension but
+	 * RFC 9846 section 4.3.7: TLSv1.3 servers can send this extension but
 	 * clients must not act on it during the handshake. This allows servers
 	 * to advertise their preferences for subsequent handshakes. We ignore
 	 * this complication.
@@ -381,6 +383,8 @@ tlsext_ecpf_process(SSL *s, uint16_t msg_type, CBS *cbs, int *alert)
 		return 0;
 	if (CBS_len(&ecpf) == 0)
 		return 0;
+
+	/* XXX - tighten this to reject anything but uncompressed format? */
 
 	/* Must contain uncompressed (0) - RFC 8422, section 5.1.2. */
 	if (!CBS_contains_zero_byte(&ecpf)) {
@@ -1058,7 +1062,7 @@ tlsext_ocsp_client_process(SSL *s, uint16_t msg_type, CBS *cbs, int *alert)
 	if (ssl_effective_tls_version(s) >= TLS1_3_VERSION) {
 		if (msg_type == SSL_TLSEXT_MSG_CR) {
 			/*
-			 * RFC 8446, 4.4.2.1 - the server may request an OCSP
+			 * RFC 9846, 4.5.1.1 - the server may request an OCSP
 			 * response with an empty status_request.
 			 */
 			if (CBS_len(cbs) == 0)
@@ -1434,7 +1438,7 @@ tlsext_srtp_client_process(SSL *s, uint16_t msg_type, CBS *cbs, int *alert)
 #endif /* OPENSSL_NO_SRTP */
 
 /*
- * TLSv1.3 Key Share - RFC 8446 section 4.2.8.
+ * TLSv1.3 Key Share - RFC 9846 section 4.3.8.
  */
 static int
 tlsext_keyshare_client_needs(SSL *s, uint16_t msg_type)
@@ -1495,14 +1499,14 @@ tlsext_keyshare_server_process(SSL *s, uint16_t msg_type, CBS *cbs, int *alert)
 	const uint16_t *client_groups = NULL, *server_groups = NULL;
 	size_t client_groups_len = 0, server_groups_len = 0;
 	size_t i, j, client_groups_index;
-	int preferred_group_found = 0;
+	int shared_group_found = 0;
 	int decode_error;
 	uint16_t client_preferred_group = 0;
 	uint16_t group;
 	CBS client_shares, key_exchange;
 
 	/*
-	 * RFC 8446 section 4.2.8:
+	 * RFC 9846 section 4.3.8:
 	 *
 	 * Each KeyShareEntry value MUST correspond to a group offered in the
 	 * "supported_groups" extension and MUST appear in the same order.
@@ -1511,7 +1515,7 @@ tlsext_keyshare_server_process(SSL *s, uint16_t msg_type, CBS *cbs, int *alert)
 	 */
 
 	if (!tlsext_extension_seen(s, TLSEXT_TYPE_supported_groups)) {
-		*alert = SSL_AD_ILLEGAL_PARAMETER;
+		*alert = SSL_AD_MISSING_EXTENSION;
 		return 0;
 	}
 	if (!tlsext_extension_processed(s, TLSEXT_TYPE_supported_groups)) {
@@ -1571,19 +1575,30 @@ tlsext_keyshare_server_process(SSL *s, uint16_t msg_type, CBS *cbs, int *alert)
 
 	/*
 	 * Find the group that is most preferred by the client that
-	 * we also support.
+	 * is also supported by the server.
 	 */
-	for (i = 0; i < client_groups_len && !preferred_group_found; i++) {
+	for (i = 0; i < client_groups_len && !shared_group_found; i++) {
 		if (!ssl_security_supported_group(s, client_groups[i]))
 			continue;
 		for (j = 0; j < server_groups_len; j++) {
 			if (server_groups[j] == client_groups[i]) {
+				/* XXX - this should be equivalent to tls1_check_group() */
 				client_preferred_group = client_groups[i];
 				s->s3->hs.tls13.server_group = client_preferred_group;
-				preferred_group_found = 1;
+				shared_group_found = 1;
 				break;
 			}
 		}
+	}
+
+	if (!shared_group_found) {
+		/*
+		 * There are no supported groups that are shared between the
+		 * client and server - this is treated as a handshake failure
+		 * or as insufficient security - see RFC 9846 section 4.2.1.
+		 */
+		*alert = TLS13_ALERT_HANDSHAKE_FAILURE;
+		return 0;
 	}
 
 	if (!CBS_get_u16_length_prefixed(cbs, &client_shares))
@@ -1631,7 +1646,7 @@ tlsext_keyshare_server_process(SSL *s, uint16_t msg_type, CBS *cbs, int *alert)
 		 * less preferred, and we choose to to use it instead of
 		 * requesting the more preferred group.
 		 */
-		if (!preferred_group_found || group != client_preferred_group)
+		if (group != client_preferred_group)
 			continue;
 
 		/* Decode and store the selected key share. */
@@ -1749,7 +1764,7 @@ tlsext_keyshare_client_process(SSL *s, uint16_t msg_type, CBS *cbs, int *alert)
 }
 
 /*
- * Supported Versions - RFC 8446 section 4.2.1.
+ * Supported Versions - RFC 9846 section 4.3.1.
  */
 static int
 tlsext_versions_client_needs(SSL *s, uint16_t msg_type)
@@ -1851,7 +1866,7 @@ tlsext_versions_client_process(SSL *s, uint16_t msg_type, CBS *cbs, int *alert)
 
 
 /*
- * Cookie - RFC 8446 section 4.2.2.
+ * Cookie - RFC 9846 section 4.3.2.
  */
 
 static int
@@ -1963,7 +1978,7 @@ tlsext_cookie_client_process(SSL *s, uint16_t msg_type, CBS *cbs, int *alert)
 }
 
 /*
- * Pre-Shared Key Exchange Modes - RFC 8446, 4.2.9.
+ * Pre-Shared Key Exchange Modes - RFC 9846 section 4.3.9.
  */
 
 static int
@@ -2033,7 +2048,7 @@ tlsext_psk_kex_modes_client_process(SSL *s, uint16_t msg_type, CBS *cbs,
 }
 
 /*
- * Pre-Shared Key Extension - RFC 8446, 4.2.11
+ * Pre-Shared Key Extension - RFC 9846 section 4.3.11
  */
 
 static int
@@ -2467,7 +2482,7 @@ tlsext_randomize_build_order(SSL *s)
 		return 0;
 	s->tlsext_build_order_len = N_TLS_EXTENSIONS;
 
-	/* RFC 8446, section 4.2 - PSK MUST be the last extension in the CH. */
+	/* RFC 9846 section 4.3 - PSK MUST be the last extension in the CH. */
 	if ((psk_ext = tls_extension_find(TLSEXT_TYPE_pre_shared_key,
 	    NULL)) == NULL)
 		return 0;
@@ -2521,7 +2536,7 @@ tlsext_build(SSL *s, int is_server, uint16_t msg_type, CBB *cbb)
 		tlsext = s->tlsext_build_order[i];
 		ext = tlsext_funcs(tlsext, is_server);
 
-		/* RFC 8446 Section 4.2 */
+		/* RFC 9846 section 4.3 */
 		if (tls_version >= TLS1_3_VERSION &&
 		    !(tlsext->messages & msg_type))
 			continue;
@@ -2550,14 +2565,15 @@ tlsext_build(SSL *s, int is_server, uint16_t msg_type, CBB *cbb)
 	return 1;
 }
 
-int
+static int
 tlsext_clienthello_hash_extension(SSL *s, uint16_t type, CBS *cbs)
 {
 	/*
-	 * RFC 8446 4.1.2. For subsequent CH, early data will be removed,
+	 * RFC 9846, 4.2.2. For subsequent CH, early data will be removed,
 	 * cookie may be added, padding may be removed.
 	 */
 	struct tls13_ctx *ctx = s->tls13;
+	uint16_t len = CBS_len(cbs);
 
 	if (type == TLSEXT_TYPE_early_data || type == TLSEXT_TYPE_cookie ||
 	    type == TLSEXT_TYPE_padding)
@@ -2571,6 +2587,8 @@ tlsext_clienthello_hash_extension(SSL *s, uint16_t type, CBS *cbs)
 	 */
 	if (type == TLSEXT_TYPE_pre_shared_key || type == TLSEXT_TYPE_key_share)
 		return 1;
+	if (!tls13_clienthello_hash_update_bytes(ctx, (void *)&len, sizeof(len)))
+		return 0;
 	if (!tls13_clienthello_hash_update(ctx, cbs))
 		return 0;
 
@@ -2624,7 +2642,7 @@ tlsext_parse(SSL *s, struct tlsext_data *td, int is_server, uint16_t msg_type,
 				goto err;
 		}
 
-		/* RFC 8446 Section 4.2 */
+		/* RFC 9846 section 4.3 */
 		if (tls_version >= TLS1_3_VERSION &&
 		    !(tlsext->messages & msg_type)) {
 			alert_desc = SSL_AD_ILLEGAL_PARAMETER;

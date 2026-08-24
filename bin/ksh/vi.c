@@ -1,4 +1,4 @@
-/*	$OpenBSD: vi.c,v 1.68 2026/03/05 05:38:58 deraadt Exp $	*/
+/*	$OpenBSD: vi.c,v 1.71 2026/08/15 11:54:18 jtt Exp $	*/
 
 /*
  *	vi command editing
@@ -819,7 +819,7 @@ vi_cmd(int argcnt, const char *cmd)
 						c2++;
 				}
 			}
-			if (*cmd != 'c' && c1 != c2)
+			if (c1 != c2)
 				yank_range(c1, c2);
 			if (*cmd != 'y') {
 				del_range(c1, c2);
@@ -858,6 +858,7 @@ vi_cmd(int argcnt, const char *cmd)
 
 		case 'C':
 			modified = 1; hnum = hlast;
+			yank_range(es->cursor, es->linelen);
 			del_range(es->cursor, es->linelen);
 			insert = INSERT;
 			break;
@@ -963,8 +964,6 @@ vi_cmd(int argcnt, const char *cmd)
 			break;
 
 		case 'v':
-			if (es->linelen == 0 && argcnt == 0)
-				return -1;
 			if (!argcnt) {
 				if (modified) {
 					es->cbuf[es->linelen] = '\0';
@@ -2205,7 +2204,9 @@ complete_word(int command, int count)
 		expanded = NONE;
 
 		/* If not a directory, add a space to the end... */
-		if (match_len > 0 && match[match_len - 1] != '/')
+		if (match_len > 0 && match[match_len - 1] != '/' &&
+		    !x_is_tilde_user_completion(es->cbuf + start,
+		    end - start, match, match_len))
 			rval = putbuf(" ", 1, 0);
 	}
 	x_free_words(nwords, words);

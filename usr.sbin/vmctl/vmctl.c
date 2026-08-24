@@ -1,4 +1,4 @@
-/*	$OpenBSD: vmctl.c,v 1.96 2026/02/11 20:13:04 mlarkin Exp $	*/
+/*	$OpenBSD: vmctl.c,v 1.98 2026/04/16 21:34:47 dv Exp $	*/
 
 /*
  * Copyright (c) 2014 Mike Larkin <mlarkin@openbsd.org>
@@ -72,8 +72,8 @@ struct imsgbuf *ibuf;
  */
 int
 vm_start(uint32_t start_id, const char *name, size_t memsize, int nnics,
-    char **nics, int ndisks, char **disks, int *disktypes, char *kernel,
-    char *iso, char *instance, unsigned int bootdevice)
+    char **nics, int ndisks, char **disks, enum vm_disk_fmt *disktypes,
+    char *kernel, char *iso, char *instance, unsigned int bootdevice)
 {
 	struct vmop_create_params vmc;
 	struct stat sb;
@@ -839,7 +839,8 @@ open_imagefile(int type, const char *imgfile_path, int flags,
 		for (i = 0; i < VM_MAX_BASE_PER_DISK - 1; i++, nfd++) {
 			if ((ret = virtio_qcow2_get_base(basefd[i],
 			    path, sizeof(path), imgfile_path)) == -1) {
-				log_debug("%s: failed to get base %d", __func__, i);
+				log_debug("%s: failed to get base %d",
+				    __func__, i);
 				return -1;
 			} else if (ret == 0)
 				break;

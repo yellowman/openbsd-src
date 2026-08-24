@@ -1,4 +1,4 @@
-/*	$OpenBSD: main.c,v 1.304 2026/01/20 16:49:03 tb Exp $ */
+/*	$OpenBSD: main.c,v 1.313 2026/07/16 03:53:28 tb Exp $ */
 /*
  * Copyright (c) 2021 Claudio Jeker <claudio@openbsd.org>
  * Copyright (c) 2019 Kristaps Dzonsons <kristaps@bsd.lv>
@@ -73,6 +73,7 @@ int	shortlistmode;
 int	rrdpon = 1;
 int	repo_timeout;
 int	experimental;
+int	retry_all_ncas = 0;
 time_t	deadline;
 
 /* 9999-12-31 23:59:59 UTC */
@@ -84,14 +85,38 @@ int64_t  evaluation_time = X509_TIME_MIN;
 
 struct stats	 stats;
 
-struct fqdnlistentry {
-	LIST_ENTRY(fqdnlistentry)	 entry;
-	char				*fqdn;
-};
-LIST_HEAD(fqdns, fqdnlistentry);
+static struct strlist shortlist = LIST_HEAD_INITIALIZER(shortlist);
+static struct strlist skiplist = LIST_HEAD_INITIALIZER(skiplist);
 
-struct fqdns shortlist = LIST_HEAD_INITIALIZER(fqdns);
-struct fqdns skiplist = LIST_HEAD_INITIALIZER(fqdns);
+/* XXX - pass in length of str? */
+void
+strlist_insert(struct strlist *strlist, const char *str)
+{
+	struct strlistentry *sle;
+
+	if ((sle = calloc(1, sizeof(*sle))) == NULL)
+		err(1, NULL);
+
+	if ((sle->str = strdup(str)) == NULL)
+		err(1, NULL);
+
+	sle->str_len = strlen(sle->str);
+
+	LIST_INSERT_HEAD(strlist, sle, entry);
+}
+
+int
+strlist_find(const struct strlist *strlist, const char *str, size_t len)
+{
+	struct strlistentry *sle;
+
+	LIST_FOREACH(sle, strlist, entry) {
+		if (sle->str_len == len && strncasecmp(str, sle->str, len) == 0)
+			return 1;
+	}
+
+	return 0;
+}
 
 /*
  * Log a message to stderr if and only if "verbose" is non-zero.
@@ -514,34 +539,28 @@ static void
 queue_add_from_cert(const struct cert *cert, struct nca_tree *ncas)
 {
 	struct repo		*repo;
-	struct fqdnlistentry	*le;
 	char			*nfile, *npath, *host;
 	const char		*uri, *repouri, *file;
-	size_t			 repourisz;
-	int			 shortlisted = 0;
+	size_t			 hostsz, repourisz;
 
 	if (strncmp(cert->repo, RSYNC_PROTO, RSYNC_PROTO_LEN) != 0)
 		errx(1, "unexpected protocol");
 	host = cert->repo + RSYNC_PROTO_LEN;
+	hostsz = strcspn(host, "/");
 
-	LIST_FOREACH(le, &skiplist, entry) {
-		if (strncasecmp(host, le->fqdn, strcspn(host, "/")) == 0) {
-			warnx("skipping %s (listed in skiplist)", cert->repo);
-			return;
-		}
+	if (strlist_find(&skiplist, host, hostsz)) {
+		warnx("skipping %s (listed in skiplist)", cert->repo);
+		return;
 	}
 
-	LIST_FOREACH(le, &shortlist, entry) {
-		if (strncasecmp(host, le->fqdn, strcspn(host, "/")) == 0) {
-			shortlisted = 1;
-			break;
-		}
-	}
-	if (shortlistmode && shortlisted == 0) {
+	if (shortlistmode && !strlist_find(&shortlist, host, hostsz)) {
 		if (verbose)
 			warnx("skipping %s (not shortlisted)", cert->repo);
 		return;
 	}
+
+	if (nca_skip_sync(ncas, cert))
+		return;
 
 	repo = repo_lookup(cert->talid, cert->repo,
 	    rrdpon ? cert->notify : NULL);
@@ -572,7 +591,6 @@ queue_add_from_cert(const struct cert *cert, struct nca_tree *ncas)
 			err(1, NULL);
 	}
 
-	cert_insert_nca(ncas, cert, repo);
 	entityq_add(npath, nfile, RTYPE_MFT, DIR_UNKNOWN, repo, NULL, 0,
 	    cert->talid, cert->certid, NULL);
 }
@@ -672,13 +690,11 @@ entity_process(struct ibuf *b, struct validation_data *vd, struct stats *st)
 		if (mft->seqnum_gap)
 			repo_stat_inc(rp, talid, type, STYPE_SEQNUM_GAP);
 		queue_add_from_mft(mft);
-		cert_remove_nca(&vd->ncas, mft->certid, rp);
+		nca_tree_remove_cert(&vd->ncas, mft->certid);
 		ccr_insert_mft(&vd->ccr.mfts, mft);
 		mft_free(mft);
 		break;
 	case RTYPE_CRL:
-		/* CRLs are sent together with MFT and not accounted for */
-		entity_queue++;
 		break;
 	case RTYPE_ROA:
 		io_read_buf(b, &ok, sizeof(ok));
@@ -735,6 +751,9 @@ entity_process(struct ibuf *b, struct validation_data *vd, struct stats *st)
 
 done:
 	free(file);
+	/* CRLs are sent together with the MFT and not accounted for */
+	if (type == RTYPE_CRL)
+		return;
 	entity_queue--;
 }
 
@@ -806,6 +825,7 @@ sum_stats(const struct repo *rp, const struct repotalstats *in, void *arg)
 	out->certs += in->certs;
 	out->certs_fail += in->certs_fail;
 	out->certs_nonfunc += in->certs_nonfunc;
+	out->certs_nonfunc_deferred += in->certs_nonfunc_deferred;
 	out->roas += in->roas;
 	out->roas_fail += in->roas_fail;
 	out->roas_invalid += in->roas_invalid;
@@ -880,7 +900,6 @@ tal_load_default(void)
 static void
 load_skiplist(const char *slf)
 {
-	struct fqdnlistentry	*le;
 	FILE			*fp;
 	char			*line = NULL;
 	size_t			 linesize = 0, linelen;
@@ -909,12 +928,7 @@ load_skiplist(const char *slf)
 		if (!valid_uri(line, linelen, NULL))
 			errx(1, "invalid entry in skiplist: %s", line);
 
-		if ((le = malloc(sizeof(struct fqdnlistentry))) == NULL)
-			err(1, NULL);
-		if ((le->fqdn = strdup(line)) == NULL)
-			err(1, NULL);
-
-		LIST_INSERT_HEAD(&skiplist, le, entry);
+		strlist_insert(&skiplist, line);
 		stats.skiplistentries++;
 	}
 	if (ferror(fp))
@@ -930,18 +944,10 @@ load_skiplist(const char *slf)
 static void
 load_shortlist(const char *fqdn)
 {
-	struct fqdnlistentry	*le;
-
 	if (!valid_uri(fqdn, strlen(fqdn), NULL))
 		errx(1, "invalid fqdn passed to -q: %s", fqdn);
 
-	if ((le = malloc(sizeof(struct fqdnlistentry))) == NULL)
-		err(1, NULL);
-
-	if ((le->fqdn = strdup(fqdn)) == NULL)
-		err(1, NULL);
-
-	LIST_INSERT_HEAD(&shortlist, le, entry);
+	strlist_insert(&shortlist, fqdn);
 }
 
 static void
@@ -1027,6 +1033,7 @@ main(int argc, char *argv[])
 	struct rusage	 ru;
 	struct timespec	 start_time, now_time;
 	struct validation_data vd = { 0 };
+	struct nonfunc_ca *nca;
 
 	clock_gettime(CLOCK_MONOTONIC, &start_time);
 
@@ -1061,7 +1068,7 @@ main(int argc, char *argv[])
 		err(1, "pledge");
 
 	while ((c =
-	    getopt(argc, argv, "0Ab:Bcd:e:fH:jmnop:P:Rs:S:t:vVx")) != -1)
+	    getopt(argc, argv, "0Ab:Bcd:e:fH:jmNnop:P:Rs:S:t:vVx")) != -1)
 		switch (c) {
 		case '0':
 			excludeas0 = 0;
@@ -1097,6 +1104,9 @@ main(int argc, char *argv[])
 			break;
 		case 'm':
 			outformats |= FORMAT_OMETRIC;
+			break;
+		case 'N':
+			retry_all_ncas = 1;
 			break;
 		case 'n':
 			noop = 1;
@@ -1345,6 +1355,8 @@ main(int argc, char *argv[])
 	if (fchdir(cachefd) == -1)
 		err(1, "fchdir");
 
+	nca_history_load();
+
 	while (entity_queue > 0 && !killme) {
 		int polltim;
 
@@ -1353,13 +1365,13 @@ main(int argc, char *argv[])
 			repo_printinfo(entity_queue);
 		}
 
+		polltim = repo_check_timeout(INFTIM);
+
 		for (i = 0; i < NPFD; i++) {
 			pfd[i].events = POLLIN;
 			if (msgbuf_queuelen(queues[i]) > 0)
 				pfd[i].events |= POLLOUT;
 		}
-
-		polltim = repo_check_timeout(INFTIM);
 
 		if (poll(pfd, NPFD, polltim) == -1) {
 			if (errno == EINTR)
@@ -1536,6 +1548,9 @@ main(int argc, char *argv[])
 	if (filemode)
 		return rc;
 
+	RB_FOREACH(nca, nca_tree, &vd.ncas)
+		repo_stat_add_nca(nca);
+
 	logx("all files parsed: generating output");
 
 	if (!noop)
@@ -1558,6 +1573,9 @@ main(int argc, char *argv[])
 
 	vd.buildtime = get_current_time();
 
+	if (!noop && rc == 0)
+		nca_history_save(&vd.ncas, vd.buildtime);
+
 	/* change working directory to the output directory */
 	if (fchdir(outdirfd) == -1)
 		err(1, "fchdir output dir");
@@ -1570,7 +1588,7 @@ main(int argc, char *argv[])
 
 	serialize_ccr_content(&vd);
 
-	if (outputfiles(&vd, &stats))
+	if (outputfiles(&vd, &stats, rc))
 		rc = 1;
 
 	printf("Processing time %lld seconds "
@@ -1597,9 +1615,11 @@ main(int argc, char *argv[])
 		    stats.repo_tal_stats.spls_invalid);
 	}
 	printf("BGPsec Router Certificates: %u\n", stats.repo_tal_stats.brks);
-	printf("Certificates: %u (%u invalid, %u non-functional)\n",
-	    stats.repo_tal_stats.certs, stats.repo_tal_stats.certs_fail,
-	    stats.repo_tal_stats.certs_nonfunc);
+	printf("Certificates: %u (%u invalid, %u non-functional, %u sync "
+	    "deferred)\n", stats.repo_tal_stats.certs,
+	    stats.repo_tal_stats.certs_fail,
+	    stats.repo_tal_stats.certs_nonfunc,
+	    stats.repo_tal_stats.certs_nonfunc_deferred);
 	printf("Trust Anchor Locators: %u (%u invalid)\n",
 	    stats.tals, talsz - stats.tals);
 	printf("Manifests: %u (%u failed parse, %u seqnum gaps)\n",
@@ -1629,7 +1649,7 @@ main(int argc, char *argv[])
 
 usage:
 	fprintf(stderr,
-	    "usage: rpki-client [-0ABcjmnoRVvx] [-b sourceaddr] [-d cachedir]"
+	    "usage: rpki-client [-0ABcjmNnoRVvx] [-b sourceaddr] [-d cachedir]"
 	    " [-e rsync_prog]\n"
 	    "                   [-H fqdn] [-P posix-seconds] [-p threads]"
 	    " [-S skiplist]\n"

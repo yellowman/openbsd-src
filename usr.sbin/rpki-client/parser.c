@@ -1,4 +1,4 @@
-/*	$OpenBSD: parser.c,v 1.178 2026/01/27 09:41:42 tb Exp $ */
+/*	$OpenBSD: parser.c,v 1.183 2026/07/21 12:21:42 claudio Exp $ */
 /*
  * Copyright (c) 2019 Claudio Jeker <claudio@openbsd.org>
  * Copyright (c) 2019 Kristaps Dzonsons <kristaps@bsd.lv>
@@ -16,9 +16,9 @@
  * OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
  */
 
+#include <sys/types.h>
 #include <sys/queue.h>
 #include <sys/tree.h>
-#include <sys/types.h>
 
 #include <err.h>
 #include <fcntl.h>
@@ -106,6 +106,26 @@ repo_add(unsigned int id, char *path, char *validpath)
 		errx(1, "repository already added: id %d, %s", id, path);
 	if ((error = pthread_rwlock_unlock(&repos_lk)) != 0)
 		errx(1, "pthread_rwlock_unlock: %s", strerror(error));
+}
+
+static void
+repo_tree_free(struct repo_tree *tree)
+{
+	struct parse_repo *repo, *trepo;
+	int error;
+
+	if ((error = pthread_rwlock_wrlock(&repos_lk)) != 0)
+		errx(1, "pthread_rwlock_wrlock: %s", strerror(error));
+	RB_FOREACH_SAFE(repo, repo_tree, tree, trepo) {
+		RB_REMOVE(repo_tree, tree, repo);
+		free(repo->path);
+		free(repo->validpath);
+		free(repo);
+	}
+	if ((error = pthread_rwlock_unlock(&repos_lk)) != 0)
+		errx(1, "pthread_rwlock_unlock: %s", strerror(error));
+	if ((error = pthread_rwlock_destroy(&repos_lk)) != 0)
+		errx(1, "pthread_rwlock_destroy: %s", strerror(error));
 }
 
 /*
@@ -277,6 +297,7 @@ proc_parser_mft_check(const char *fn, struct mft *p)
 	for (i = 0; i < p->filesz; i++) {
 		struct mftfile *m = &p->files[i];
 		int try, fd = -1, noent = 0, valid = 0;
+
 		for (try = 0; try < 2 && !valid; try++) {
 			if ((path = parse_filepath(p->repoid, p->path, m->file,
 			    loc[try])) == NULL)
@@ -293,8 +314,12 @@ proc_parser_mft_check(const char *fn, struct mft *p)
 
 		if (!valid) {
 			/* silently skip not-existing unknown files */
-			if (m->type == RTYPE_INVALID && noent == 2)
-				continue;
+			if (m->type == RTYPE_INVALID) {
+				if (noent == 2)
+					continue;
+				if (noop && noent == 1)
+					continue;
+			}
 			warnx("%s#%s: bad message digest for %s", fn,
 			    p->seqnum, m->file);
 			rc = 0;
@@ -1047,6 +1072,12 @@ parse_worker(void *arg)
 				errx(1, "pthread_cond_wait: %s",
 				    strerror(error));
 		}
+		if (quit) {
+			if ((error = pthread_mutex_unlock(&globalq_mtx)) != 0)
+				errx(1, "pthread_mutex_unlock: %s",
+				    strerror(error));
+			break;
+		}
 		n = 0;
 		while ((entp = TAILQ_FIRST(&globalq)) != NULL) {
 			TAILQ_REMOVE(&globalq, entp, entries);
@@ -1116,6 +1147,8 @@ parse_writer(void *arg)
 			if (error != 0)
 				errx(1, "pthread_mutex_lock: %s",
 				    strerror(error));
+			if (quit)
+				break;
 		}
 
 		if (msgbuf_queuelen(myq) > 0) {
@@ -1149,26 +1182,6 @@ parse_writer(void *arg)
 
 	msgbuf_free(myq);
 	return NULL;
-}
-
-static void
-repo_tree_free(struct repo_tree *tree)
-{
-	struct parse_repo *repo, *trepo;
-	int error;
-
-	if ((error = pthread_rwlock_wrlock(&repos_lk)) != 0)
-		errx(1, "pthread_rwlock_wrlock: %s", strerror(error));
-	RB_FOREACH_SAFE(repo, repo_tree, tree, trepo) {
-		RB_REMOVE(repo_tree, tree, repo);
-		free(repo->path);
-		free(repo->validpath);
-		free(repo);
-	}
-	if ((error = pthread_rwlock_unlock(&repos_lk)) != 0)
-		errx(1, "pthread_rwlock_unlock: %s", strerror(error));
-	if ((error = pthread_rwlock_destroy(&repos_lk)) != 0)
-		errx(1, "pthread_rwlock_destroy: %s", strerror(error));
 }
 
 /*
@@ -1274,13 +1287,19 @@ proc_parser(int fd, int nthreads)
 	}
 
 	/* signal all threads */
+	if ((error = pthread_mutex_lock(&globalq_mtx)) != 0)
+		errx(1, "pthread_mutex_lock: %s", strerror(error));
+	if ((error = pthread_mutex_lock(&globalmsgq_mtx)) != 0)
+		errx(1, "pthread_mutex_lock: %s", strerror(error));
+
 	if ((error = pthread_cond_broadcast(&globalq_cond)) != 0)
 		errx(1, "pthread_cond_broadcast: %s", strerror(error));
 	if ((error = pthread_cond_broadcast(&globalmsgq_cond)) != 0)
 		errx(1, "pthread_cond_broadcast: %s", strerror(error));
 
-	if ((error = pthread_mutex_lock(&globalq_mtx)) != 0)
-		errx(1, "pthread_mutex_lock: %s", strerror(error));
+	if ((error = pthread_mutex_unlock(&globalmsgq_mtx)) != 0)
+		errx(1, "pthread_mutex_unlock: %s", strerror(error));
+
 	while ((entp = TAILQ_FIRST(&globalq)) != NULL) {
 		TAILQ_REMOVE(&globalq, entp, entries);
 		entity_free(entp);

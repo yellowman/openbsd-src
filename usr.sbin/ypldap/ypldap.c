@@ -1,4 +1,4 @@
-/*	$OpenBSD: ypldap.c,v 1.31 2024/11/21 13:38:15 claudio Exp $ */
+/*	$OpenBSD: ypldap.c,v 1.33 2026/08/07 21:06:39 claudio Exp $ */
 
 /*
  * Copyright (c) 2008 Pierre-Yves Ritschard <pyr@openbsd.org>
@@ -349,8 +349,7 @@ make_uids:
 void
 main_dispatch_client(int fd, short events, void *p)
 {
-	int		 n;
-	int		 shut = 0;
+	int		 n, shut = 0;
 	struct env	*env = p;
 	struct imsgev	*iev = env->sc_iev;
 	struct imsgbuf	*ibuf = &iev->ibuf;
@@ -376,8 +375,8 @@ main_dispatch_client(int fd, short events, void *p)
 	}
 
 	for (;;) {
-		if ((n = imsg_get(ibuf, &imsg)) == -1)
-			fatal("main_dispatch_client: imsg_get error");
+		if ((n = imsgbuf_get(ibuf, &imsg)) == -1)
+			fatal("main_dispatch_client: imsgbuf_get error");
 		if (n == 0)
 			break;
 
@@ -392,7 +391,13 @@ main_dispatch_client(int fd, short events, void *p)
 			if (env->update_trashed)
 				break;
 
-			(void)memcpy(&ir, imsg.data, n - IMSG_HEADER_SIZE);
+			len = imsg_get_len(&imsg);
+			if (len < sizeof(ir.ir_key) + 1 || len > sizeof(ir))
+				break;
+			if (imsg_get_data(&imsg, &ir, len) == -1)
+				break;
+			len -= sizeof(ir.ir_key);
+			ir.ir_line[len - 1] = '\0';
 			if ((ue = calloc(1, sizeof(*ue))) == NULL ||
 			    (ue->ue_line = strdup(ir.ir_line)) == NULL) {
 				/*
@@ -418,7 +423,13 @@ main_dispatch_client(int fd, short events, void *p)
 			if (env->update_trashed)
 				break;
 
-			(void)memcpy(&ir, imsg.data, n - IMSG_HEADER_SIZE);
+			len = imsg_get_len(&imsg);
+			if (len < sizeof(ir.ir_key) + 1 || len > sizeof(ir))
+				break;
+			if (imsg_get_data(&imsg, &ir, len) == -1)
+				break;
+			len -= sizeof(ir.ir_key);
+			ir.ir_line[len - 1] = '\0';
 			if ((ge = calloc(1, sizeof(*ge))) == NULL ||
 			    (ge->ge_line = strdup(ir.ir_line)) == NULL) {
 				/*

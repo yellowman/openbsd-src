@@ -1,4 +1,4 @@
-/* $OpenBSD: auth2-pubkey.c,v 1.125 2025/12/22 01:49:03 djm Exp $ */
+/* $OpenBSD: auth2-pubkey.c,v 1.127 2026/07/30 03:37:39 djm Exp $ */
 /*
  * Copyright (c) 2000 Markus Friedl.  All rights reserved.
  * Copyright (c) 2010 Damien Miller.  All rights reserved.
@@ -139,6 +139,11 @@ userauth_pubkey(struct ssh *ssh, const char *method)
 		verbose_f("unsupported public key algorithm: %s", pkalg);
 		goto done;
 	}
+	if (match_pattern_list(pkalg, options.pubkey_accepted_algos, 0) != 1) {
+		logit_f("signature algorithm %s not in "
+		    "PubkeyAcceptedAlgorithms", pkalg);
+		goto done;
+	}
 	if ((r = sshkey_from_blob(pkblob, blen, &key)) != 0) {
 		error_fr(r, "parse key");
 		goto done;
@@ -147,18 +152,14 @@ userauth_pubkey(struct ssh *ssh, const char *method)
 		error_f("cannot decode key: %s", pkalg);
 		goto done;
 	}
-	if (key->type != pktype) {
-		error_f("type mismatch for decoded key "
-		    "(received %d, expected %d)", key->type, pktype);
+	if (key->type != pktype || (sshkey_type_plain(pktype) == KEY_ECDSA &&
+	    sshkey_ecdsa_nid_from_name(pkalg) != key->ecdsa_nid)) {
+		error_f("key type mismatch for decoded key "
+		    "(received %s, expected %s)", sshkey_ssh_name(key), pkalg);
 		goto done;
 	}
 	if (auth2_key_already_used(authctxt, key)) {
 		logit("refusing previously-used %s key", sshkey_type(key));
-		goto done;
-	}
-	if (match_pattern_list(pkalg, options.pubkey_accepted_algos, 0) != 1) {
-		logit_f("signature algorithm %s not in "
-		    "PubkeyAcceptedAlgorithms", pkalg);
 		goto done;
 	}
 	if ((r = sshkey_check_cert_sigtype(key,

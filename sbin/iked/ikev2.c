@@ -1,4 +1,4 @@
-/*	$OpenBSD: ikev2.c,v 1.395 2025/11/04 11:10:43 yasuoka Exp $	*/
+/*	$OpenBSD: ikev2.c,v 1.402 2026/06/22 12:51:16 hshoexer Exp $	*/
 
 /*
  * Copyright (c) 2019 Tobias Heider <tobias.heider@stusta.de>
@@ -713,7 +713,7 @@ ikev2_recv(struct iked *env, struct iked_message *msg)
 	}
 
 	if (msg->msg_response) {
-		if (msg->msg_msgid > sa->sa_reqid) {
+		if (msg->msg_msgid + 1 != sa->sa_reqid) {
 			ikestat_inc(env, ikes_msg_rcvd_dropped);
 			return;
 		}
@@ -858,6 +858,7 @@ ikev2_auth_verify(struct iked *env, struct iked_sa *sa)
 	struct iked_auth	 ikeauth;
 	struct ibuf		*authmsg;
 	int			 ret;
+	size_t			 msklen;
 
 	memcpy(&ikeauth, &sa->sa_policy->pol_auth,
 	    sizeof(ikeauth));
@@ -871,10 +872,17 @@ ikev2_auth_verify(struct iked *env, struct iked_sa *sa)
 		ikeauth.auth_method = IKEV2_AUTH_SHARED_KEY_MIC;
 
 		/* Copy session key as PSK */
-		memcpy(ikeauth.auth_data,
-		    ibuf_data(sa->sa_eapmsk),
-		    ibuf_size(sa->sa_eapmsk));
-		ikeauth.auth_length = ibuf_size(sa->sa_eapmsk);
+		msklen = ibuf_size(sa->sa_eapmsk);
+		if (msklen > sizeof(ikeauth.auth_data) ||
+		    msklen > 255) {
+			log_warnx("%s: unexpected eap size %zu",
+			    SPI_SA(sa, __func__), msklen);
+			ikev2_send_auth_failed(env, sa);
+			explicit_bzero(&ikeauth, sizeof(ikeauth));
+			return (-1);
+		}
+		memcpy(ikeauth.auth_data, ibuf_data(sa->sa_eapmsk), msklen);
+		ikeauth.auth_length = msklen;
 	}
 
 	if (ikev2_ike_auth_compatible(sa,
@@ -4452,6 +4460,9 @@ ikev2_init_create_child_sa(struct iked *env, struct iked_message *msg)
 	uint32_t			 spi32;
 	int				 pfs = 0, ret = -1;
 
+	if (!sa_stateok(sa, IKEV2_STATE_ESTABLISHED))
+		return -1;
+
 	if (!ikev2_msg_frompeer(msg) ||
 	    (sa->sa_stateflags & (IKED_REQ_CHILDSA|IKED_REQ_INF)) == 0)
 		return (0);
@@ -4917,6 +4928,9 @@ ikev2_resp_create_child_sa(struct iked *env, struct iked_message *msg)
 	int				 ret = -1;
 	int				 pfs = 0;
 
+	if (!sa_stateok(sa, IKEV2_STATE_ESTABLISHED))
+		return -1;
+
 	initiator = sa->sa_hdr.sh_initiator ? 1 : 0;
 
 	if (!ikev2_msg_frompeer(msg) || msg->msg_prop == NULL)
@@ -4964,6 +4978,13 @@ ikev2_resp_create_child_sa(struct iked *env, struct iked_message *msg)
 		/* IKE SA rekeying */
 		spi = &msg->msg_prop->prop_peerspi;
 
+		if (spi->spi == 0 ||
+		    sa_lookup(env, spi->spi, 0, 0) != NULL) {
+			log_info("%s: new IKE SA exists %s",
+			    SPI_SA(sa, __func__), print_spi(spi->spi, 8));
+			return (ret);
+		}
+
 		if ((nsa = sa_new(env, spi->spi, 0, 0,
 		    msg->msg_policy)) == NULL) {
 			log_debug("%s: failed to get new SA", __func__);
@@ -4972,7 +4993,7 @@ ikev2_resp_create_child_sa(struct iked *env, struct iked_message *msg)
 
 		if (ikev2_sa_responder(env, nsa, sa, msg)) {
 			log_debug("%s: failed to get IKE SA keys", __func__);
-			return (ret);
+			goto done;
 		}
 
 		sa_state(env, nsa, IKEV2_STATE_AUTH_SUCCESS);
@@ -5041,8 +5062,6 @@ ikev2_resp_create_child_sa(struct iked *env, struct iked_message *msg)
 				msg->msg_error = IKEV2_N_CHILD_SA_NOT_FOUND;
 				goto fail;
 			}
-			csa->csa_rekey = 1;
-			csa->csa_peersa->csa_rekey = 1;
 		}
 
 		/* Update initiator's nonce */
@@ -5078,6 +5097,11 @@ ikev2_resp_create_child_sa(struct iked *env, struct iked_message *msg)
 				sa->sa_simult = ibuf_dup(kex->kex_inonce);
 			else
 				sa->sa_simult = ibuf_dup(nonce);
+		}
+
+		if (rekeying && csa) {
+			csa->csa_rekey = 1;
+			csa->csa_peersa->csa_rekey = 1;
 		}
 	}
 
@@ -5168,6 +5192,15 @@ ikev2_resp_create_child_sa(struct iked *env, struct iked_message *msg)
 		ret = ikev2_childsa_enable(env, sa);
 
  done:
+	if (ret && nsa != NULL && nsa != sa) {
+		ikev2_ike_sa_setreason(nsa, "invalid SA for rekey");
+		sa_free(env, nsa);
+	}
+	if (ret && rekeying && csa) {
+		/* rekeying failed, unmark */
+		csa->csa_rekey = 0;
+		csa->csa_peersa->csa_rekey = 0;
+	}
 	if (ret && protoid != IKEV2_SAPROTO_IKE)
 		ikev2_childsa_delete(env, sa, 0, 0, NULL, 1);
 	ibuf_free(e);
@@ -7019,7 +7052,9 @@ ikev2_print_id(struct iked_id *id, char *idstr, size_t idstrlen)
 	case IKEV2_ID_IPV4:
 		s4.sin_family = AF_INET;
 		s4.sin_len = sizeof(s4);
-		memcpy(&s4.sin_addr.s_addr, ptr, len);
+		if (len != (ssize_t)sizeof(s4.sin_addr.s_addr))
+			return (-1);
+		memcpy(&s4.sin_addr.s_addr, ptr, sizeof(s4.sin_addr.s_addr));
 
 		if (strlcat(idstr, print_addr(&s4), idstrlen) >= idstrlen)
 			return (-1);
@@ -7038,7 +7073,9 @@ ikev2_print_id(struct iked_id *id, char *idstr, size_t idstrlen)
 	case IKEV2_ID_IPV6:
 		s6.sin6_family = AF_INET6;
 		s6.sin6_len = sizeof(s6);
-		memcpy(&s6.sin6_addr, ptr, len);
+		if (len != (ssize_t)sizeof(s6.sin6_addr))
+			return (-1);
+		memcpy(&s6.sin6_addr, ptr, sizeof(s6.sin6_addr));
 
 		if (strlcat(idstr, print_addr(&s6), idstrlen) >= idstrlen)
 			return (-1);

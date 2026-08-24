@@ -1,4 +1,4 @@
-/*	$OpenBSD: bgpd.c,v 1.288 2026/03/19 12:44:22 claudio Exp $ */
+/*	$OpenBSD: bgpd.c,v 1.293 2026/07/30 13:56:06 claudio Exp $ */
 
 /*
  * Copyright (c) 2003, 2004 Henning Brauer <henning@openbsd.org>
@@ -847,15 +847,14 @@ dispatch_imsg(struct imsgbuf *imsgbuf, int idx, struct bgpd_config *conf)
 	struct pftable_msg	 pfmsg;
 	struct demote_msg	 demote;
 	char			 reason[REASON_LEN], ifname[IFNAMSIZ];
-	ssize_t			 n;
+	int			 n;
 	u_int			 rtableid;
 	int			 rv, verbose;
 
 	rv = 0;
 	while (imsgbuf) {
-		if ((n = imsg_get(imsgbuf, &imsg)) == -1)
+		if ((n = imsgbuf_get(imsgbuf, &imsg)) == -1)
 			return (-1);
-
 		if (n == 0)
 			break;
 
@@ -1002,7 +1001,6 @@ dispatch_imsg(struct imsgbuf *imsgbuf, int idx, struct bgpd_config *conf)
 			}
 			break;
 		case IMSG_CTL_LOG_VERBOSE:
-			/* already checked by SE */
 			if (imsg_get_data(&imsg, &verbose, sizeof(verbose)) ==
 			    -1)
 				log_warn("wrong imsg len");
@@ -1258,7 +1256,7 @@ set_pollfd(struct pollfd *pfd, struct imsgbuf *i)
 int
 handle_pollfd(struct pollfd *pfd, struct imsgbuf *i)
 {
-	ssize_t n;
+	int n;
 
 	if (i == NULL)
 		return (0);
@@ -1373,12 +1371,15 @@ bgpd_rtr_conn_setup(struct rtr_config *r)
 		log_warn("rtr %s", r->descr);
 		return;
 	}
+	ce->fd = -1;
+	ce->id = r->id;
 
 	if (pfkey_establish(&ce->auth_state, &r->auth,
-	    &r->local_addr, &r->remote_addr) == -1)
+	    &r->local_addr, &r->remote_addr) == -1) {
 		log_warnx("rtr %s: pfkey setup failed", r->descr);
+		goto fail;
+	}
 
-	ce->id = r->id;
 	ce->fd = socket(aid2af(r->remote_addr.aid),
 	    SOCK_STREAM | SOCK_CLOEXEC | SOCK_NONBLOCK, IPPROTO_TCP);
 	if (ce->fd == -1) {
@@ -1409,8 +1410,10 @@ bgpd_rtr_conn_setup(struct rtr_config *r)
 		goto fail;
 	}
 
-	if (tcp_md5_set(ce->fd, &r->auth, &r->remote_addr) == -1)
+	if (tcp_md5_set(ce->fd, &r->auth, &r->remote_addr) == -1) {
 		log_warn("rtr %s: setting md5sig", r->descr);
+		goto fail;
+	}
 
 	if ((sa = addr2sa(&r->local_addr, 0, &len)) != NULL) {
 		if (bind(ce->fd, sa, len) == -1) {
@@ -1439,6 +1442,7 @@ bgpd_rtr_conn_setup(struct rtr_config *r)
  fail:
 	if (ce->fd != -1)
 		close(ce->fd);
+	pfkey_remove(&ce->auth_state);
 	free(ce);
 }
 
@@ -1488,6 +1492,7 @@ bgpd_rtr_conn_setup_done(int fd, struct bgpd_config *conf)
 
 fail:
 	close(fd);
+	pfkey_remove(&ce->auth_state);
 	free(ce);
 }
 

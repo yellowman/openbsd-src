@@ -137,7 +137,6 @@ struct xfrd_soa {
 	uint16_t type; /* = TYPE_SOA */
 	uint16_t klass; /* = CLASS_IN */
 	uint32_t ttl;
-	uint16_t rdata_count; /* = 7 */
 	/* format is 1 octet length, + wireformat dname.
 	   one more octet since parse_dname_wire_from_packet needs it.
 	   maximum size is allocated to avoid memory alloc/free. */
@@ -488,5 +487,9 @@ const char* xfrd_pretty_time(time_t v);
 xfrd_xfr_type *xfrd_prepare_zone_xfr(xfrd_zone_type *zone, uint16_t query_type);
 
 void xfrd_delete_zone_xfr(xfrd_zone_type *zone, xfrd_xfr_type *xfr);
+
+/* Find zone by name. */
+struct xfrd_zone* xfrd_find_zone(xfrd_state_type* xfrd,
+	const dname_type* dname);
 
 #endif /* XFRD_H */

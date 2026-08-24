@@ -1,4 +1,4 @@
-/*	$OpenBSD: pf.c,v 1.1236 2026/02/05 03:26:00 dlg Exp $ */
+/*	$OpenBSD: pf.c,v 1.1238 2026/08/19 07:54:41 sashan Exp $ */
 
 /*
  * Copyright (c) 2001 Daniel Hartmeier
@@ -756,16 +756,23 @@ pf_src_connlimit(struct pf_state **stp)
 {
 	int			 bad = 0;
 	struct pf_src_node	*sn;
+	u_int32_t		 sn_conn;
 
 	if ((sn = pf_get_src_node((*stp), PF_SN_NONE)) == NULL)
 		return (0);
 
-	sn->conn++;
+	/*
+	 * Note: conn limit is bumped on SYN_SENT->ESTBLISHED
+	 * state transition. packet does not hold any locks
+	 * when running here, therefore atomic is needed.
+	 */
+	sn_conn = atomic_inc_int_nv(&sn->conn);
+
 	(*stp)->src.tcp_est = 1;
 	pf_add_threshold(&sn->conn_rate);
 
 	if ((*stp)->rule.ptr->max_src_conn &&
-	    (*stp)->rule.ptr->max_src_conn < sn->conn) {
+	    (*stp)->rule.ptr->max_src_conn < sn_conn) {
 		pf_status.lcounters[LCNT_SRCCONN]++;
 		bad++;
 	}
@@ -2054,7 +2061,7 @@ pf_src_tree_remove_state(struct pf_state *st)
 	while ((sni = SLIST_FIRST(&st->src_nodes)) != NULL) {
 		SLIST_REMOVE_HEAD(&st->src_nodes, next);
 		if (st->src.tcp_est)
-			--sni->sn->conn;
+			atomic_dec_int(&sni->sn->conn);
 		if (--sni->sn->states == 0) {
 			timeout = st->rule.ptr->timeout[PFTM_SRC_NODE];
 			if (!timeout)
@@ -2122,16 +2129,24 @@ pf_remove_state(struct pf_state *st)
 		case PF_STATE_LINK_TYPE_SOURCELIM: {
 			struct pf_sourcelim *srlim;
 			struct pf_source key, *sr;
+			int sidx, kidx;
 
+			if (st->direction == PF_IN) {
+				sidx = 0;
+				kidx = PF_SK_WIRE;
+			} else {
+				sidx = 1;
+				kidx = PF_SK_STACK;
+			}
 			srlim = pf_sourcelim_find(st->sourcelim);
 			KASSERTMSG(srlim != NULL,
 			    "pf_state %p pfl %p cannot find sourcelim %u",
 			    st, pfl, st->sourcelim);
 
 			pf_source_key(srlim, &key,
-			    st->key[PF_SK_WIRE]->af,
-			    st->key[PF_SK_WIRE]->rdomain,
-			    &st->key[PF_SK_WIRE]->addr[0 /* XXX or 1? */]);
+			    st->key[kidx]->af,
+			    st->key[kidx]->rdomain,
+			    &st->key[kidx]->addr[sidx]);
 
 			sr = pf_source_find(srlim, &key);
 			KASSERTMSG(sr != NULL,

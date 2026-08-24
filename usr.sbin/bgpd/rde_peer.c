@@ -1,4 +1,4 @@
-/*	$OpenBSD: rde_peer.c,v 1.70 2026/03/02 12:08:30 claudio Exp $ */
+/*	$OpenBSD: rde_peer.c,v 1.81 2026/07/21 08:04:44 claudio Exp $ */
 
 /*
  * Copyright (c) 2019 Claudio Jeker <claudio@openbsd.org>
@@ -25,12 +25,6 @@
 
 #include "bgpd.h"
 #include "rde.h"
-
-struct rib_pq {
-	LIST_ENTRY(rib_pq)	entry;
-	struct prefix		*new;
-	uint32_t		old_pathid_tx;
-};
 
 struct peer_tree	 peertable = RB_INITIALIZER(&peertable);
 struct peer_tree	 zombietable = RB_INITIALIZER(&zombietable);
@@ -192,11 +186,11 @@ peer_add(uint32_t id, struct peer_config *p_conf, struct filter_head *rules)
 	do {
 		struct rde_peer *p;
 
+		while ((peer->path_id_tx = arc4random() << 1) == 0)
+			continue;
 		conflict = 0;
-		peer->path_id_tx = arc4random() << 1;
 		RB_FOREACH(p, peer_tree, &peertable) {
-			if (peer->path_id_tx == 0 ||
-			    p->path_id_tx == peer->path_id_tx) {
+			if (p->path_id_tx == peer->path_id_tx) {
 				conflict = 1;
 				break;
 			}
@@ -250,7 +244,7 @@ RB_GENERATE(peer_tree, rde_peer, entry, peer_cmp);
 
 static void
 peer_generate_update(struct rde_peer *peer, struct rib_entry *re,
-    struct prefix *newpath, uint32_t old_pathid_tx, enum eval_mode mode)
+    enum eval_mode mode)
 {
 	uint8_t		 aid;
 
@@ -275,79 +269,67 @@ peer_generate_update(struct rde_peer *peer, struct rib_entry *re,
 
 	/* handle peers with add-path */
 	if (peer_has_add_path(peer, aid, CAPA_AP_SEND)) {
-#if NOTYET
-		/* XXX skip addpath all optimisation for now until the queue
-		 * is extended to allow this mode to work again.
-		 * This mode is not very common and so taking the slow path
-		 * here like for all other addpath send modes is not that
-		 * big of an issue right now.
-		 */
-		if (peer->eval.mode == ADDPATH_EVAL_ALL) {
-			up_generate_addpath_all(peer, re, newpath,
-			    old_pathid_tx);
-			return;
-		}
-#endif
-		up_generate_addpath(peer, re);
+		if (peer->eval.mode == ADDPATH_EVAL_ALL)
+			up_generate_addpath_all(peer, re, mode);
+		else
+			up_generate_addpath(peer, re, mode);
 		return;
 	}
 
 	/* skip regular peers if the best path didn't change */
 	if (mode == EVAL_ALL && (peer->flags & PEERFLAG_EVALUATE_ALL) == 0)
 		return;
-	up_generate_updates(peer, re);
+	up_generate_updates(peer, re, mode);
 }
 
+/*
+ * Enqueue updates into the peer queue specified by peer. The meaning of
+ * mode is:
+ *	EVAL_DEFAULT is triggered when the best path changes.
+ *	EVAL_ALL is sent for any other update (needed for peers with
+ *	addpath or evaluate all set).
+ *	EVAL_REEVAL is used by config reloads (a full RIB refresh is needed)
+ *	EVAL_SYNC is used for single peer RIB dumps but those call
+ *	peer_generate_update() directly.
+ * peer, newpath and old_pathid_tx are ignored if mode is EVAL_REEVAL.
+ * In the other cases either newpath or old_pathid_tx are valid but not
+ * both at the same time.
+ */
 void
-rde_generate_updates(struct rib_entry *re, struct prefix *newpath,
-    uint32_t old_pathid_tx, enum eval_mode mode)
+rde_enqueue_updates(struct rib_entry *re, struct rde_peer *peer,
+    struct prefix *newpath, uint32_t old_path_id_tx, enum eval_mode mode)
 {
-	struct rde_peer	*peer;
+	struct rde_peer *p;
+	uint32_t path_id_tx;
 
 	switch (mode) {
-	case EVAL_RECONF:
+	case EVAL_REEVAL:
 		/* skip peers which don't need to reconfigure */
-		RB_FOREACH(peer, peer_tree, &peertable) {
-			if (peer->reconf_out == 0)
+		RB_FOREACH(p, peer_tree, &peertable) {
+			if (p->reconf_out == 0)
 				continue;
-			peer_generate_update(peer, re, NULL, 0, EVAL_RECONF);
+			peer_generate_update(p, re, mode);
 		}
+		adjout_prefix_collect(re->prefix);
 		return;
 	case EVAL_DEFAULT:
-		break;
 	case EVAL_ALL:
-		/*
-		 * EVAL_DEFAULT is triggered when a new best path is selected.
-		 * EVAL_ALL is sent for any other update (needed for peers with
-		 * addpath or evaluate all set).
-		 * There can be only one EVAL_DEFAULT queued, it replaces the
-		 * previous one. A flag is enough.
-		 * A path can only exist once in the queue (old or new).
-		 */
-		if (re->pq_mode == EVAL_DEFAULT)
-			/* already a best path update pending, nothing to do */
-			return;
-
 		break;
+	case EVAL_SYNC:
 	case EVAL_NONE:
 		fatalx("bad eval mode in %s", __func__);
 	}
 
-	if (re->pq_mode != EVAL_NONE) {
-		peer = peer_get(re->pq_peer_id);
-		TAILQ_REMOVE(&peer->rib_pq_head, re, rib_queue);
-		rdemem.rde_rib_entry_count--;
-		peer->stats.rib_entry_count--;
-	}
 	if (newpath != NULL)
-		peer = prefix_peer(newpath);
+		path_id_tx = newpath->path_id_tx;
 	else
-		peer = peerself;
-	re->pq_mode = mode;
-	re->pq_peer_id = peer->conf.id;
-	TAILQ_INSERT_TAIL(&peer->rib_pq_head, re, rib_queue);
-	rdemem.rde_rib_entry_count++;
-	peer->stats.rib_entry_count++;
+		path_id_tx = old_path_id_tx;
+
+	rib_pq_enqueue(re, peer, path_id_tx, newpath);
+
+	/* don't downgrade pq_mode from EVAL_DEFAULT to EVAL_ALL */
+	if (re->pq_mode != EVAL_DEFAULT)
+		re->pq_mode = mode;
 }
 
 void
@@ -355,7 +337,6 @@ peer_process_updates(struct rde_peer *peer, void *bula)
 {
 	struct rib_entry *re;
 	struct rde_peer *p;
-	enum eval_mode mode;
 
 	re = TAILQ_FIRST(&peer->rib_pq_head);
 	if (re == NULL)
@@ -364,12 +345,11 @@ peer_process_updates(struct rde_peer *peer, void *bula)
 	rdemem.rde_rib_entry_count--;
 	peer->stats.rib_entry_count--;
 
-	mode = re->pq_mode;
-
 	RB_FOREACH(p, peer_tree, &peertable)
-		peer_generate_update(p, re, NULL, 0, mode);
+		peer_generate_update(p, re, re->pq_mode);
 
-	rib_dequeue(re);
+	adjout_prefix_collect(re->prefix);
+	rib_pq_dequeue(re);
 }
 
 /*
@@ -428,7 +408,7 @@ peer_flush_upcall(struct rib_entry *re, void *arg)
 void
 peer_up(struct rde_peer *peer, struct session_up *sup)
 {
-	uint8_t	 i;
+	u_int	 i;
 	int force_sync = 1;
 
 	if (peer->state == PEER_ERR) {
@@ -512,10 +492,12 @@ peer_down(struct rde_peer *peer)
  * RIB walker callback for peer_delete / the reaper.
  */
 static void
-peer_reaper_upcall(struct rde_peer *peer, struct pt_entry *pte,
-    struct adjout_prefix *p, void *ptr)
+peer_reaper_upcall(struct pt_entry *pte, struct adjout_prefix *p,
+    uint32_t bid, void *ptr)
 {
-	adjout_prefix_withdraw(peer, pte, p);
+	struct rde_peer		*peer = ptr;
+
+	adjout_prefix_withdraw(peer, pte, p, 1);
 }
 
 /*
@@ -568,7 +550,7 @@ peer_flush(struct rde_peer *peer, uint8_t aid, monotime_t staletime)
 
 	/* every route is gone so reset staletime */
 	if (aid == AID_UNSPEC) {
-		uint8_t i;
+		u_int i;
 		for (i = AID_MIN; i < AID_MAX; i++)
 			peer->staletime[i] = monotime_clear();
 	} else {
@@ -616,9 +598,11 @@ peer_stale(struct rde_peer *peer, uint8_t aid, int flushall)
  * Enqueue a prefix onto the update queue so it can be sent out.
  */
 static void
-peer_blast_upcall(struct rde_peer *peer, struct pt_entry *pte,
-    struct adjout_prefix *p, void *ptr)
+peer_blast_upcall(struct pt_entry *pte, struct adjout_prefix *p,
+    uint32_t bid, void *ptr)
 {
+	struct rde_peer		*peer = ptr;
+
 	pend_prefix_add(peer, p->attrs, pte, p->path_id_tx);
 }
 
@@ -664,7 +648,8 @@ peer_dump_upcall(struct rib_entry *re, void *ptr)
 		/* no eligible prefix, not even for 'evaluate all' */
 		return;
 
-	peer_generate_update(peer, re, NULL, 0, EVAL_DEFAULT);
+	peer_generate_update(peer, re, EVAL_SYNC);
+	adjout_prefix_collect(re->prefix);
 }
 
 static void
@@ -685,10 +670,10 @@ peer_dump(struct rde_peer *peer, uint8_t aid)
 	peer->throttled = 1;
 
 	if (peer->export_type == EXPORT_NONE) {
-		peer_blast(peer, aid);
+		peer_dump_done(peer, aid);
 	} else if (peer->export_type == EXPORT_DEFAULT_ROUTE) {
 		up_generate_default(peer, aid);
-		peer_blast(peer, aid);
+		peer_dump_done(peer, aid);
 	} else if (aid == AID_FLOWSPECv4 || aid == AID_FLOWSPECv6) {
 		prefix_flowspec_dump(aid, peer, peer_dump_upcall,
 		    peer_dump_done);

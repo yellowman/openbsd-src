@@ -1,4 +1,4 @@
-/*	$OpenBSD: pfctl.c,v 1.401 2026/03/13 11:13:38 sashan Exp $ */
+/*	$OpenBSD: pfctl.c,v 1.405 2026/07/10 06:28:43 sashan Exp $ */
 
 /*
  * Copyright (c) 2001 Daniel Hartmeier
@@ -135,13 +135,13 @@ int	pfctl_call_cleartables(int, int, struct pfr_anchoritem *);
 int	pfctl_call_clearanchors(int, int, struct pfr_anchoritem *);
 int	pfctl_call_showtables(int, int, struct pfr_anchoritem *);
 
-RBT_PROTOTYPE(pfctl_statelim_ids, pfctl_statelim, entry,
+RBT_PROTOTYPE(pfctl_statelim_ids, pfctl_statelim, id_entry,
     pfctl_statelim_id_cmp);
-RBT_PROTOTYPE(pfctl_statelim_nms, pfctl_statelim, entry,
+RBT_PROTOTYPE(pfctl_statelim_nms, pfctl_statelim, nm_entry,
     pfctl_statelim_nm_cmp);
-RBT_PROTOTYPE(pfctl_sourcelim_ids, pfctl_sourcelim, entry,
+RBT_PROTOTYPE(pfctl_sourcelim_ids, pfctl_sourcelim, id_entry,
     pfctl_sourcelim_id_cmp);
-RBT_PROTOTYPE(pfctl_sourcelim_nms, pfctl_sourcelim, entry,
+RBT_PROTOTYPE(pfctl_sourcelim_nms, pfctl_sourcelim, nm_entry,
     pfctl_sourcelim_nm_cmp);
 
 enum showopt_id {
@@ -1231,7 +1231,7 @@ pfctl_show_rules(struct pfctl *pf, char *path, enum pfctl_show format,
 	struct pfioc_rule pr;
 	u_int32_t header = 0;
 	int len = strlen(path), ret = 0;
-	char *npath, *p;
+	char *npath = NULL, *p;
 
 	if (depth > PF_ANCHOR_STACK_MAX) {
 		warnx("%s: max stack depth exceeded for %s", __func__, path);
@@ -1769,6 +1769,8 @@ pfctl_load_queues(struct pfctl *pf)
 
 	if ((pf->opts & PF_OPT_NOACTION) == 0)
 		ticket = pfctl_get_ticket(pf->trans, PF_TRANS_RULESET, "");
+	else
+		ticket = 0;
 
 	TAILQ_FOREACH_SAFE(qi, &rootqs, entries, tempqi) {
 		TAILQ_REMOVE(&rootqs, qi, entries);
@@ -3337,6 +3339,7 @@ main(int argc, char *argv[])
 		pfctl_show_limits(dev, opts);
 		break;
 	case SHOWOPT_ALL:
+		opts |= PF_OPT_SHOWALL;
 		pfctl_init_show_rules(&show_rules_pf, dev, opts);
 		pfctl_load_fingerprints(dev, opts);
 		pfctl_show_rules(&show_rules_pf, path, PFCTL_SHOW_RULES,
@@ -3557,7 +3560,8 @@ pfctl_statelim_id_cmp(const struct pfctl_statelim *a,
 	return (0);
 }
 
-RBT_GENERATE(pfctl_statelim_ids, pfctl_statelim, entry, pfctl_statelim_id_cmp);
+RBT_GENERATE(pfctl_statelim_ids, pfctl_statelim, id_entry,
+    pfctl_statelim_id_cmp);
 
 static inline int
 pfctl_statelim_nm_cmp(const struct pfctl_statelim *a,
@@ -3566,7 +3570,8 @@ pfctl_statelim_nm_cmp(const struct pfctl_statelim *a,
 	return (strcmp(a->ioc.name, b->ioc.name));
 }
 
-RBT_GENERATE(pfctl_statelim_nms, pfctl_statelim, entry, pfctl_statelim_nm_cmp);
+RBT_GENERATE(pfctl_statelim_nms, pfctl_statelim, nm_entry,
+    pfctl_statelim_nm_cmp);
 
 int
 pfctl_add_statelim(struct pfctl *pf, struct pfctl_statelim *stlim)
@@ -3623,7 +3628,7 @@ pfctl_sourcelim_id_cmp(const struct pfctl_sourcelim *a,
 	return (0);
 }
 
-RBT_GENERATE(pfctl_sourcelim_ids, pfctl_sourcelim, entry,
+RBT_GENERATE(pfctl_sourcelim_ids, pfctl_sourcelim, id_entry,
     pfctl_sourcelim_id_cmp);
 
 static inline int
@@ -3633,7 +3638,7 @@ pfctl_sourcelim_nm_cmp(const struct pfctl_sourcelim *a,
 	return (strcmp(a->ioc.name, b->ioc.name));
 }
 
-RBT_GENERATE(pfctl_sourcelim_nms, pfctl_sourcelim, entry,
+RBT_GENERATE(pfctl_sourcelim_nms, pfctl_sourcelim, nm_entry,
     pfctl_sourcelim_nm_cmp);
 
 int
@@ -3642,8 +3647,9 @@ pfctl_add_sourcelim(struct pfctl *pf, struct pfctl_sourcelim *srlim)
 	struct pfctl_sourcelim *osrlim;
 
 	osrlim = RBT_INSERT(pfctl_sourcelim_ids, &pf->sourcelim_ids, srlim);
-	if (osrlim != NULL)
+	if (osrlim != NULL) {
 		return (-1);
+	}
 
 	osrlim = RBT_INSERT(pfctl_sourcelim_nms, &pf->sourcelim_nms, srlim);
 	if (osrlim != NULL) {

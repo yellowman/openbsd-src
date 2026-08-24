@@ -1,4 +1,4 @@
-/*	$OpenBSD: qwzvar.h,v 1.12 2025/07/07 00:55:15 jsg Exp $	*/
+/*	$OpenBSD: qwzvar.h,v 1.18 2026/05/26 14:55:16 kirill Exp $	*/
 
 /*
  * Copyright (c) 2018-2019 The Linux Foundation.
@@ -141,6 +141,8 @@ struct hal_tx_info {
 	uint8_t dscp_tid_tbl_idx;
 	bool enable_mesh;
 	uint8_t rbm_id;
+	uint8_t bank_id;	/* WCN7850/WiFi7: pre-configured TX bank index */
+	uint8_t vdev_id;	/* WCN7850/WiFi7: VDEV ID in tcl_data_cmd info3 */
 };
 
 /* TODO: Check if the actual desc macros can be used instead */
@@ -257,6 +259,7 @@ struct ath12k_hw_params {
 	bool tcl_ring_retry;
 #endif
 	uint32_t tx_ring_size;
+	uint32_t rddm_size;
 	bool smp2p_wow_exit;
 };
 
@@ -280,9 +283,9 @@ struct hal_rx_ops {
 #ifdef notyet
 	uint8_t (*rx_desc_get_mesh_ctl)(struct hal_rx_desc *desc);
 	bool (*rx_desc_get_mpdu_seq_ctl_vld)(struct hal_rx_desc *desc);
-	bool (*rx_desc_get_mpdu_fc_valid)(struct hal_rx_desc *desc);
 	uint16_t (*rx_desc_get_mpdu_start_seq_no)(struct hal_rx_desc *desc);
 #endif
+	bool (*rx_desc_get_mpdu_fc_valid)(struct hal_rx_desc *desc);
 	uint16_t (*rx_desc_get_msdu_len)(struct hal_rx_desc *desc);
 #ifdef notyet
 	uint8_t (*rx_desc_get_msdu_sgi)(struct hal_rx_desc *desc);
@@ -1102,6 +1105,7 @@ struct ath12k_rx_desc_info {
 	uint32_t magic;
 	uint8_t in_use		: 1,
 	        reserved	: 7;
+	struct qwz_rx_msdu rx_msdu;
 };
 
 struct ath12k_tx_desc_info {
@@ -1121,7 +1125,7 @@ struct ath12k_spt_info {
 
 struct dp_rx_tid {
 	uint8_t tid;
-	struct qwz_dmamem *mem;
+	const struct qwz_dmamem *mem;
 	uint32_t *vaddr;
 	uint64_t paddr;
 	uint32_t size;
@@ -1287,6 +1291,17 @@ struct qwz_dp {
 	struct dp_srng rx_mac_buf_ring[MAX_RXDMA_PER_PDEV];
 	struct dp_srng rxdma_err_dst_ring[MAX_RXDMA_PER_PDEV];
 	struct dp_rxdma_mon_ring rxdma_mon_buf_ring;
+
+	/*
+	 * Cache of DMA memory regions used for Rx aggregation.
+	 * We used to free these DMA allocations in interrupt context but
+	 * destroying DMA memory in interrupt context is not allowed.
+	 *
+	 * This array contains enough entries for client station mode.
+	 * It will need to grow in order to support multiple clients if
+	 * support for HostAP mode gets added to the driver.
+	 */
+	struct qwz_dmamem *rx_tid_mem[HAL_DESC_REO_NON_QOS_TID + 1];
 };
 
 #define ATH12K_SHADOW_DP_TIMER_INTERVAL 20
@@ -1378,6 +1393,7 @@ struct qwz_wmi_base {
 	uint32_t max_msg_len[QWZ_MAX_RADIOS];
 	int service_ready;
 	int unified_ready;
+	int hw_mode_ready;
 	uint8_t svc_map[howmany(WMI_MAX_EXT2_SERVICE, 8)];
 	int tx_credits;
 	const struct wmi_peer_flags_map *peer_flags;
@@ -1796,6 +1812,7 @@ struct qwz_vif {
 	uint16_t tcl_metadata;
 	uint8_t hal_addr_search_flags;
 	uint8_t search_type;
+	int8_t bank_id;	/* WCN7850/WiFi7 TX bank profile id, -1 if unset */
 
 	struct qwz_softc *sc;
 
@@ -1893,6 +1910,11 @@ struct qwz_setkey_task_arg {
 #define QWZ_DEL_KEY	2
 };
 
+struct qwz_ba_task_data {
+	uint32_t		start_tidmask;
+	uint32_t		stop_tidmask;
+};
+
 struct qwz_softc {
 	struct device			sc_dev;
 	struct ieee80211com		sc_ic;
@@ -1927,6 +1949,10 @@ struct qwz_softc {
 	int install_key_done;
 	int install_key_status;
 
+	/* Task for firmware BlockAck setup/teardown and its arguments. */
+	struct task		ba_task;
+	struct qwz_ba_task_data	ba_rx;
+
 	enum ath12k_11d_state	state_11d;
 	int			completed_11d_scan;
 	uint32_t		vdev_id_11d_scan;
@@ -1945,6 +1971,7 @@ struct qwz_softc {
 	struct qwz_survey_info	survey[IEEE80211_CHAN_MAX];
 
 	int			attached;
+	int			fw_initialized;
 	struct {
 		u_char *data;
 		size_t size;
@@ -1976,6 +2003,8 @@ struct qwz_softc {
 
 	uint16_t			qmi_txn_id;
 	int				qmi_cal_done;
+	int				single_chip_mlo_support;
+	uint8_t				qmi_phy_cap_num_phy;
 	struct qwz_qmi_ce_cfg		qmi_ce_cfg;
 	struct qwz_qmi_target_info	qmi_target;
 	struct qwz_qmi_dev_mem_info	qmi_dev_mem[ATH12K_QMI_WLFW_MAX_DEV_MEM_NUM_V01];
@@ -2141,6 +2170,12 @@ int	qwz_set_key(struct ieee80211com *, struct ieee80211_node *,
     struct ieee80211_key *);
 void	qwz_delete_key(struct ieee80211com *, struct ieee80211_node *,
     struct ieee80211_key *);
+int	qwz_ampdu_rx_start(struct ieee80211com *, struct ieee80211_node *,
+	    uint8_t);
+void	qwz_ampdu_rx_stop(struct ieee80211com *, struct ieee80211_node *,
+	    uint8_t);
+int	qwz_ampdu_tx_start(struct ieee80211com *, struct ieee80211_node *,
+	    uint8_t);
 
 void	qwz_qrtr_recv_msg(struct qwz_softc *, struct mbuf *);
 

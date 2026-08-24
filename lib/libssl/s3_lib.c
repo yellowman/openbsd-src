@@ -1,4 +1,4 @@
-/* $OpenBSD: s3_lib.c,v 1.258 2025/12/04 21:16:17 beck Exp $ */
+/* $OpenBSD: s3_lib.c,v 1.262 2026/08/21 17:15:22 tb Exp $ */
 /* Copyright (C) 1995-1998 Eric Young (eay@cryptsoft.com)
  * All rights reserved.
  *
@@ -722,7 +722,7 @@ const SSL_CIPHER ssl3_ciphers[] = {
 
 #ifdef LIBRESSL_HAS_TLS1_3
 	/*
-	 * TLSv1.3 cipher suites (RFC 8446).
+	 * TLSv1.3 cipher suites (RFC 9846).
 	 */
 	{
 		.value = 0x1301,
@@ -1163,13 +1163,6 @@ ssl3_pending(const SSL *s)
 }
 
 int
-ssl3_handshake_msg_hdr_len(SSL *s)
-{
-	return (SSL_is_dtls(s) ? DTLS1_HM_HEADER_LENGTH :
-            SSL3_HM_HEADER_LENGTH);
-}
-
-int
 ssl3_handshake_msg_start(SSL *s, CBB *handshake, CBB *body, uint8_t msg_type)
 {
 	int ret = 0;
@@ -1216,18 +1209,8 @@ ssl3_handshake_msg_finish(SSL *s, CBB *handshake)
 	s->init_off = 0;
 
 	if (SSL_is_dtls(s)) {
-		unsigned long len;
-		uint8_t msg_type;
-		CBS cbs;
-
-		CBS_init(&cbs, data, outlen);
-		if (!CBS_get_u8(&cbs, &msg_type))
+		if (!dtls12_handshake_msg_built(s))
 			goto err;
-
-		len = outlen - ssl3_handshake_msg_hdr_len(s);
-
-		dtls1_set_message_header(s, msg_type, len, 0, len);
-		dtls1_buffer_message(s, 0);
 	}
 
 	ret = 1;
@@ -1396,7 +1379,7 @@ ssl3_clear(SSL *s)
 	s->s3->hs.state = SSL_ST_BEFORE|((s->server) ? SSL_ST_ACCEPT : SSL_ST_CONNECT);
 }
 
-long
+static long
 _SSL_get_shared_group(SSL *s, long n)
 {
 	size_t count;
@@ -1429,7 +1412,7 @@ _SSL_get_shared_group(SSL *s, long n)
 	return nid;
 }
 
-long
+static long
 _SSL_get_peer_tmp_key(SSL *s, EVP_PKEY **key)
 {
 	EVP_PKEY *pkey = NULL;

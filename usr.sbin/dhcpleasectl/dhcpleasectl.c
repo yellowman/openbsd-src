@@ -1,4 +1,4 @@
-/*	$OpenBSD: dhcpleasectl.c,v 1.13 2024/11/21 13:38:14 claudio Exp $	*/
+/*	$OpenBSD: dhcpleasectl.c,v 1.15 2026/07/27 13:30:08 claudio Exp $	*/
 
 /*
  * Copyright (c) 2021 Florian Obser <florian@openbsd.org>
@@ -179,8 +179,8 @@ main(int argc, char *argv[])
 		if (n == 0)
 			errx(1, "pipe closed");
 
-		if ((n = imsg_get(ibuf, &imsg)) == -1)
-			errx(1, "imsg_get error");
+		if ((n = imsgbuf_get(ibuf, &imsg)) == -1)
+			errx(1, "imsgbuf_get error");
 		if (n == 0)
 			break;
 
@@ -221,7 +221,7 @@ show_interface_msg(struct ctl_engine_info *cei)
 {
 	struct timespec		 now, diff;
 	time_t			 d, h, m, s;
-	int			 i;
+	uint32_t		 i;
 	char			 buf[IF_NAMESIZE], *bufp;
 	char			 ipbuf[INET_ADDRSTRLEN];
 	char			 maskbuf[INET_ADDRSTRLEN];

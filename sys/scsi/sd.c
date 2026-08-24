@@ -1,4 +1,4 @@
-/*	$OpenBSD: sd.c,v 1.341 2025/11/17 14:27:43 jsg Exp $	*/
+/*	$OpenBSD: sd.c,v 1.343 2026/06/24 17:03:06 krw Exp $	*/
 /*	$NetBSD: sd.c,v 1.111 1997/04/02 02:29:41 mycroft Exp $	*/
 
 /*-
@@ -74,8 +74,6 @@
 #include <scsi/scsi_disk.h>
 #include <scsi/scsiconf.h>
 #include <scsi/sdvar.h>
-
-#include <ufs/ffs/fs.h>			/* for BBSIZE and SBSIZE */
 
 #include <sys/vnode.h>
 
@@ -890,12 +888,6 @@ sdioctl(dev_t dev, u_long cmd, caddr_t addr, int flag, struct proc *p)
 
 	case DIOCGDINFO:
 		*(struct disklabel *)addr = *(sc->sc_dk.dk_label);
-		goto exit;
-
-	/* XXX temporary to support the transition to more partitions */
-	case O_DIOCGDINFO:
-		/* truncate the buffer, good enough */
-		bcopy(sc->sc_dk.dk_label, addr, O_disklabel);
 		goto exit;
 
 	case DIOCGPART:
