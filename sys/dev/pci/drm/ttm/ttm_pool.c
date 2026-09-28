@@ -658,7 +658,7 @@ static void ttm_pool_allocated_page_commit(struct vm_page *allocated,
  * if successful, populate the page-table and dma-address arrays.
  */
 static int ttm_pool_restore_commit(struct ttm_pool_tt_restore *restore,
-				   struct file *backup,
+				   struct uvm_object *backup,
 				   const struct ttm_operation_ctx *ctx,
 				   struct ttm_pool_alloc_state *alloc)
 
@@ -811,7 +811,7 @@ static void ttm_pool_free_range(struct ttm_pool *pool, struct ttm_tt *tt,
 				pgoff_t start_page, pgoff_t end_page)
 {
 	struct vm_page **pages = &tt->pages[start_page];
-	struct file *backup = tt->backup;
+	struct uvm_object *backup = tt->backup;
 	pgoff_t i, nr;
 
 	for (i = start_page; i < end_page; i += nr, pages += nr) {
@@ -995,40 +995,51 @@ EXPORT_SYMBOL(ttm_pool_alloc);
 int ttm_pool_restore_and_alloc(struct ttm_pool *pool, struct ttm_tt *tt,
 			       const struct ttm_operation_ctx *ctx)
 {
+	struct ttm_pool_tt_restore *restore = tt->restore;
 	struct ttm_pool_alloc_state alloc;
+	int ret;
 
 	if (WARN_ON(!ttm_tt_is_backed_up(tt)))
 		return -EINVAL;
 
-	if (!tt->restore) {
+	if (!restore) {
 		gfp_t gfp = GFP_KERNEL | __GFP_NOWARN;
 
 		ttm_pool_alloc_state_init(tt, &alloc);
 		if (ctx->gfp_retry_mayfail)
 			gfp |= __GFP_RETRY_MAYFAIL;
 
-		tt->restore = kzalloc(sizeof(*tt->restore), gfp);
-		if (!tt->restore)
+		restore = kzalloc(sizeof(*restore), gfp);
+		if (!restore)
 			return -ENOMEM;
 
-		tt->restore->snapshot_alloc = alloc;
-		tt->restore->pool = pool;
-		tt->restore->restored_pages = 1;
-	} else {
-		struct ttm_pool_tt_restore *restore = tt->restore;
-		int ret;
+		restore->snapshot_alloc = alloc;
+		restore->pool = pool;
+		restore->restored_pages = 1;
 
+		tt->restore = restore;
+	} else {
 		alloc = restore->snapshot_alloc;
-		if (ttm_pool_restore_valid(tt->restore)) {
-			ret = ttm_pool_restore_commit(restore, tt->backup, ctx, &alloc);
+		if (ttm_pool_restore_valid(restore)) {
+			ret = ttm_pool_restore_commit(restore, tt->backup,
+						      ctx, &alloc);
+
 			if (ret)
 				return ret;
 		}
-		if (!alloc.remaining_pages)
+		if (!alloc.remaining_pages) {
+			ret = ttm_pool_apply_caching(&alloc);
+			if (ret)
+				return ret;
+
+			kfree(tt->restore);
+			tt->restore = NULL;
+
 			return 0;
+		}
 	}
 
-	return __ttm_pool_alloc(pool, tt, ctx, &alloc, tt->restore);
+	return __ttm_pool_alloc(pool, tt, ctx, &alloc, restore);
 }
 
 /**
@@ -1123,7 +1134,7 @@ void ttm_pool_drop_backed_up(struct ttm_tt *tt)
 long ttm_pool_backup(struct ttm_pool *pool, struct ttm_tt *tt,
 		     const struct ttm_backup_flags *flags)
 {
-	struct file *backup = tt->backup;
+	struct uvm_object *backup = tt->backup;
 	struct vm_page *page;
 	unsigned long handle;
 	gfp_t alloc_gfp;

@@ -1,4 +1,4 @@
-/*	$OpenBSD: vionet.c,v 1.32 2026/08/04 19:12:14 claudio Exp $	*/
+/*	$OpenBSD: vionet.c,v 1.38 2026/09/22 23:29:58 dv Exp $	*/
 
 /*
  * Copyright (c) 2023 Dave Voutila <dv@openbsd.org>
@@ -17,12 +17,18 @@
  * OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
  */
 #include <sys/types.h>
+#include <sys/ioctl.h>
 
 #include <dev/pci/virtio_pcireg.h>
 #include <dev/pv/virtioreg.h>
 
 #include <net/if.h>
+#include <net/if_tun.h>
 #include <netinet/in.h>
+#include <netinet/ip.h>
+#include <netinet/ip6.h>
+#include <netinet/tcp.h>
+#include <netinet/udp.h>
 #include <netinet/if_ether.h>
 
 #include <errno.h>
@@ -50,6 +56,7 @@
 
 #define VIRTIO_NET_CONFIG_MAC		 0 /*  8 bit x 6 byte */
 
+#define VIRTIO_NET_F_GUEST_CSUM	(1 << 1)
 #define VIRTIO_NET_F_MAC	(1 << 5)
 #define RXQ	0
 #define TXQ	1
@@ -65,7 +72,7 @@ static void *rx_run_loop(void *);
 static void *tx_run_loop(void *);
 static int vionet_rx(struct virtio_dev *, int);
 static ssize_t vionet_rx_copy(struct vionet_dev *, int, const struct iovec *,
-    int, size_t);
+    int, size_t, struct tun_hdr *th);
 static ssize_t vionet_rx_zerocopy(struct vionet_dev *, int,
     const struct iovec *, int);
 static void vionet_rx_event(int, short, void *);
@@ -82,8 +89,12 @@ static void handle_sync_io(int, short, void *);
 static void read_pipe_main(int, short, void *);
 static void read_pipe_rx(int, short, void *);
 static void read_pipe_tx(int, short, void *);
-static void vionet_assert_pic_irq(struct virtio_dev *);
+static void vionet_assert_irq(struct virtio_dev *, uint16_t);
 static void vionet_deassert_pic_irq(struct virtio_dev *);
+static void vhdr2thdr(struct virtio_net_hdr *, struct tun_hdr *,
+    const struct iovec *, int);
+static void thdr2vhdr(struct tun_hdr *, struct virtio_net_hdr *,
+    const struct iovec *, int);
 
 /* Device Globals */
 struct event ev_tap;
@@ -105,7 +116,7 @@ pthread_rwlock_t lock = NULL;		/* Guards device config state. */
 int rx_enabled = 0;	/* 1: we expect to read the tap, 0: wait for notify. */
 
 __dead void
-vionet_main(int fd, int fd_vmm)
+vionet_main(int fd, int vm_fd)
 {
 	struct virtio_dev	 dev;
 	struct vionet_dev	*vionet = NULL;
@@ -141,8 +152,8 @@ vionet_main(int fd, int fd_vmm)
 	vionet = &dev.vionet;
 
 	log_debug("%s: got vionet dev. tap fd = %d, syncfd = %d, asyncfd = %d"
-	    ", vmm fd = %d", __func__, vionet->data_fd, dev.sync_fd,
-	    dev.async_fd, fd_vmm);
+	    ", vm fd = %d", __func__, vionet->data_fd, dev.sync_fd,
+	    dev.async_fd, vm_fd);
 
 	/* Receive our vm information from the vm process. */
 	memset(&vm, 0, sizeof(vm));
@@ -157,16 +168,16 @@ vionet_main(int fd, int fd_vmm)
 	log_procinit("vm/%s/vionet%d", vm.vm_params.vmc_name, vionet->idx);
 
 	/* Now that we have our vm information, we can remap memory. */
-	ret = remap_guest_mem(&vm, fd_vmm);
+	ret = remap_guest_mem(&vm, vm_fd);
 	if (ret) {
 		fatal("%s: failed to remap", __func__);
 		goto fail;
 	}
 
 	/*
-	 * We no longer need /dev/vmm access.
+	 * We no longer need VM fd access.
 	 */
-	close_fd(fd_vmm);
+	close_fd(vm_fd);
 	if (pledge("stdio", NULL) == -1)
 		fatal("pledge2");
 
@@ -299,6 +310,31 @@ fail:
 }
 
 /*
+ * Update and sync offload features with tap(4).
+ */
+static void
+vionet_update_offload(struct virtio_dev *dev)
+{
+	struct viodev_msg	msg;
+	int			ret;
+
+	memset(&msg, 0, sizeof(msg));
+	msg.irq = dev->irq;
+	msg.type = VIODEV_MSG_TUNSCAP;
+
+	if (dev->driver_feature & VIRTIO_NET_F_GUEST_CSUM) {
+		msg.data |= IFCAP_CSUM_TCPv4 | IFCAP_CSUM_UDPv4;
+		msg.data |= IFCAP_CSUM_TCPv6 | IFCAP_CSUM_UDPv6;
+	}
+
+	ret = imsg_compose_event2(&dev->async_iev, IMSG_DEVOP_MSG, 0, 0, -1,
+	    &msg, sizeof(msg), ev_base_main);
+	if (ret == -1)
+		log_warnx("%s: failed to assert irq %d", __func__, dev->irq);
+}
+
+
+/*
  * vionet_rx
  *
  * Pull packet from the provided fd and fill the receive-side virtqueue. We
@@ -320,6 +356,7 @@ vionet_rx(struct virtio_dev *dev, int fd)
 	struct virtio_net_hdr *hdr = NULL;
 	struct virtio_vq_info *vq_info;
 	struct iovec *iov;
+	struct tun_hdr th;
 	int notify = 0;
 	ssize_t sz;
 	uint8_t status = 0;
@@ -333,13 +370,14 @@ vionet_rx(struct virtio_dev *dev, int fd)
 	vq_info = &dev->vq[RXQ];
 	idx = vq_info->last_avail;
 	vr = vq_info->q_hva;
-	if (vr == NULL)
+	if (vr == NULL || vq_info->q_avail_hva == NULL ||
+	    vq_info->q_used_hva == NULL)
 		fatalx("%s: vr == NULL", __func__);
 
-	/* Compute offsets in ring of descriptors, avail ring, and used ring */
+	/* Locate the independently mapped split virtqueue areas. */
 	table = (struct vring_desc *)(vr);
-	avail = (struct vring_avail *)(vr + vq_info->vq_availoffset);
-	used = (struct vring_used *)(vr + vq_info->vq_usedoffset);
+	avail = vq_info->q_avail_hva;
+	used = vq_info->q_used_hva;
 	used->flags |= VRING_USED_F_NO_NOTIFY;
 
 	while (idx != avail->idx) {
@@ -350,8 +388,8 @@ vionet_rx(struct virtio_dev *dev, int fd)
 			goto reset;
 		}
 
-		iov = &iov_rx[0];
-		iov_cnt = 1;
+		iov = &iov_rx[1];
+		iov_cnt = 2;
 
 		/*
 		 * First descriptor should be at least as large as the
@@ -372,7 +410,6 @@ vionet_rx(struct virtio_dev *dev, int fd)
 		if (iov->iov_base == NULL)
 			goto reset;
 		hdr = iov->iov_base;
-		memset(hdr, 0, sizeof(struct virtio_net_hdr));
 
 		/* Tweak the iovec to account for the virtio_net_hdr. */
 		iov->iov_len -= sizeof(struct virtio_net_hdr);
@@ -417,21 +454,24 @@ vionet_rx(struct virtio_dev *dev, int fd)
 			goto reset;
 		}
 
-		hdr->num_buffers = iov_cnt;
-
 		/*
 		 * If we're enforcing hardware address or handling an injected
 		 * packet, we need to use a copy-based approach.
 		 */
+		iov_rx[0].iov_base = &th;
+		iov_rx[0].iov_len = sizeof(th);
 		if (vionet->lockedmac || fd != vionet->data_fd)
-			sz = vionet_rx_copy(vionet, fd, iov_rx, iov_cnt,
-			    chain_len);
+			sz = vionet_rx_copy(vionet, fd, iov_rx + 1, iov_cnt - 1,
+			    chain_len, &th);
 		else
 			sz = vionet_rx_zerocopy(vionet, fd, iov_rx, iov_cnt);
 		if (sz == -1)
 			goto reset;
 		if (sz == 0)	/* No packets, so bail out for now. */
 			break;
+
+		thdr2vhdr(&th, hdr, iov_rx + 1, iov_cnt - 1);
+		hdr->num_buffers = iov_cnt - 1;
 
 		/*
 		 * Account for the prefixed header since it wasn't included
@@ -465,16 +505,16 @@ reset:
  * characteristics, and copy into the provided buffers in the iovec array.
  *
  * It's assumed that the provided iovec array contains validated host virtual
- * address translations and not guest physical addreses.
+ * address translations and not guest physical addresses.
  *
  * Returns number of bytes copied on success, 0 if packet is dropped, and
  * -1 on an error.
  */
 ssize_t
 vionet_rx_copy(struct vionet_dev *dev, int fd, const struct iovec *iov,
-    int iov_cnt, size_t chain_len)
+    int iov_cnt, size_t chain_len, struct tun_hdr *th)
 {
-	static uint8_t		 buf[VIONET_HARD_MTU];
+	static uint8_t		 buf[sizeof(struct tun_hdr) + VIONET_HARD_MTU];
 	struct packet		*pkt = NULL;
 	struct ether_header	*eh = NULL;
 	uint8_t			*payload = buf;
@@ -483,7 +523,8 @@ vionet_rx_copy(struct vionet_dev *dev, int fd, const struct iovec *iov,
 
 	/* If reading from the tap(4), try to right-size the read. */
 	if (fd == dev->data_fd)
-		nbytes = MIN(chain_len, VIONET_HARD_MTU);
+		nbytes = sizeof(struct tun_hdr) +
+		    MIN(chain_len, VIONET_HARD_MTU);
 	else if (fd == pipe_inject[READ])
 		nbytes = sizeof(struct packet);
 	else {
@@ -503,10 +544,20 @@ vionet_rx_copy(struct vionet_dev *dev, int fd, const struct iovec *iov,
 			return (-1);
 		}
 		return (0);
-	} else if (fd == dev->data_fd && sz < VIONET_MIN_TXLEN) {
+	} else if (fd == dev->data_fd) {
+		if ((size_t)sz < sizeof(struct tun_hdr)) {
+			log_warnx("%s: short tun_hdr", __func__);
+			return (0);
+		}
+		memcpy(th, payload, sizeof *th);
+		payload += sizeof(struct tun_hdr);
+		sz -= sizeof(struct tun_hdr);
+
 		/* If reading the tap(4), we should get valid ethernet. */
-		log_warnx("%s: invalid packet size", __func__);
-		return (0);
+		if (sz < VIONET_MIN_TXLEN) {
+			log_warnx("%s: invalid packet size", __func__);
+			return (0);
+		}
 	} else if (fd == pipe_inject[READ] && sz != sizeof(struct packet)) {
 		log_warnx("%s: invalid injected packet object (sz=%ld)",
 		    __func__, sz);
@@ -525,6 +576,7 @@ vionet_rx_copy(struct vionet_dev *dev, int fd, const struct iovec *iov,
 			log_warnx("%s: invalid injected packet size", __func__);
 			goto drop;
 		}
+		memset(th, 0, sizeof *th);
 		payload = pkt->buf;
 		sz = (ssize_t)pkt->len;
 	}
@@ -584,6 +636,12 @@ vionet_rx_zerocopy(struct vionet_dev *dev, int fd, const struct iovec *iov,
 	sz = readv(fd, iov, iov_cnt);
 	if (sz == -1 && errno == EAGAIN)
 		return (0);
+
+	if ((size_t)sz < sizeof(struct tun_hdr))
+		return (0);
+
+	sz -= sizeof(struct tun_hdr);
+
 	return (sz);
 }
 
@@ -630,7 +688,8 @@ vionet_rx_event(int fd, short event, void *arg)
 	pthread_rwlock_unlock(&lock);
 
 	if (raise_irq)
-		vm_pipe_send(&pipe_main, VIRTIO_RAISE_IRQ);
+		vm_pipe_send(&pipe_main, ret == 1 ? VIRTIO_RAISE_IRQ_RX :
+		    VIRTIO_RAISE_IRQ_CONFIG);
 }
 
 static void
@@ -671,6 +730,8 @@ vionet_tx(struct virtio_dev *dev)
 	struct ether_header *eh;
 	struct iovec *iov;
 	struct packet pkt;
+	struct virtio_net_hdr *vhp;
+	struct tun_hdr th;
 	uint8_t status = 0;
 
 	status = dev->status & VIRTIO_CONFIG_DEVICE_STATUS_DRIVER_OK;
@@ -682,13 +743,14 @@ vionet_tx(struct virtio_dev *dev)
 	vq_info = &dev->vq[TXQ];
 	idx = vq_info->last_avail;
 	vr = vq_info->q_hva;
-	if (vr == NULL)
+	if (vr == NULL || vq_info->q_avail_hva == NULL ||
+	    vq_info->q_used_hva == NULL)
 		fatalx("%s: vr == NULL", __func__);
 
-	/* Compute offsets in ring of descriptors, avail ring, and used ring */
+	/* Locate the independently mapped split virtqueue areas. */
 	table = (struct vring_desc *)(vr);
-	avail = (struct vring_avail *)(vr + vq_info->vq_availoffset);
-	used = (struct vring_used *)(vr + vq_info->vq_usedoffset);
+	avail = vq_info->q_avail_hva;
+	used = vq_info->q_used_hva;
 
 	while (idx != avail->idx) {
 		hdr_idx = avail->ring[idx & vq_info->mask];
@@ -698,8 +760,9 @@ vionet_tx(struct virtio_dev *dev)
 			goto reset;
 		}
 
-		iov = &iov_tx[0];
-		iov_cnt = 0;
+		/* the 0th slot will by used by the tun_hdr */
+		iov = &iov_tx[1];
+		iov_cnt = 1;
 		chain_len = 0;
 
 		/*
@@ -710,13 +773,17 @@ vionet_tx(struct virtio_dev *dev)
 			log_warnx("%s: invalid descriptor length", __func__);
 			goto reset;
 		}
-		iov->iov_len = desc->len;
 
-		if (iov->iov_len > sizeof(struct virtio_net_hdr)) {
-			/* Chop off the virtio header, leaving packet data. */
-			iov->iov_len -= sizeof(struct virtio_net_hdr);
-			iov->iov_base = hvaddr_mem(desc->addr +
-			    sizeof(struct virtio_net_hdr), iov->iov_len);
+		/* Chop the virtio net header off */
+		vhp = hvaddr_mem(desc->addr, sizeof(*vhp));
+		if (vhp == NULL)
+			goto reset;
+
+		iov->iov_len = desc->len - sizeof(*vhp);
+		if (iov->iov_len > 0) {
+			iov->iov_base = hvaddr_mem(desc->addr + sizeof(*vhp),
+			    iov->iov_len);
+
 			if (iov->iov_base == NULL)
 				goto reset;
 
@@ -764,7 +831,7 @@ vionet_tx(struct virtio_dev *dev)
 		 * descriptor with packet data contains a large enough buffer
 		 * for this inspection.
 		 */
-		iov = &iov_tx[0];
+		iov = &iov_tx[1];
 		if (vionet->lockedmac) {
 			if (iov->iov_len < ETHER_HDR_LEN) {
 				log_warnx("%s: insufficient header data",
@@ -790,11 +857,30 @@ vionet_tx(struct virtio_dev *dev)
 			}
 		}
 
+		/*
+		 * if we look at more of vhp we might need to copy
+		 * it so it's aligned properly
+		 */
+		vhdr2thdr(vhp, &th, iov_tx + 1, iov_cnt - 1);
+
+		iov_tx[0].iov_base = &th;
+		iov_tx[0].iov_len = sizeof(th);
+
 		/* Write our packet to the tap(4). */
 		sz = writev(vionet->data_fd, iov_tx, iov_cnt);
-		if (sz == -1 && errno != ENOBUFS) {
-			log_warn("%s", __func__);
-			goto reset;
+		if (sz == -1) {
+			switch (errno) {
+			case ENOMEM:
+				log_debug("%s: no mbufs, dropping packet",
+				    __func__);
+				goto drop;
+			case EMSGSIZE:
+				log_debug("%s: invalid packet size", __func__);
+				goto drop;
+			default:
+				log_warn("%s", __func__);
+				goto reset;
+			}
 		}
 		chain_len += sizeof(struct virtio_net_hdr);
 drop:
@@ -949,7 +1035,7 @@ handle_sync_io(int fd, short event, void *arg)
 		if (n == 0)
 			break;
 
-		/* Unpack our message. They ALL should be dev messeges! */
+		/* Unpack our message. They ALL should be dev messages! */
 		viodev_msg_read(&imsg, &msg);
 		imsg_free(&imsg);
 
@@ -1014,7 +1100,7 @@ vionet_cfg_read(struct virtio_dev *dev, struct viodev_msg *msg)
 		}
 		break;
 	case VIO1_PCI_CONFIG_MSIX_VECTOR:
-		data = VIRTIO_MSI_NO_VECTOR;	/* Unsupported */
+		data = pci_cfg->config_msix_vector;
 		break;
 	case VIO1_PCI_NUM_QUEUES:
 		data = dev->num_queues;
@@ -1032,7 +1118,7 @@ vionet_cfg_read(struct virtio_dev *dev, struct viodev_msg *msg)
 		data = pci_cfg->queue_size;
 		break;
 	case VIO1_PCI_QUEUE_MSIX_VECTOR:
-		data = VIRTIO_MSI_NO_VECTOR;	/* Unsupported */
+		data = pci_cfg->queue_msix_vector;
 		break;
 	case VIO1_PCI_QUEUE_ENABLE:
 		data = pci_cfg->queue_enable;
@@ -1119,9 +1205,17 @@ vionet_cfg_write(struct virtio_dev *dev, struct viodev_msg *msg)
 		dev->driver_feature &= dev->device_feature;
 		DPRINTF("%s: driver features 0x%llx", __func__,
 		    dev->driver_feature);
+		vionet_update_offload(dev);
 		break;
 	case VIO1_PCI_CONFIG_MSIX_VECTOR:
-		/* Ignore until we support MSIX. */
+		if (sz != 2)
+			log_warnx("%s: invalid config MSI-X vector size %u",
+			    __func__, sz);
+		else if (data == VIRTIO_MSI_NO_VECTOR ||
+		    data < dev->num_queues + 1)
+			pci_cfg->config_msix_vector = data;
+		else
+			pci_cfg->config_msix_vector = VIRTIO_MSI_NO_VECTOR;
 		break;
 	case VIO1_PCI_NUM_QUEUES:
 		log_warnx("illegal write to num queues register");
@@ -1148,10 +1242,11 @@ vionet_cfg_write(struct virtio_dev *dev, struct viodev_msg *msg)
 			/* Reset device and virtqueues. */
 			dev->driver_feature = 0;
 			dev->isr = 0;
+			pci_cfg->config_msix_vector = VIRTIO_MSI_NO_VECTOR;
 			pci_cfg->queue_select = 0;	/* Technically RXQ. */
-			virtio_update_qs(dev);
 			virtio_vq_init(dev, RXQ);
 			virtio_vq_init(dev, TXQ);
+			virtio_update_qs(dev);
 		}
 		DPRINTF("%s: dev %u status [%s%s%s%s%s%s]", __func__,
 		    dev->pci_id,
@@ -1185,7 +1280,19 @@ vionet_cfg_write(struct virtio_dev *dev, struct viodev_msg *msg)
 		virtio_update_qa(dev);
 		break;
 	case VIO1_PCI_QUEUE_MSIX_VECTOR:
-		/* Ignore until we support MSI-X. */
+		if (sz != 2)
+			log_warnx("%s: invalid queue MSI-X vector size %u",
+			    __func__, sz);
+		else if (pci_cfg->queue_select < dev->num_queues) {
+			if (data == VIRTIO_MSI_NO_VECTOR ||
+			    data < dev->num_queues + 1)
+				dev->vq[pci_cfg->queue_select].q_msix_vector = data;
+			else
+				dev->vq[pci_cfg->queue_select].q_msix_vector =
+				    VIRTIO_MSI_NO_VECTOR;
+			pci_cfg->queue_msix_vector =
+			    dev->vq[pci_cfg->queue_select].q_msix_vector;
+		}
 		break;
 	case VIO1_PCI_QUEUE_ENABLE:
 		pci_cfg->queue_enable = data;
@@ -1499,7 +1606,8 @@ read_pipe_tx(int fd, short event, void *arg)
 	pthread_rwlock_unlock(&lock);
 
 	if (raise_irq)
-		vm_pipe_send(&pipe_main, VIRTIO_RAISE_IRQ);
+		vm_pipe_send(&pipe_main, ret == 1 ? VIRTIO_RAISE_IRQ_TX :
+		    VIRTIO_RAISE_IRQ_CONFIG);
 }
 
 /*
@@ -1516,8 +1624,14 @@ read_pipe_main(int fd, short event, void *arg)
 
 	msg = vm_pipe_recv(&pipe_main);
 	switch (msg) {
-	case VIRTIO_RAISE_IRQ:
-		vionet_assert_pic_irq(dev);
+	case VIRTIO_RAISE_IRQ_RX:
+		vionet_assert_irq(dev, RXQ);
+		break;
+	case VIRTIO_RAISE_IRQ_TX:
+		vionet_assert_irq(dev, TXQ);
+		break;
+	case VIRTIO_RAISE_IRQ_CONFIG:
+		vionet_assert_irq(dev, VIODEV_QUEUE_CONFIG);
 		break;
 	default:
 		fatalx("%s: invalid channel msg: %d", __func__, msg);
@@ -1529,7 +1643,7 @@ read_pipe_main(int fd, short event, void *arg)
  * thread.
  */
 static void
-vionet_assert_pic_irq(struct virtio_dev *dev)
+vionet_assert_irq(struct virtio_dev *dev, uint16_t vq_idx)
 {
 	struct viodev_msg	msg;
 	int			ret;
@@ -1537,6 +1651,7 @@ vionet_assert_pic_irq(struct virtio_dev *dev)
 	memset(&msg, 0, sizeof(msg));
 	msg.irq = dev->irq;
 	msg.vcpu = 0; /* XXX: smp */
+	msg.vq_idx = vq_idx;
 	msg.type = VIODEV_MSG_KICK;
 	msg.state = INTR_STATE_ASSERT;
 
@@ -1559,6 +1674,7 @@ vionet_deassert_pic_irq(struct virtio_dev *dev)
 	memset(&msg, 0, sizeof(msg));
 	msg.irq = dev->irq;
 	msg.vcpu = 0; /* XXX: smp */
+	msg.vq_idx = VIODEV_QUEUE_CONFIG;
 	msg.type = VIODEV_MSG_KICK;
 	msg.state = INTR_STATE_DEASSERT;
 
@@ -1566,4 +1682,122 @@ vionet_deassert_pic_irq(struct virtio_dev *dev)
 	    &msg, sizeof(msg), ev_base_main);
 	if (ret == -1)
 		log_warnx("%s: failed to assert irq %d", __func__, dev->irq);
+}
+
+static int
+iov_copydata(const struct iovec *iov, int iovcnt, size_t off, size_t len,
+    void *buf)
+{
+	uint8_t *cp = buf;
+	size_t count;
+
+	/* inspired by m_getptr() */
+	while (off > 0) {
+		if (iovcnt == 0)
+			return (-1);
+
+		if (off < iov->iov_len)
+			break;
+
+		off -= iov->iov_len;
+		iov++;
+		iovcnt--;
+	}
+
+	/* inspired by m_copydata() */
+	while (len > 0) {
+		if (iovcnt == 0)
+			return (-1);
+		count = MIN(iov->iov_len - off, len);
+		memmove(cp, (const uint8_t *)iov->iov_base + off, count);
+		len -= count;
+		cp += count;
+		off = 0;
+		iov++;
+		iovcnt--;
+	}
+
+	return (0);
+}
+
+static size_t
+hdr_off(const struct iovec *iov, int iovcnt)
+{
+	size_t		off = 0;
+	uint16_t	etype;
+
+	if (iov_copydata(iov, iovcnt, offsetof(struct ether_header, ether_type),
+	    sizeof(etype), &etype) == -1)
+		return 0;
+
+	off = sizeof(struct ether_header);
+
+	if (etype == htons(ETHERTYPE_VLAN)) {
+		if (iov_copydata(iov, iovcnt,
+		    offsetof(struct ether_vlan_header, evl_proto),
+		    sizeof(etype), &etype) == -1)
+			return 0;
+
+		off = sizeof(struct ether_vlan_header);
+	}
+
+	if (etype == htons(ETHERTYPE_IP)) {
+		size_t	offs;
+		uint8_t	hl;
+
+		/* Get ipproto field from IP header. */
+		offs = off + offsetof(struct ip, ip_p);
+
+		/* Get IP header length field from IP header. */
+		offs = off;
+		if (iov_copydata(iov, iovcnt, offs, sizeof(hl), &hl) == -1)
+			return 0;
+
+		off += (hl & 0x0f) << 2;
+	} else if (etype == htons(ETHERTYPE_IPV6)) {
+		off += sizeof(struct ip6_hdr);
+	}
+
+	return off;
+}
+
+static void
+vhdr2thdr(struct virtio_net_hdr *vh, struct tun_hdr *th,
+    const struct iovec *iov, int iovcnt)
+{
+	memset(th, 0, sizeof(*th));
+
+	if (vh->flags & VIRTIO_NET_HDR_F_NEEDS_CSUM) {
+		switch (vh->csum_offset) {
+		case offsetof(struct tcphdr, th_sum):
+			th->th_flags |= TUN_H_TCP_CSUM;
+			break;
+
+		case offsetof(struct udphdr, uh_sum):
+			th->th_flags |= TUN_H_UDP_CSUM;
+			break;
+		}
+	}
+}
+
+static void
+thdr2vhdr(struct tun_hdr *th, struct virtio_net_hdr *vh,
+    const struct iovec *iov, int iovcnt)
+{
+	memset(vh, 0, sizeof(*vh));
+
+	if (th->th_flags & (TUN_H_TCP_CSUM | TUN_H_UDP_CSUM)) {
+		vh->flags |= VIRTIO_NET_HDR_F_NEEDS_CSUM;
+		vh->csum_start = hdr_off(iov, iovcnt);
+
+		switch (th->th_flags & (TUN_H_TCP_CSUM | TUN_H_UDP_CSUM)) {
+		case TUN_H_TCP_CSUM:
+			vh->csum_offset = offsetof(struct tcphdr, th_sum);
+			break;
+
+		case TUN_H_UDP_CSUM:
+			vh->csum_offset = offsetof(struct udphdr, uh_sum);
+			break;
+		}
+	}
 }

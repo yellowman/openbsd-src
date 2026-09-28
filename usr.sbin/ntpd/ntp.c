@@ -1,4 +1,4 @@
-/*	$OpenBSD: ntp.c,v 1.185 2026/08/04 19:05:21 claudio Exp $ */
+/*	$OpenBSD: ntp.c,v 1.187 2026/09/18 00:45:50 bcook Exp $ */
 
 /*
  * Copyright (c) 2003, 2004 Henning Brauer <henning@openbsd.org>
@@ -27,6 +27,7 @@
 #include <pwd.h>
 #include <signal.h>
 #include <stdlib.h>
+#include <limits.h>
 #include <string.h>
 #include <syslog.h>
 #include <time.h>
@@ -92,12 +93,16 @@ ntp_main(struct ntpd_conf *nconf, struct passwd *pw, int argc, char **argv)
 	time_t			 nextaction, last_sensor_scan = 0, now;
 	time_t			 last_action = 0, interval, last_cdns_reset = 0;
 	void			*newp;
+	char			 execpath[PATH_MAX];
+
+	if (getexecpath(execpath, sizeof execpath) != 0)
+		fatal("getexecpath");
 
 	if (socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, PF_UNSPEC,
 	    pipe_dns) == -1)
 		fatal("socketpair");
 
-	start_child(NTPDNS_PROC_NAME, pipe_dns[1], argc, argv);
+	start_child(NTPDNS_PROC_NAME, pipe_dns[1], execpath, argc, argv);
 
 	log_init(nconf->debug ? LOG_TO_STDERR : LOG_TO_SYSLOG, nconf->verbose,
 	    LOG_DAEMON);
@@ -703,6 +708,7 @@ peer_addr_head_clear(struct ntp_peer *p)
 static void
 priv_adjfreq(double offset)
 {
+	static double time_origin;
 	double curtime, freq;
 
 	if (!conf->status.synced){
@@ -719,6 +725,10 @@ priv_adjfreq(double offset)
 	offset = conf->freq.overall_offset;
 
 	curtime = gettime_corrected();
+	/* Center time to keep the regression sums numerically stable. */
+	if (conf->freq.samples == 1)
+		time_origin = curtime;
+	curtime -= time_origin;
 	conf->freq.xy += offset * curtime;
 	conf->freq.x += curtime;
 	conf->freq.y += offset;

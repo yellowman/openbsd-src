@@ -1,4 +1,4 @@
-/*	$OpenBSD: sha1.h,v 1.4 2026/08/22 09:04:01 jsing Exp $	*/
+/*	$OpenBSD: sha1.h,v 1.6 2026/08/31 15:09:14 tb Exp $	*/
 /*
  * Copyright (c) 2015 Philip Guenther <guenther@openbsd.org>
  *
@@ -24,6 +24,10 @@ __BEGIN_HIDDEN_DECLS
 void __sha1_block(uint32_t state[5], const uint8_t *in, size_t num);
 void __sha1_block_generic(uint32_t state[5], const uint8_t *in, size_t num);
 
+#ifdef __aarch64__
+void __sha1_block_ce(uint32_t state[5], const uint8_t *in, size_t num);
+#endif
+
 #ifdef __amd64__
 void __sha1_block_shani(uint32_t state[5], const uint8_t *in, size_t num);
 #endif
@@ -32,11 +36,8 @@ __END_HIDDEN_DECLS
 PROTO_NORMAL(SHA1Data);
 PROTO_NORMAL(SHA1End);
 PROTO_NORMAL(SHA1File);
-PROTO_NORMAL(SHA1FileChunk);
 PROTO_NORMAL(SHA1Final);
 PROTO_NORMAL(SHA1Init);
-PROTO_NORMAL(SHA1Pad);
-PROTO_NORMAL(SHA1Transform);
 PROTO_NORMAL(SHA1Update);
 
 #endif /* _LIBC_SHA1_H */

@@ -1,4 +1,4 @@
-/*	$OpenBSD: roa.c,v 1.90 2026/06/25 07:51:58 tb Exp $ */
+/*	$OpenBSD: roa.c,v 1.93 2026/09/14 09:21:41 tb Exp $ */
 /*
  * Copyright (c) 2022 Theo Buehler <tb@openbsd.org>
  * Copyright (c) 2019 Kristaps Dzonsons <kristaps@bsd.lv>
@@ -236,6 +236,12 @@ roa_validate(const char *fn, void *obj, struct cert *cert)
 	return 1; /* XXX */
 }
 
+static const ASN1_OBJECT *
+roa_obj_oid(void)
+{
+	return roa_oid;
+}
+
 static void *
 roa_obj_new(size_t der_len, time_t signtime)
 {
@@ -256,11 +262,14 @@ roa_obj_free(void *obj)
 
 static const struct signed_obj roa_signed_obj = {
 	.rtype = RTYPE_ROA,
+
 	.new = roa_obj_new,
 	.free = roa_obj_free,
 	.cert_info = roa_cert_info,
 	.parse_econtent = roa_parse_econtent,
 	.validate = roa_validate,
+
+	.oid = roa_obj_oid,
 };
 
 const struct signed_obj *
@@ -270,60 +279,17 @@ roa_obj(void)
 }
 
 /*
- * Parse a full RFC 9582 file.
- * Returns the ROA or NULL if the document was malformed.
- */
-struct roa *
-roa_parse(struct cert **out_cert, const char *fn, int talid,
-    const unsigned char *der, size_t len)
-{
-	struct roa	*roa;
-	struct cert	*cert = NULL;
-	size_t		 cmsz;
-	unsigned char	*cms;
-	time_t		 signtime = 0;
-	int		 rc = 0;
-
-	assert(*out_cert == NULL);
-
-	cms = cms_parse_validate(&cert, fn, talid, der, len, roa_oid, &cmsz,
-	    &signtime);
-	if (cms == NULL)
-		return NULL;
-
-	roa = roa_obj_new(len, signtime);
-	if (!roa_cert_info(fn, roa, cert))
-		goto out;
-	if (!roa_parse_econtent(fn, roa, cms, cmsz))
-		goto out;
-	(void)roa_validate(fn, roa, cert);
-
-	*out_cert = cert;
-	cert = NULL;
-
-	rc = 1;
- out:
-	if (rc == 0) {
-		roa_free(roa);
-		roa = NULL;
-	}
-	cert_free(cert);
-	free(cms);
-	return roa;
-}
-
-/*
  * Free an ROA pointer.
  * Safe to call with NULL.
  */
 void
-roa_free(struct roa *p)
+roa_free(struct roa *roa)
 {
 
-	if (p == NULL)
+	if (roa == NULL)
 		return;
-	free(p->ips);
-	free(p);
+	free(roa->ips);
+	free(roa);
 }
 
 /*
@@ -331,15 +297,15 @@ roa_free(struct roa *p)
  * See roa_read() for reader.
  */
 void
-roa_buffer(struct ibuf *b, const struct roa *p)
+roa_buffer(struct ibuf *b, const struct roa *roa)
 {
-	io_simple_buffer(b, &p->valid, sizeof(p->valid));
-	io_simple_buffer(b, &p->asid, sizeof(p->asid));
-	io_simple_buffer(b, &p->talid, sizeof(p->talid));
-	io_simple_buffer(b, &p->num_ips, sizeof(p->num_ips));
-	io_simple_buffer(b, &p->expires, sizeof(p->expires));
+	io_simple_buffer(b, &roa->valid, sizeof(roa->valid));
+	io_simple_buffer(b, &roa->asid, sizeof(roa->asid));
+	io_simple_buffer(b, &roa->talid, sizeof(roa->talid));
+	io_simple_buffer(b, &roa->num_ips, sizeof(roa->num_ips));
+	io_simple_buffer(b, &roa->expires, sizeof(roa->expires));
 
-	io_simple_buffer(b, p->ips, p->num_ips * sizeof(p->ips[0]));
+	io_simple_buffer(b, roa->ips, roa->num_ips * sizeof(roa->ips[0]));
 }
 
 /*
@@ -350,24 +316,25 @@ roa_buffer(struct ibuf *b, const struct roa *p)
 struct roa *
 roa_read(struct ibuf *b)
 {
-	struct roa	*p;
+	struct roa	*roa;
 
-	if ((p = calloc(1, sizeof(struct roa))) == NULL)
+	if ((roa = calloc(1, sizeof(struct roa))) == NULL)
 		err(1, NULL);
 
-	io_read_buf(b, &p->valid, sizeof(p->valid));
-	io_read_buf(b, &p->asid, sizeof(p->asid));
-	io_read_buf(b, &p->talid, sizeof(p->talid));
-	io_read_buf(b, &p->num_ips, sizeof(p->num_ips));
-	io_read_buf(b, &p->expires, sizeof(p->expires));
+	io_read_buf(b, &roa->valid, sizeof(roa->valid));
+	io_read_buf(b, &roa->asid, sizeof(roa->asid));
+	io_read_buf(b, &roa->talid, sizeof(roa->talid));
+	io_read_buf(b, &roa->num_ips, sizeof(roa->num_ips));
+	io_read_buf(b, &roa->expires, sizeof(roa->expires));
 
-	if (p->num_ips > 0) {
-		if ((p->ips = calloc(p->num_ips, sizeof(p->ips[0]))) == NULL)
+	if (roa->num_ips > 0) {
+		if ((roa->ips = calloc(roa->num_ips,
+		    sizeof(roa->ips[0]))) == NULL)
 			err(1, NULL);
-		io_read_buf(b, p->ips, p->num_ips * sizeof(p->ips[0]));
+		io_read_buf(b, roa->ips, roa->num_ips * sizeof(roa->ips[0]));
 	}
 
-	return p;
+	return roa;
 }
 
 /*

@@ -1,4 +1,4 @@
-/*	$OpenBSD: uipc_syscalls.c,v 1.227 2026/03/14 14:57:14 deraadt Exp $	*/
+/*	$OpenBSD: uipc_syscalls.c,v 1.229 2026/09/04 02:13:45 dlg Exp $	*/
 /*	$NetBSD: uipc_syscalls.c,v 1.19 1996/02/09 19:00:48 christos Exp $	*/
 
 /*
@@ -1034,7 +1034,7 @@ recvit(struct proc *p, int s, struct msghdr *mp, caddr_t namelenp,
 	struct file *fp;
 	struct uio auio;
 	struct iovec *iov;
-	int i;
+	unsigned int i;
 	size_t len;
 	int error;
 	struct mbuf *from = NULL, *control = NULL;
@@ -1117,18 +1117,20 @@ recvit(struct proc *p, int s, struct msghdr *mp, caddr_t namelenp,
 		}
 	}
 	if (mp->msg_control) {
-		len = mp->msg_controllen;
-		if (len <= 0 || control == NULL)
-			len = 0;
+		socklen_t clen;
+
+		clen = mp->msg_controllen;
+		if (clen <= 0 || control == NULL)
+			clen = 0;
 		else {
 			struct mbuf *m = control;
 			caddr_t cp = mp->msg_control;
 
 			do {
 				i = m->m_len;
-				if (len < i) {
+				if (clen < i) {
 					mp->msg_flags |= MSG_CTRUNC;
-					i = len;
+					i = clen;
 				}
 				error = copyout(mtod(m, caddr_t), cp, i);
 #ifdef KTRACE
@@ -1141,16 +1143,21 @@ recvit(struct proc *p, int s, struct msghdr *mp, caddr_t namelenp,
 					mp->msg_flags = rmsgflags;
 				}
 #endif
-				if (m->m_next)
+				if (m->m_next) {
 					i = ALIGN(i);
+					if (clen < i) {
+						mp->msg_flags |= MSG_CTRUNC;
+						i = clen;
+					}
+				}
 				cp += i;
-				len -= i;
-				if (error != 0 || len <= 0)
+				clen -= i;
+				if (error != 0 || clen <= 0)
 					break;
 			} while ((m = m->m_next) != NULL);
-			len = cp - (caddr_t)mp->msg_control;
+			clen = cp - (caddr_t)mp->msg_control;
 		}
-		mp->msg_controllen = len;
+		mp->msg_controllen = clen;
 	}
 	if (!error) {
 		mtx_enter(&fp->f_mtx);
@@ -1199,7 +1206,9 @@ sys_setsockopt(struct proc *p, void *v, register_t *retval)
 
 	if ((error = getsock(p, SCARG(uap, s), &fp)) != 0)
 		return (error);
-	error = pledge_sockopt(p, 1, SCARG(uap, level), SCARG(uap, name));
+	so = fp->f_data;
+	error = pledge_sockopt(p, 1, so->so_proto,
+	     SCARG(uap, level), SCARG(uap, name));
 	if (error)
 		goto bad;
 	if (SCARG(uap, valsize) > MCLBYTES) {
@@ -1222,7 +1231,6 @@ sys_setsockopt(struct proc *p, void *v, register_t *retval)
 		}
 		m->m_len = SCARG(uap, valsize);
 	}
-	so = fp->f_data;
 	error = sosetopt(so, SCARG(uap, level), SCARG(uap, name), m);
 bad:
 	m_freem(m);
@@ -1248,7 +1256,9 @@ sys_getsockopt(struct proc *p, void *v, register_t *retval)
 
 	if ((error = getsock(p, SCARG(uap, s), &fp)) != 0)
 		return (error);
-	error = pledge_sockopt(p, 0, SCARG(uap, level), SCARG(uap, name));
+	so = fp->f_data;
+	error = pledge_sockopt(p, 0, so->so_proto,
+	    SCARG(uap, level), SCARG(uap, name));
 	if (error)
 		goto out;
 	if (SCARG(uap, val)) {
@@ -1259,7 +1269,6 @@ sys_getsockopt(struct proc *p, void *v, register_t *retval)
 	} else
 		valsize = 0;
 	m = m_get(M_WAIT, MT_SOOPTS);
-	so = fp->f_data;
 	error = sogetopt(so, SCARG(uap, level), SCARG(uap, name), m);
 	if (error == 0 && SCARG(uap, val) && valsize && m != NULL) {
 		if (valsize > m->m_len)

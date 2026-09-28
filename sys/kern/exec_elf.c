@@ -1,4 +1,4 @@
-/*	$OpenBSD: exec_elf.c,v 1.201 2026/06/02 09:45:08 kettenis Exp $	*/
+/*	$OpenBSD: exec_elf.c,v 1.206 2026/09/16 03:22:37 deraadt Exp $	*/
 
 /*
  * Copyright (c) 1996 Per Fogelstrom
@@ -90,8 +90,7 @@
 #include <machine/reg.h>
 #include <machine/elf.h>
 
-int	elf_load_file(struct proc *, char *, struct exec_package *,
-	    struct elf_args *);
+int	elf_load_file(struct proc *, char *, struct exec_package *);
 int	elf_check_header(Elf_Ehdr *);
 int	elf_read_from(struct proc *, struct vnode *, u_long, void *, int);
 void	elf_load_psection(struct exec_vmcmd_set *, struct vnode *,
@@ -339,8 +338,7 @@ bad:
  * coff_load_shlib()]. Made slightly generic so it might be used externally.
  */
 int
-elf_load_file(struct proc *p, char *path, struct exec_package *epp,
-    struct elf_args *ap)
+elf_load_file(struct proc *p, char *path, struct exec_package *epp)
 {
 	int error, i;
 	struct nameidata nd;
@@ -510,7 +508,7 @@ elf_load_file(struct proc *p, char *path, struct exec_package *epp,
 				    ELF_TRUNC(ph[i].p_vaddr,ph[i].p_align);
 				if (flags == VMCMD_RELATIVE)
 					epp->ep_entry += pos;
-				ap->arg_interp = pos;
+				epp->ep_interpaddr = pos;
 			}
 			if (prot & PROT_EXEC) {
 				if (addr < text_start)
@@ -889,25 +887,10 @@ exec_elf_makecmds(struct proc *p, struct exec_package *epp)
 	}
 
 	epp->ep_interp = interp;
-	epp->ep_entry = eh->e_entry + exe_base;
-
-	/*
-	 * Check if we found a dynamically linked binary and arrange to load
-	 * its interpreter when the exec file is released.
-	 */
-	if (interp || eh->e_type == ET_DYN) {
-		struct elf_args *ap;
-
-		ap = malloc(sizeof(*ap), M_TEMP, M_WAITOK);
-
-		ap->arg_phaddr = phdr;
-		ap->arg_phentsize = eh->e_phentsize;
-		ap->arg_phnum = eh->e_phnum;
-		ap->arg_entry = eh->e_entry + exe_base;
-		ap->arg_interp = exe_base;
-
-		epp->ep_args = ap;
-	}
+	epp->ep_entry = eh->e_entry + exe_base; /* updated if ld.so loads */
+	epp->ep_entrymain = eh->e_entry + exe_base;
+	epp->ep_phdraddr = phdr;
+	epp->ep_interpaddr = exe_base;
 
 	free(ph, M_TEMP, phsize);
 	vn_marktext(epp->ep_vp);
@@ -938,9 +921,9 @@ unsigned long hwcap2;
 int
 exec_elf_fixup(struct proc *p, struct exec_package *epp)
 {
-	char	*interp;
+	char	*interp = NULL;
 	int	error = 0;
-	struct	elf_args *ap;
+	Elf_Ehdr *eh = epp->ep_hdr;
 	AuxInfo ai[ELF_AUX_ENTRIES], *a;
 
 	interp = epp->ep_interp;
@@ -951,14 +934,7 @@ exec_elf_fixup(struct proc *p, struct exec_package *epp)
 		p->p_vmspace->vm_map.flags |= VM_MAP_PINSYSCALL_ONCE;
 	}
 
-	ap = epp->ep_args;
-	if (ap == NULL) {
-		return (0);
-	}
-
-	if (interp &&
-	    (error = elf_load_file(p, interp, epp, ap)) != 0) {
-		free(ap, M_TEMP, sizeof *ap);
+	if (interp && (error = elf_load_file(p, interp, epp)) != 0) {
 		pool_put(&namei_pool, interp);
 		kill_vmcmds(&epp->ep_vmcmds);
 		return (error);
@@ -977,15 +953,15 @@ exec_elf_fixup(struct proc *p, struct exec_package *epp)
 		a = ai;
 
 		a->au_id = AUX_phdr;
-		a->au_v = ap->arg_phaddr;
+		a->au_v = epp->ep_phdraddr;
 		a++;
 
 		a->au_id = AUX_phent;
-		a->au_v = ap->arg_phentsize;
+		a->au_v = eh->e_phentsize;
 		a++;
 
 		a->au_id = AUX_phnum;
-		a->au_v = ap->arg_phnum;
+		a->au_v = eh->e_phnum;
 		a++;
 
 		a->au_id = AUX_pagesz;
@@ -993,7 +969,7 @@ exec_elf_fixup(struct proc *p, struct exec_package *epp)
 		a++;
 
 		a->au_id = AUX_base;
-		a->au_v = ap->arg_interp;
+		a->au_v = epp->ep_interpaddr;
 		a++;
 
 		a->au_id = AUX_flags;
@@ -1001,7 +977,7 @@ exec_elf_fixup(struct proc *p, struct exec_package *epp)
 		a++;
 
 		a->au_id = AUX_entry;
-		a->au_v = ap->arg_entry;
+		a->au_v = epp->ep_entrymain;
 		a++;
 
 #ifdef __HAVE_CPU_HWCAP
@@ -1020,13 +996,16 @@ exec_elf_fixup(struct proc *p, struct exec_package *epp)
 		a->au_v = p->p_p->ps_timekeep;
 		a++;
 
+		a->au_id = AUX_openbsd_execpath;
+		a->au_v = (vaddr_t)epp->ep_execpath;
+    		a++;
+
 		a->au_id = AUX_null;
 		a->au_v = 0;
 		a++;
 
 		error = copyout(ai, epp->ep_auxinfo, sizeof ai);
 	}
-	free(ap, M_TEMP, sizeof *ap);
 	if (interp)
 		pool_put(&namei_pool, interp);
 	return (error);

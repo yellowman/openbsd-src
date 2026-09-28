@@ -1,4 +1,4 @@
-# $OpenBSD: Makefile,v 1.122 2026/08/01 17:04:12 miod Exp $
+# $OpenBSD: Makefile,v 1.125 2026/09/21 10:22:31 nicm Exp $
 
 PROG=	tmux
 SRCS=	alerts.c \
@@ -89,6 +89,7 @@ SRCS=	alerts.c \
 	input-keys.c \
 	input.c \
 	job.c \
+	json.c \
 	key-bindings.c \
 	key-string.c \
 	layout-custom.c \
@@ -102,7 +103,6 @@ SRCS=	alerts.c \
 	options-table.c \
 	options.c \
 	paste.c \
-	popup.c \
 	proc.c \
 	procname.c \
 	prompt.c \
@@ -152,6 +152,8 @@ CFLAGS += -I${.CURDIR}
 
 LDADD=	-lutil -lcurses -levent -lm
 DPADD=	${LIBUTIL} ${LIBCURSES} ${LIBEVENT} ${LIBM}
+
+DEBUG=	-g
 
 .if "${MACHINE_ARCH}" == "sh"
 screen-redraw.o:

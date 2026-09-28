@@ -1,4 +1,4 @@
-/*	$OpenBSD: in6_ifattach.c,v 1.126 2026/07/21 14:20:37 bket Exp $	*/
+/*	$OpenBSD: in6_ifattach.c,v 1.128 2026/09/20 20:50:29 gnezdo Exp $	*/
 /*	$KAME: in6_ifattach.c,v 1.124 2001/07/18 08:32:51 jinmei Exp $	*/
 
 /*

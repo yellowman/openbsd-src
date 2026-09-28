@@ -1,4 +1,4 @@
-/*	$OpenBSD: extern.h,v 1.290 2026/07/15 07:53:06 tb Exp $ */
+/*	$OpenBSD: extern.h,v 1.299 2026/09/24 14:44:03 tb Exp $ */
 /*
  * Copyright (c) 2019 Kristaps Dzonsons <kristaps@bsd.lv>
  *
@@ -244,6 +244,7 @@ enum location {
 
 struct signed_obj {
 	enum rtype rtype;
+
 	void *(*new)(size_t, time_t);
 	void (*free)(void *);
 	int (*cert_info)(const char *, void *, const struct cert *);
@@ -251,6 +252,8 @@ struct signed_obj {
 	int (*parse_detached)(const char *, void *, BIO *, char *, size_t,
 	    uint8_t **, size_t *);
 	int (*validate)(const char *, void *, struct cert *);
+
+	const ASN1_OBJECT *(*oid)(void);
 };
 
 /*
@@ -274,6 +277,7 @@ struct mft {
 	char		*seqnum; /* manifestNumber */
 	char		*aki; /* AKI */
 	char		*sia; /* SIA signedObject */
+	char		*crldp; /* full canonical path rsync://... */
 	char		*crl; /* CRL file name */
 	unsigned char	 mfthash[SHA256_DIGEST_LENGTH];
 	size_t		 mftsize;
@@ -540,6 +544,7 @@ struct crl {
 	RB_ENTRY(crl)	 entry;
 	char		*aki;
 	char		*mftpath;
+	char		*mftcrldp;
 	X509_CRL	*x509_crl;
 	time_t		 thisupdate;	/* do not use before */
 	time_t		 nextupdate;	/* do not use after */
@@ -776,8 +781,6 @@ void		 nca_tree_remove_cert(struct nca_tree *, int);
 enum rtype	 rtype_from_file_extension(const char *);
 void		 mft_buffer(struct ibuf *, const struct mft *);
 void		 mft_free(struct mft *);
-struct mft	*mft_parse(struct cert **, const char *, int,
-		    const unsigned char *, size_t);
 const struct signed_obj *mft_obj(void);
 struct mft	*mft_read(struct ibuf *);
 int		 mft_compare_issued(const struct mft *, const struct mft *);
@@ -787,8 +790,6 @@ int		 mft_seqnum_gap_present(const struct mft *, const struct mft *,
 
 void		 roa_buffer(struct ibuf *, const struct roa *);
 void		 roa_free(struct roa *);
-struct roa	*roa_parse(struct cert **, const char *, int,
-		    const unsigned char *, size_t);
 const struct signed_obj *roa_obj(void);
 struct roa	*roa_read(struct ibuf *);
 void		 roa_insert_vrps(struct vrp_tree *, struct roa *,
@@ -796,30 +797,22 @@ void		 roa_insert_vrps(struct vrp_tree *, struct roa *,
 
 void		 spl_buffer(struct ibuf *, const struct spl *);
 void		 spl_free(struct spl *);
-struct spl	*spl_parse(struct cert **, const char *, int,
-		    const unsigned char *, size_t);
 const struct signed_obj *spl_obj(void);
 struct spl	*spl_read(struct ibuf *);
 void		 spl_insert_vsps(struct vsp_tree *, struct spl *,
 		    struct repo *);
 
 void		 rsc_free(struct rsc *);
-struct rsc	*rsc_parse(struct cert **, const char *, int,
-		    const unsigned char *, size_t);
 const struct signed_obj *rsc_obj(void);
 
 void		 takey_free(struct takey *);
 void		 tak_free(struct tak *);
-struct tak	*tak_parse(struct cert **, const char *, int,
-		    const unsigned char *, size_t);
 const struct signed_obj *tak_obj(void);
 
 void		 aspa_buffer(struct ibuf *, const struct aspa *);
 void		 aspa_free(struct aspa *);
 void		 aspa_insert_vaps(char *, struct vap_tree *, struct aspa *,
 		    struct repo *);
-struct aspa	*aspa_parse(struct cert **, const char *, int,
-		    const unsigned char *, size_t);
 const struct signed_obj *aspa_obj(void);
 struct aspa	*aspa_read(struct ibuf *);
 
@@ -832,15 +825,14 @@ void		 crl_tree_free(struct crl_tree *);
 
 /* Validation of our objects. */
 
-int		 valid_cert(const char *, struct auth *, const struct cert *);
 int		 valid_roa(const char *, struct cert *, struct roa *);
 int		 valid_filehash(int, const char *, size_t);
 int		 valid_hash(unsigned char *, size_t, const char *, size_t);
 int		 valid_filename(const char *, size_t);
 int		 valid_uri(const char *, size_t, const char *);
 int		 valid_origin(const char *, const char *);
-int		 valid_x509(char *, X509_STORE_CTX *, X509 *, struct auth *,
-		    struct crl *, const char **);
+int		 valid_cert(char *, X509_STORE_CTX *, struct cert *,
+		    struct auth *, struct crl *, const char **);
 int		 valid_rsc(const char *, struct cert *, struct rsc *);
 int		 valid_econtent_version(const char *, const ASN1_INTEGER *,
 		    uint64_t);
@@ -849,9 +841,8 @@ int		 valid_uuid(const char *);
 int		 valid_spl(const char *, struct cert *, struct spl *);
 
 /* Working with CMS. */
-unsigned char	*cms_parse_validate(struct cert **, const char *, int,
-		    const unsigned char *, size_t, const ASN1_OBJECT *,
-		    size_t *, time_t *);
+void		*signed_object_parse(struct cert **, const char *, enum rtype,
+		    int, const unsigned char *, size_t);
 
 /* Work with RFC 3779 IP addresses, prefixes, ranges. */
 
@@ -1031,10 +1022,6 @@ void		 aspa_print(const struct cert *, const struct aspa *);
 void		 tak_print(const struct cert *, const struct tak *);
 void		 spl_print(const struct cert *, const struct spl *);
 
-/* Missing RFC 3779 API */
-IPAddrBlocks *IPAddrBlocks_new(void);
-void IPAddrBlocks_free(IPAddrBlocks *);
-
 /* Output! */
 
 extern int	 outformats;
@@ -1066,6 +1053,9 @@ void ccr_insert_roa(struct ccr_vrp_tree *, const struct roa *);
 void ccr_insert_tas(struct ccr_tas_tree *, const struct cert *);
 void ccr_insert_mft_sub(struct ccr_mft_tree *, const struct cert *);
 void serialize_ccr_content(struct validation_data *);
+
+/* ASN.1 helpers */
+int	copy_asn1_string(const ASN1_STRING *,  unsigned char *, size_t);
 
 void		 logx(const char *fmt, ...)
 		    __attribute__((format(printf, 1, 2)));
@@ -1144,5 +1134,9 @@ int	mkpathat(int, const char *);
 /* Compat helpers for OpenSSL < 4 and LibreSSL. */
 int	ASN1_BIT_STRING_get_length(const ASN1_BIT_STRING *, size_t *, int *);
 int	ASN1_BIT_STRING_set1(ASN1_BIT_STRING *, const uint8_t *, size_t, int);
+
+/* Missing RFC 3779 API, needed for OpenSSL < 4.1 and LibreSSL */
+IPAddrBlocks *IPAddrBlocks_new(void);
+void IPAddrBlocks_free(IPAddrBlocks *);
 
 #endif /* ! EXTERN_H */

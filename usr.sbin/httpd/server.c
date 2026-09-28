@@ -1,4 +1,4 @@
-/*	$OpenBSD: server.c,v 1.137 2026/07/26 14:46:32 rsadowski Exp $	*/
+/*	$OpenBSD: server.c,v 1.139 2026/09/27 11:02:24 kn Exp $	*/
 
 /*
  * Copyright (c) 2006 - 2015 Reyk Floeter <reyk@openbsd.org>
@@ -141,6 +141,15 @@ server_tls_cmp(struct server *s1, struct server *s2)
 		return (-1);
 	if (sc1->tls_ticket_lifetime != sc2->tls_ticket_lifetime)
 		return (-1);
+
+	/* TLS client certificates */
+	if ((sc1->tls_flags & TLSFLAG_CA) &&
+	    strcmp(sc1->tls_ca_file, sc2->tls_ca_file) != 0)
+		return (-1);
+	if ((sc1->tls_flags & TLSFLAG_CRL) &&
+	    strcmp(sc1->tls_crl_file, sc2->tls_crl_file) != 0)
+		return (-1);
+
 	if (strcmp(sc1->tls_ciphers, sc2->tls_ciphers) != 0)
 		return (-1);
 	if (strcmp(sc1->tls_dhe_params, sc2->tls_dhe_params) != 0)
@@ -397,13 +406,6 @@ server_init(struct privsep *ps, struct privsep_proc *p, void *arg)
 
 	if (pledge("stdio rpath inet unix recvfd", NULL) == -1)
 		fatal("pledge");
-
-#if 0
-	/* Schedule statistics timer */
-	evtimer_set(&ps->ps_env->sc_statev, server_statistics, NULL);
-	memcpy(&tv, &ps->ps_env->sc_statinterval, sizeof(tv));
-	evtimer_add(&ps->ps_env->sc_statev, &tv);
-#endif
 }
 
 int

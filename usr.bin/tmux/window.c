@@ -1,4 +1,4 @@
-/* $OpenBSD: window.c,v 1.372 2026/08/24 07:14:54 nicm Exp $ */
+/* $OpenBSD: window.c,v 1.383 2026/09/28 10:42:01 nicm Exp $ */
 
 /*
  * Copyright (c) 2007 Nicholas Marriott <nicholas.marriott@gmail.com>
@@ -94,7 +94,11 @@ struct window_pane_prompt {
 int
 window_cmp(struct window *w1, struct window *w2)
 {
-	return (w1->id - w2->id);
+	if (w1->id < w2->id)
+		return (-1);
+	if (w1->id > w2->id)
+		return (1);
+	return (0);
 }
 
 static void
@@ -201,7 +205,11 @@ winlink_cmp(struct winlink *wl1, struct winlink *wl2)
 int
 window_pane_cmp(struct window_pane *wp1, struct window_pane *wp2)
 {
-	return (wp1->id - wp2->id);
+	if (wp1->id < wp2->id)
+		return (-1);
+	if (wp1->id > wp2->id)
+		return (1);
+	return (0);
 }
 
 struct winlink *
@@ -451,9 +459,17 @@ window_create(u_int sx, u_int sy, u_int xpixel, u_int ypixel)
 static void
 window_destroy(struct window *w)
 {
+	struct window_pane	*wp;
+
 	log_debug("window @%u destroyed (%d references)", w->id, w->references);
 
-	window_unzoom(w, 0);
+	if (w->flags & WINDOW_ZOOMED) {
+		w->flags &= ~WINDOW_ZOOMED;
+		TAILQ_FOREACH(wp, &w->panes, entry) {
+			wp->flags &= ~PANE_ZOOMED;
+			wp->saved_layout_cell = NULL;
+		}
+	}
 	RB_REMOVE(windows, &windows, w);
 
 	layout_free_cell(w->layout_root, 0);
@@ -652,6 +668,34 @@ window_pane_contains(struct window_pane *wp, u_int x, u_int y)
 	return (1);
 }
 
+/*
+ * Does floating pane, including its borders and scrollbar, overlap any cell of
+ * another pane, including its scrollbar?
+ */
+int
+window_pane_floating_overlaps(struct window_pane *fwp, struct window_pane *wp)
+{
+	int	fxoff, fyoff, xoff, yoff, border = 0;
+	u_int	fsx, fsy, sx, sy;
+
+	if (!window_pane_is_floating(fwp))
+		return (0);
+
+	window_pane_full_size_offset(fwp, &fxoff, &fyoff, &fsx, &fsy);
+	window_pane_full_size_offset(wp, &xoff, &yoff, &sx, &sy);
+
+	if (window_pane_get_pane_lines(fwp) != PANE_LINES_NONE)
+		border = 1;
+
+	if (fxoff - border >= xoff + (int)sx ||
+	    fxoff + (int)fsx + border <= xoff)
+		return (0);
+	if (fyoff - border >= yoff + (int)sy ||
+	    fyoff + (int)fsy + border <= yoff)
+		return (0);
+	return (1);
+}
+
 void
 window_update_focus(struct window *w)
 {
@@ -676,7 +720,6 @@ window_pane_update_focus(struct window_pane *wp)
 				    c->session->attached != 0 &&
 				    (c->flags & CLIENT_FOCUSED) &&
 				    c->session->curw->window == wp->window &&
-				    c->overlay_draw == NULL &&
 				    wp->window->menu == NULL) {
 					focused = 1;
 					break;
@@ -807,6 +850,16 @@ window_get_active_at(struct window *w, u_int x, u_int y)
 		if (window_pane_contains(w->modal, x, y))
 			return (w->modal);
 		return (NULL);
+	}
+
+	/*
+	 * A floating pane is above every tiled pane, including their status
+	 * lines, so check those first.
+	 */
+	TAILQ_FOREACH(wp, &w->z_index, zentry) {
+		if (window_pane_is_floating(wp) &&
+		    window_pane_contains(wp, x, y))
+			return (wp);
 	}
 
 	if (pane_status == PANE_STATUS_TOP) {
@@ -1248,6 +1301,21 @@ window_pane_zindex(struct window_pane *wp, u_int *i)
 	return (-1);
 }
 
+int
+window_pane_last_index(struct window_pane *wp, u_int *i)
+{
+	struct window		*w = wp->window;
+	struct window_pane	*wq;
+
+	*i = 0;
+	TAILQ_FOREACH(wq, &w->last_panes, sentry) {
+		if (wq == wp)
+			return (0);
+		(*i)++;
+	}
+	return (-1);
+}
+
 u_int
 window_count_panes(struct window *w, int with_floating)
 {
@@ -1411,7 +1479,7 @@ window_pane_wait_finish(struct window_pane *wp)
 {
 	struct cmdq_item	*item = wp->wait_item;
 	struct client		*c;
-	int			 retval = 0;
+	int			 retval = 128 + SIGHUP;
 
 	if (item == NULL)
 		return;
@@ -1471,6 +1539,8 @@ window_pane_scrollbar_overlay_visible(struct window_pane *wp)
 void
 window_pane_scrollbar_redraw(struct window_pane *wp)
 {
+	if (!window_pane_scrollbar_visible(wp))
+		return;
 	if (window_pane_scrollbar_overlay_visible(wp)) {
 		wp->flags |= PANE_REDRAW;
 		return;
@@ -1497,7 +1567,7 @@ window_pane_destroy(struct window_pane *wp)
 	window_pane_clear_prompt(wp);
 
 	window_pane_free_modes(wp);
-	screen_write_clear_dirty(wp);
+	screen_write_sync_clear_dirty(wp);
 
 	if (wp->fd != -1) {
 		bufferevent_free(wp->event);
@@ -1597,7 +1667,7 @@ window_pane_set_event(struct window_pane *wp)
 	    NULL, window_pane_error_callback, wp);
 	if (wp->event == NULL)
 		fatalx("out of memory");
-	wp->ictx = input_init(wp, wp->event, &wp->palette, NULL);
+	wp->ictx = input_init(wp, wp->event, &wp->palette);
 
 	bufferevent_enable(wp->event, EV_READ|EV_WRITE);
 }
@@ -2401,7 +2471,7 @@ winlink_shuffle_up(struct session *s, struct winlink *wl, int before)
 {
 	int	 idx, last;
 
-	if (wl == NULL)
+	if (wl == NULL || wl->idx == INT_MAX)
 		return (-1);
 	if (before)
 		idx = wl->idx;
@@ -2874,6 +2944,18 @@ window_pane_is_floating(struct window_pane *wp)
 {
 	struct layout_cell	*lc = wp->layout_cell;
 
+	if (lc == NULL || (lc->flags & LAYOUT_CELL_FLOATING) == 0)
+		return (0);
+	return (1);
+}
+
+int
+window_pane_is_floating_with_hidden(struct window_pane *wp)
+{
+	struct layout_cell	*lc = wp->layout_cell;
+
+	if (lc == NULL)
+		lc = wp->saved_layout_cell;
 	if (lc == NULL || (lc->flags & LAYOUT_CELL_FLOATING) == 0)
 		return (0);
 	return (1);

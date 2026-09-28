@@ -1,4 +1,4 @@
-/*	$OpenBSD: filemode.c,v 1.86 2026/07/09 11:39:19 claudio Exp $ */
+/*	$OpenBSD: filemode.c,v 1.91 2026/09/24 14:44:03 tb Exp $ */
 /*
  * Copyright (c) 2019 Claudio Jeker <claudio@openbsd.org>
  * Copyright (c) 2019 Kristaps Dzonsons <kristaps@bsd.lv>
@@ -100,7 +100,7 @@ static void
 parse_load_crl(char *uri)
 {
 	struct crl *crl;
-	char *f;
+	char *f, *file;
 	size_t flen;
 
 	if (uri == NULL)
@@ -109,17 +109,22 @@ parse_load_crl(char *uri)
 		warnx("bad CRL distribution point URI %s", uri);
 		return;
 	}
-	uri += RSYNC_PROTO_LEN;
+	file = uri + RSYNC_PROTO_LEN;
 
-	f = load_file(uri, &flen);
+	f = load_file(file, &flen);
 	if (f == NULL) {
-		warn("parse file %s", uri);
+		warn("parse file %s", file);
 		return;
 	}
 
-	crl = crl_parse(uri, f, flen);
-	if (crl != NULL && !crl_insert(&crls, crl))
-		crl_free(crl);
+	crl = crl_parse(file, f, flen);
+	if (crl != NULL) {
+		assert(crl->mftcrldp == NULL);
+		if ((crl->mftcrldp = strdup(uri)) == NULL)
+			err(1, NULL);
+		if (!crl_insert(&crls, crl))
+			crl_free(crl);
+	}
 
 	free(f);
 }
@@ -219,8 +224,7 @@ parse_load_certchain(char *uri)
 		uri = filestack[i - 1];
 
 		crl = crl_get(&crls, a);
-		if (!valid_x509(uri, ctx, cert->x509, a, crl, &errstr) ||
-		    !valid_cert(uri, a, cert)) {
+		if (!valid_cert(uri, ctx, cert, a, crl, &errstr)) {
 			if (errstr != NULL)
 				warnx("%s: %s", uri, errstr);
 			goto fail;
@@ -500,7 +504,7 @@ proc_parser_file(char *file, unsigned char *in_buf, size_t len)
 
 	switch (type) {
 	case RTYPE_ASPA:
-		aspa = aspa_parse(&cert, file, -1, buf, len);
+		aspa = signed_object_parse(&cert, file, type, -1, buf, len);
 		if (aspa == NULL)
 			break;
 		aia = cert->aia;
@@ -531,7 +535,7 @@ proc_parser_file(char *file, unsigned char *in_buf, size_t len)
 		crl_print(crl);
 		break;
 	case RTYPE_MFT:
-		mft = mft_parse(&cert, file, -1, buf, len);
+		mft = signed_object_parse(&cert, file, type, -1, buf, len);
 		if (mft == NULL)
 			break;
 		aia = cert->aia;
@@ -540,7 +544,7 @@ proc_parser_file(char *file, unsigned char *in_buf, size_t len)
 		notafter = &mft->nextupdate;
 		break;
 	case RTYPE_ROA:
-		roa = roa_parse(&cert, file, -1, buf, len);
+		roa = signed_object_parse(&cert, file, type, -1, buf, len);
 		if (roa == NULL)
 			break;
 		aia = cert->aia;
@@ -549,7 +553,7 @@ proc_parser_file(char *file, unsigned char *in_buf, size_t len)
 		notafter = &cert->notafter;
 		break;
 	case RTYPE_RSC:
-		rsc = rsc_parse(&cert, file, -1, buf, len);
+		rsc = signed_object_parse(&cert, file, type, -1, buf, len);
 		if (rsc == NULL)
 			break;
 		aia = cert->aia;
@@ -558,7 +562,7 @@ proc_parser_file(char *file, unsigned char *in_buf, size_t len)
 		notafter = &cert->notafter;
 		break;
 	case RTYPE_SPL:
-		spl = spl_parse(&cert, file, -1, buf, len);
+		spl = signed_object_parse(&cert, file, type, -1, buf, len);
 		if (spl == NULL)
 			break;
 		aia = cert->aia;
@@ -567,7 +571,7 @@ proc_parser_file(char *file, unsigned char *in_buf, size_t len)
 		notafter = &cert->notafter;
 		break;
 	case RTYPE_TAK:
-		tak = tak_parse(&cert, file, -1, buf, len);
+		tak = signed_object_parse(&cert, file, type, -1, buf, len);
 		if (tak == NULL)
 			break;
 		aia = cert->aia;
@@ -591,7 +595,7 @@ proc_parser_file(char *file, unsigned char *in_buf, size_t len)
 		a = parse_load_certchain(aia);
 		c = crl_get(&crls, a);
 
-		if ((status = valid_x509(file, ctx, cert->x509, a, c, &errstr))) {
+		if ((status = valid_cert(file, ctx, cert, a, c, &errstr))) {
 			switch (type) {
 			case RTYPE_ASPA:
 				status = aspa->valid;

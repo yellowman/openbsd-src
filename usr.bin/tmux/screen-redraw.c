@@ -1,4 +1,4 @@
-/* $OpenBSD: screen-redraw.c,v 1.157 2026/07/24 08:49:23 nicm Exp $ */
+/* $OpenBSD: screen-redraw.c,v 1.162 2026/09/24 11:19:39 nicm Exp $ */
 
 /*
  * Copyright (c) 2026 Nicholas Marriott <nicholas.marriott@gmail.com>
@@ -33,7 +33,7 @@
  * this is done at various points, such as when a pane is moved or resized. The
  * scene only includes the part of the client used for the window: panes, pane
  * status lines, borders, scrollbars, and any area outside the window. The
- * client status line and overlay are not included.
+ * client status line is not included.
  *
  * A scene is made from spans. A span is a horizontal run of cells on one
  * visible line that can be drawn in the same way. Each span has a type, for
@@ -93,7 +93,6 @@ enum redraw_span_type {
 #define REDRAW_PANE_SCROLLBAR 0x20
 #define REDRAW_STATUS 0x40
 #define REDRAW_MENU 0x80
-#define REDRAW_OVERLAY 0x100
 
 /* Draw everything. */
 #define REDRAW_ALL 0x7fffffff
@@ -264,8 +263,6 @@ redraw_flags_to_string(int flags)
 		strlcat(s, "scrollbar ", sizeof s);
 	if (flags & REDRAW_MENU)
 		strlcat(s, "menu ", sizeof s);
-	if (flags & REDRAW_OVERLAY)
-		strlcat(s, "overlay ", sizeof s);
 	if (REDRAW_IS_ALL(flags))
 		strlcat(s, "all ", sizeof s);
 	if (*s != '\0')
@@ -713,7 +710,7 @@ redraw_mark_pane_borders(struct redraw_build_ctx *bctx, struct window_pane *wp,
 	} else {
 		mark_right = (right <= (int)bctx->w->sx);
 		mark_bottom = (bottom <= (int)bctx->w->sy);
-		if (pane_status == PANE_STATUS_TOP)
+		if (pane_status == PANE_STATUS_TOP && bottom < (int)bctx->w->sy)
 			mark_bottom = 0;
 		else if (pane_status == PANE_STATUS_BOTTOM)
 			mark_top = 0;
@@ -1381,45 +1378,30 @@ static void
 redraw_draw_span(struct redraw_draw_ctx *dctx, struct redraw_span *span,
     u_int y)
 {
-	struct redraw_scene	*scene = dctx->scene;
 	struct redraw_span_data	*data = &span->data;
 	enum redraw_span_type	 type = data->type;
-	struct client		*c = scene->c;
-	struct tty		*tty = &c->tty;
-	struct visible_ranges	*r;
-	struct visible_range	*rr;
-	u_int			 i, x, n;
 
 	if (type == REDRAW_SPAN_STATUS && ~data->st.wp->flags & PANE_NEWSTATUS)
 		return;
 
-	r = tty_check_overlay_range(tty, span->x, y, span->width);
-	for (i = 0; i < r->used; i++) {
-		rr = &r->ranges[i];
-		if (rr->nx == 0)
-			continue;
-		x = rr->px;
-		n = rr->nx;
-
-		switch (span->data.type) {
-		case REDRAW_SPAN_PANE:
-			redraw_draw_pane_span(dctx, span, x, y, n);
-			break;
-		case REDRAW_SPAN_BORDER:
-		case REDRAW_SPAN_EMPTY:
-		case REDRAW_SPAN_OUTSIDE:
-			redraw_draw_border_span(dctx, span, x, y, n);
-			break;
-		case REDRAW_SPAN_STATUS:
-			redraw_draw_status_span(dctx, span, x, y, n);
-			break;
-		case REDRAW_SPAN_SCROLLBAR:
-			redraw_draw_scrollbar_span(dctx, span, x, y, n);
-			break;
-		case REDRAW_SPAN_MENU:
-			redraw_draw_menu_span(dctx, span, x, y, n);
-			break;
-		}
+	switch (span->data.type) {
+	case REDRAW_SPAN_PANE:
+		redraw_draw_pane_span(dctx, span, span->x, y, span->width);
+		break;
+	case REDRAW_SPAN_BORDER:
+	case REDRAW_SPAN_EMPTY:
+	case REDRAW_SPAN_OUTSIDE:
+		redraw_draw_border_span(dctx, span, span->x, y, span->width);
+		break;
+	case REDRAW_SPAN_STATUS:
+		redraw_draw_status_span(dctx, span, span->x, y, span->width);
+		break;
+	case REDRAW_SPAN_SCROLLBAR:
+		redraw_draw_scrollbar_span(dctx, span, span->x, y, span->width);
+		break;
+	case REDRAW_SPAN_MENU:
+		redraw_draw_menu_span(dctx, span, span->x, y, span->width);
+		break;
 	}
 }
 
@@ -1673,7 +1655,7 @@ redraw_draw_pane_prompt(struct redraw_draw_ctx *dctx, struct window_pane *wp)
 	prompt_draw(wp->prompt, &pdd);
 	screen_write_stop(&ctx);
 
-	tty_draw_line(tty, &screen, 0, offset, width, px, cy, NULL);
+	tty_draw_line(tty, &screen, offset, 0, width, px, cy, NULL);
 	screen_free(&screen);
 }
 
@@ -1688,10 +1670,8 @@ redraw_draw(struct client *c, struct window_pane *wp, int flags)
 	struct screen		*sl;
 	struct redraw_scene	*scene;
 	struct window_pane	*loop;
-	u_int			 width, i, y, lines, j;
+	u_int			 width, i, y, lines;
 	struct redraw_span	*first;
-	struct visible_ranges	*r;
-	struct visible_range	*rr;
 	int			 redraw;
 
 	if (c->flags & CLIENT_SUSPENDED)
@@ -1738,8 +1718,7 @@ redraw_draw(struct client *c, struct window_pane *wp, int flags)
 			else
 				loop->flags &= ~PANE_NEWSTATUS;
 
-			width = redraw_pane_status_width(&dctx, loop,
-			    &first);
+			width = redraw_pane_status_width(&dctx, loop, &first);
 			if (width == 0)
 				continue;
 
@@ -1759,18 +1738,18 @@ redraw_draw(struct client *c, struct window_pane *wp, int flags)
 		if (wp != NULL) {
 			if (wp->base.mode & MODE_SYNC)
 				screen_write_stop_sync(wp);
-			screen_write_clear_dirty(wp);
+			screen_write_sync_clear_dirty(wp);
 		} else {
 			TAILQ_FOREACH(loop, &scene->w->panes, entry) {
 				if (!window_pane_is_visible(loop))
 					continue;
 				if (loop->base.mode & MODE_SYNC)
 					screen_write_stop_sync(loop);
-				screen_write_clear_dirty(loop);
+				screen_write_sync_clear_dirty(loop);
 			}
 		}
 	}
-	tty_sync_start(tty);
+	tty_sync_start(tty); /* end in server_client_reset_state */
 	tty_update_mode(tty, tty->mode & ~CURSOR_MODES, NULL);
 
 	if (wp != NULL)
@@ -1800,22 +1779,11 @@ redraw_draw(struct client *c, struct window_pane *wp, int flags)
 		else
 			y = c->tty.sy - lines;
 		sl = c->status.active;
-		for (i = 0; i < lines; i++) {
-			r = tty_check_overlay_range(tty, 0, y + i, tty->sx);
-			for (j = 0; j < r->used; j++) {
-				rr = &r->ranges[j];
-				if (rr->nx == 0)
-					continue;
-				tty_draw_line(tty, sl, rr->px, i, rr->nx,
-				    rr->px, y + i, NULL);
-			}
-		}
+		for (i = 0; i < lines; i++)
+			tty_draw_line(tty, sl, 0, i, tty->sx, 0, y + i, NULL);
 	}
-	if (c->overlay_draw != NULL && (flags & REDRAW_OVERLAY))
-		c->overlay_draw(c, c->overlay_data);
 
 	tty_reset(tty);
-	tty_sync_end(tty);
 
 	log_debug("%s: finished @%u redraw", c->name, scene->w->id);
 
@@ -1861,18 +1829,13 @@ redraw_screen(struct client *c)
 {
 	int	flags = 0;
 
-	if (c->flags & CLIENT_REDRAWWINDOW) {
-		if (c->flags & CLIENT_REDRAWOVERLAY)
-			redraw_draw(c, NULL, REDRAW_ALL);
-		else
-			redraw_draw(c, NULL, REDRAW_ALL & ~REDRAW_OVERLAY);
-	} else {
+	if (c->flags & CLIENT_REDRAWWINDOW)
+		redraw_draw(c, NULL, REDRAW_ALL);
+	else {
 		if (c->flags & CLIENT_REDRAWBORDERS)
 			flags |= (REDRAW_PANE_BORDER|REDRAW_PANE_STATUS);
 		if (c->flags & CLIENT_REDRAWSTATUS)
 			flags |= (REDRAW_STATUS|REDRAW_PANE_STATUS);
-		if (c->flags & CLIENT_REDRAWOVERLAY)
-			flags |= REDRAW_OVERLAY;
 		if (c->flags & CLIENT_REDRAWMENU)
 			flags |= REDRAW_MENU;
 		if (c->session->curw->window->menu != NULL)

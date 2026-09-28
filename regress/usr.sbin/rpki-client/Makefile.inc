@@ -1,4 +1,4 @@
-# $OpenBSD: Makefile.inc,v 1.48 2026/06/15 14:30:53 job Exp $
+# $OpenBSD: Makefile.inc,v 1.50 2026/09/20 16:27:42 job Exp $
 
 .PATH:		${.CURDIR}/../../../../usr.sbin/rpki-client
 
@@ -13,7 +13,7 @@ PROGS += test-rsc
 PROGS += test-tal
 PROGS += test-rrdp
 PROGS += test-aspa
-PROGS += test-tak
+# PROGS += test-tak	# we currently don't have validly encoded TAKs
 PROGS += test-spl
 PROGS += test-seqnum
 
@@ -29,7 +29,8 @@ CLEANFILES+=	*.out *.err *.txt
 
 TEST_COMMON= as.c aspa.c ccr.c cert.c cms.c constraints-dummy.c crl.c \
 	     encoding.c io.c ip.c json.c mft.c print.c repo-dummy.c \
-	     rfc3779.c roa.c rsync.c validate.c x509.c asn1_bit_string.c
+	     rfc3779.c roa.c rsync.c rsc.c spl.c tak.c validate.c x509.c \
+	     asn1_bit_string.c
 
 SRCS_test-ip +=		test-ip.c ${TEST_COMMON}
 run-regress-test-ip: test-ip
@@ -55,7 +56,7 @@ SRCS_test-roa+=	test-roa.c ${TEST_COMMON}
 run-regress-test-roa: test-roa
 	./test-roa -v ${.CURDIR}/../roa/*.roa
 
-SRCS_test-rsc+=	test-rsc.c rsc.c ${TEST_COMMON}
+SRCS_test-rsc+=	test-rsc.c ${TEST_COMMON}
 
 run-regress-test-rsc: test-rsc
 	./test-rsc -v ${.CURDIR}/../rsc/*.sig
@@ -68,11 +69,11 @@ SRCS_test-aspa+=	test-aspa.c ${TEST_COMMON}
 run-regress-test-aspa: test-aspa
 	./test-aspa -v ${.CURDIR}/../aspa/*.asa
 
-SRCS_test-tak+=	test-tak.c tak.c ${TEST_COMMON}
+SRCS_test-tak+=	test-tak.c ${TEST_COMMON}
 run-regress-test-tak: test-tak
 	./test-tak -v ${.CURDIR}/../tak/*.tak
 
-SRCS_test-spl+=	test-spl.c spl.c ${TEST_COMMON}
+SRCS_test-spl+=	test-spl.c ${TEST_COMMON}
 run-regress-test-spl: test-spl
 	./test-spl -v ${.CURDIR}/../spl/*.spl
 

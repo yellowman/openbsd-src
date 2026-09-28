@@ -1,4 +1,4 @@
-/*	$OpenBSD: sev.c,v 1.8 2026/01/14 03:09:05 dv Exp $	*/
+/*	$OpenBSD: sev.c,v 1.10 2026/09/19 17:21:52 dv Exp $	*/
 
 /*
  * Copyright (c) 2023-2025 Hans-Joerg Hoexer <hshoexer@genua.de>
@@ -94,7 +94,7 @@ sev_register_encryption(vaddr_t addr, size_t size)
 	if (size == 0)
 		return (0);
 
-	/* Adjust address and size to be aligend to AES_XTS_BLOCKSIZE. */
+	/* Adjust address and size to be aligned to AES_XTS_BLOCKSIZE. */
 	if (addr & (AES_XTS_BLOCKSIZE - 1)) {
 		size += (addr & (AES_XTS_BLOCKSIZE - 1));
 		addr &= ~(AES_XTS_BLOCKSIZE - 1);
@@ -129,7 +129,7 @@ sev_register_encryption(vaddr_t addr, size_t size)
 }
 
 /*
- * Encrypt and measure previously recorded memroy segments.
+ * Encrypt and measure previously recorded memory segments.
  *
  * This encrypts the memory initially used by the guest.  This
  * includes the kernel or BIOS image, initial stack, boot arguments
@@ -208,7 +208,7 @@ sev_encrypt_state(struct vmd_vm *vm, int vcpu_id)
 		return (0);
 
 	if (psp_encrypt_state(vm->vm_sev_handle, vm->vm_sev_asid[vcpu_id],
-	    vm->vm_vmmid, vcpu_id)) {
+	    vm->vm_fd, vcpu_id)) {
 		log_warnx("%s: failed to encrypt state: 0x%x 0x%x 0x%0x 0x%0x",
 		    __func__, vm->vm_sev_handle, vm->vm_sev_asid[vcpu_id],
 		    vm->vm_vmid, vcpu_id);

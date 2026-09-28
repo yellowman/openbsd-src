@@ -1,4 +1,4 @@
-/*	$OpenBSD: mft.c,v 1.141 2026/06/25 07:51:58 tb Exp $ */
+/*	$OpenBSD: mft.c,v 1.145 2026/09/14 09:21:41 tb Exp $ */
 /*
  * Copyright (c) 2022 Theo Buehler <tb@openbsd.org>
  * Copyright (c) 2019 Kristaps Dzonsons <kristaps@bsd.lv>
@@ -390,6 +390,8 @@ mft_cert_info(const char *fn, void *obj, const struct cert *cert)
 		err(1, NULL);
 	if ((mft->sia = strdup(cert->signedobj)) == NULL)
 		err(1, NULL);
+	if ((mft->crldp = strdup(cert->crl)) == NULL)
+		err(1, NULL);
 
 	crlfile = strrchr(cert->crl, '/');
 	if (crlfile == NULL) {
@@ -424,6 +426,12 @@ mft_validate(const char *fn, void *obj, struct cert *cert)
 	return 1;
 }
 
+static const ASN1_OBJECT *
+mft_obj_oid(void)
+{
+	return mft_oid;
+}
+
 static void *
 mft_obj_new(size_t der_len, time_t signtime)
 {
@@ -445,11 +453,14 @@ mft_obj_free(void *obj)
 
 static const struct signed_obj mft_signed_obj = {
 	.rtype = RTYPE_MFT,
+
 	.new = mft_obj_new,
 	.free = mft_obj_free,
 	.cert_info = mft_cert_info,
 	.parse_econtent = mft_parse_econtent,
 	.validate = mft_validate,
+
+	.oid = mft_obj_oid,
 };
 
 const struct signed_obj *
@@ -459,71 +470,28 @@ mft_obj(void)
 }
 
 /*
- * Parse the objects that have been published in the manifest.
- * Return mft if it conforms to RFC 9286, otherwise NULL.
- */
-struct mft *
-mft_parse(struct cert **out_cert, const char *fn, int talid,
-    const unsigned char *der, size_t len)
-{
-	struct mft	*mft;
-	struct cert	*cert = NULL;
-	int		 rc = 0;
-	size_t		 cmsz;
-	unsigned char	*cms;
-	time_t		 signtime = 0;
-
-	assert(*out_cert == NULL);
-
-	cms = cms_parse_validate(&cert, fn, talid, der, len, mft_oid, &cmsz,
-	    &signtime);
-	if (cms == NULL)
-		return NULL;
-
-	mft = mft_obj_new(len, signtime);
-	if (!mft_cert_info(fn, mft, cert))
-		goto out;
-	if (!mft_parse_econtent(fn, mft, cms, cmsz))
-		goto out;
-	if (!mft_validate(fn, mft, cert))
-		goto out;
-
-	*out_cert = cert;
-	cert = NULL;
-
-	rc = 1;
- out:
-	if (rc == 0) {
-		mft_free(mft);
-		mft = NULL;
-	}
-	cert_free(cert);
-	free(cms);
-	return mft;
-}
-
-/*
  * Free an MFT pointer.
  * Safe to call with NULL.
  */
 void
-mft_free(struct mft *p)
+mft_free(struct mft *mft)
 {
 	size_t	 i;
 
-	if (p == NULL)
+	if (mft == NULL)
 		return;
 
-	for (i = 0; i < p->filesz; i++)
-		free(p->files[i].file);
+	for (i = 0; i < mft->filesz; i++)
+		free(mft->files[i].file);
 
-	free(p->path);
-	free(p->files);
-	free(p->seqnum);
-	free(p->aki);
-	free(p->sia);
-	free(p->crl);
-	free(p);
+	free(mft->path);
+	free(mft->files);
+	free(mft->seqnum);
+	free(mft->aki);
+	free(mft->sia);
+	free(mft->crldp);
+	free(mft->crl);
+	free(mft);
 }
 
 /*
@@ -531,31 +499,31 @@ mft_free(struct mft *p)
  * See mft_read() for the other side of the pipe.
  */
 void
-mft_buffer(struct ibuf *b, const struct mft *p)
+mft_buffer(struct ibuf *b, const struct mft *mft)
 {
 	size_t		 i;
 
-	io_simple_buffer(b, &p->repoid, sizeof(p->repoid));
-	io_simple_buffer(b, &p->talid, sizeof(p->talid));
-	io_simple_buffer(b, &p->certid, sizeof(p->certid));
-	io_simple_buffer(b, &p->seqnum_gap, sizeof(p->seqnum_gap));
-	io_opt_str_buffer(b, p->path);
+	io_simple_buffer(b, &mft->repoid, sizeof(mft->repoid));
+	io_simple_buffer(b, &mft->talid, sizeof(mft->talid));
+	io_simple_buffer(b, &mft->certid, sizeof(mft->certid));
+	io_simple_buffer(b, &mft->seqnum_gap, sizeof(mft->seqnum_gap));
+	io_opt_str_buffer(b, mft->path);
 
-	io_str_buffer(b, p->aki);
-	io_str_buffer(b, p->seqnum);
-	io_str_buffer(b, p->sia);
-	io_simple_buffer(b, &p->thisupdate, sizeof(p->thisupdate));
-	io_simple_buffer(b, p->mfthash, sizeof(p->mfthash));
-	io_simple_buffer(b, &p->mftsize, sizeof(p->mftsize));
+	io_str_buffer(b, mft->aki);
+	io_str_buffer(b, mft->seqnum);
+	io_str_buffer(b, mft->sia);
+	io_simple_buffer(b, &mft->thisupdate, sizeof(mft->thisupdate));
+	io_simple_buffer(b, mft->mfthash, sizeof(mft->mfthash));
+	io_simple_buffer(b, &mft->mftsize, sizeof(mft->mftsize));
 
-	io_simple_buffer(b, &p->filesz, sizeof(size_t));
-	for (i = 0; i < p->filesz; i++) {
-		io_str_buffer(b, p->files[i].file);
-		io_simple_buffer(b, &p->files[i].type,
-		    sizeof(p->files[i].type));
-		io_simple_buffer(b, &p->files[i].location,
-		    sizeof(p->files[i].location));
-		io_simple_buffer(b, p->files[i].hash, SHA256_DIGEST_LENGTH);
+	io_simple_buffer(b, &mft->filesz, sizeof(size_t));
+	for (i = 0; i < mft->filesz; i++) {
+		io_str_buffer(b, mft->files[i].file);
+		io_simple_buffer(b, &mft->files[i].type,
+		    sizeof(mft->files[i].type));
+		io_simple_buffer(b, &mft->files[i].location,
+		    sizeof(mft->files[i].location));
+		io_simple_buffer(b, mft->files[i].hash, SHA256_DIGEST_LENGTH);
 	}
 }
 
@@ -566,40 +534,40 @@ mft_buffer(struct ibuf *b, const struct mft *p)
 struct mft *
 mft_read(struct ibuf *b)
 {
-	struct mft	*p = NULL;
+	struct mft	*mft = NULL;
 	size_t		 i;
 
-	if ((p = calloc(1, sizeof(struct mft))) == NULL)
+	if ((mft = calloc(1, sizeof(struct mft))) == NULL)
 		err(1, NULL);
 
-	io_read_buf(b, &p->repoid, sizeof(p->repoid));
-	io_read_buf(b, &p->talid, sizeof(p->talid));
-	io_read_buf(b, &p->certid, sizeof(p->certid));
-	io_read_buf(b, &p->seqnum_gap, sizeof(p->seqnum_gap));
-	io_read_opt_str(b, &p->path);
+	io_read_buf(b, &mft->repoid, sizeof(mft->repoid));
+	io_read_buf(b, &mft->talid, sizeof(mft->talid));
+	io_read_buf(b, &mft->certid, sizeof(mft->certid));
+	io_read_buf(b, &mft->seqnum_gap, sizeof(mft->seqnum_gap));
+	io_read_opt_str(b, &mft->path);
 
-	io_read_str(b, &p->aki);
-	io_read_str(b, &p->seqnum);
-	io_read_str(b, &p->sia);
-	io_read_buf(b, &p->thisupdate, sizeof(p->thisupdate));
-	io_read_buf(b, &p->mfthash, sizeof(p->mfthash));
-	io_read_buf(b, &p->mftsize, sizeof(p->mftsize));
+	io_read_str(b, &mft->aki);
+	io_read_str(b, &mft->seqnum);
+	io_read_str(b, &mft->sia);
+	io_read_buf(b, &mft->thisupdate, sizeof(mft->thisupdate));
+	io_read_buf(b, &mft->mfthash, sizeof(mft->mfthash));
+	io_read_buf(b, &mft->mftsize, sizeof(mft->mftsize));
 
-	io_read_buf(b, &p->filesz, sizeof(size_t));
-	if (p->filesz == 0)
+	io_read_buf(b, &mft->filesz, sizeof(size_t));
+	if (mft->filesz == 0)
 		err(1, "mft_read: bad message");
-	if ((p->files = calloc(p->filesz, sizeof(struct mftfile))) == NULL)
+	if ((mft->files = calloc(mft->filesz, sizeof(struct mftfile))) == NULL)
 		err(1, NULL);
 
-	for (i = 0; i < p->filesz; i++) {
-		io_read_str(b, &p->files[i].file);
-		io_read_buf(b, &p->files[i].type, sizeof(p->files[i].type));
-		io_read_buf(b, &p->files[i].location,
-		    sizeof(p->files[i].location));
-		io_read_buf(b, p->files[i].hash, SHA256_DIGEST_LENGTH);
+	for (i = 0; i < mft->filesz; i++) {
+		io_read_str(b, &mft->files[i].file);
+		io_read_buf(b, &mft->files[i].type, sizeof(mft->files[i].type));
+		io_read_buf(b, &mft->files[i].location,
+		    sizeof(mft->files[i].location));
+		io_read_buf(b, mft->files[i].hash, SHA256_DIGEST_LENGTH);
 	}
 
-	return p;
+	return mft;
 }
 
 /*

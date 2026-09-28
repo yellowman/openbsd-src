@@ -1,4 +1,4 @@
-/*	$OpenBSD: validate.c,v 1.84 2026/06/15 14:30:53 job Exp $ */
+/*	$OpenBSD: validate.c,v 1.90 2026/09/24 14:44:03 tb Exp $ */
 /*
  * Copyright (c) 2019 Kristaps Dzonsons <kristaps@bsd.lv>
  *
@@ -80,18 +80,31 @@ valid_ip(struct auth *a, enum afi afi,
 
 /*
  * Validate a non-TA certificate: make sure its IP and AS resources are
- * fully covered by those in the authority key (which must exist).
+ * fully covered by those in the issuing certificate.
  * Returns 1 if valid, 0 otherwise.
  */
-int
-valid_cert(const char *fn, struct auth *a, const struct cert *cert)
+static int
+valid_resources(const char *fn, struct auth *a, const struct cert *cert)
 {
 	size_t		 i;
 	uint32_t	 min, max;
 
 	for (i = 0; i < cert->num_ases; i++) {
-		if (cert->ases[i].type == CERT_AS_INHERIT)
-			continue;
+		if (cert->ases[i].type == CERT_AS_INHERIT) {
+			if (a->cert->num_ases > 0)
+				continue;
+
+			/*
+			 * Many MFTs are issued by a CA without AS resources.
+			 * Accept this non-compliance with RFC 3779, 3.3.
+			 * Apart from MFTs, this affects only TAKs and GBRs.
+			 */
+			if (cert->purpose == CERT_PURPOSE_EE)
+				continue;
+
+			warnx("%s: parent without AS resources", fn);
+			return 0;
+		}
 
 		if (cert->ases[i].type == CERT_AS_ID) {
 			min = cert->ases[i].id;
@@ -109,8 +122,21 @@ valid_cert(const char *fn, struct auth *a, const struct cert *cert)
 	}
 
 	for (i = 0; i < cert->num_ips; i++) {
-		if (cert->ips[i].type == CERT_IP_INHERIT)
-			continue;
+		if (cert->ips[i].type == CERT_IP_INHERIT) {
+			if (a->cert->num_ips > 0)
+				continue;
+
+			/*
+			 * Many MFT are issued by a CA without IP resources.
+			 * Accept this non-compliance with RFC 3779, 2.3.
+			 * Apart from MFTs, this affects only TAKs and GBRs.
+			 */
+			if (cert->purpose == CERT_PURPOSE_EE)
+				continue;
+
+			warnx("%s: parent without IP resources", fn);
+			return 0;
+		}
 
 		if (valid_ip(a, cert->ips[i].afi, cert->ips[i].min,
 		    cert->ips[i].max))
@@ -266,7 +292,7 @@ valid_uri(const char *uri, size_t usz, const char *proto)
 	}
 
 	/* do not allow files or directories to start with a '.' */
-	if (strstr(uri, "/.") != NULL)
+	if (memmem(uri, usz, "/.", strlen("/.")) != NULL)
 		return 0;
 
 	if (strncasecmp(uri, RSYNC_PROTO, RSYNC_PROTO_LEN) == 0) {
@@ -382,15 +408,16 @@ pretty_revocation_time(X509 *x509, X509_CRL *crl, const char **errstr)
  * returned by X509_verify_cert_error_string().
  */
 int
-valid_x509(char *file, X509_STORE_CTX *store_ctx, X509 *x509, struct auth *a,
-    struct crl *crl, const char **errstr)
+valid_cert(char *file, X509_STORE_CTX *store_ctx, struct cert *cert,
+    struct auth *a, struct crl *crl, const char **errstr)
 {
+	X509			*x509 = cert->x509;
 	X509_VERIFY_PARAM	*params;
 	ASN1_OBJECT		*cp_oid;
 	STACK_OF(X509)		*intermediates, *root;
 	STACK_OF(X509_CRL)	*crls = NULL;
 	unsigned long		 flags;
-	int			 error;
+	int			 error, ret = 0;
 
 	*errstr = NULL;
 	build_chain(a, &intermediates, &root);
@@ -429,18 +456,25 @@ valid_x509(char *file, X509_STORE_CTX *store_ctx, X509 *x509, struct auth *a,
 		*errstr = X509_verify_cert_error_string(error);
 		if (filemode && error == X509_V_ERR_CERT_REVOKED)
 			pretty_revocation_time(x509, crl->x509_crl, errstr);
-		X509_STORE_CTX_cleanup(store_ctx);
-		sk_X509_free(intermediates);
-		sk_X509_free(root);
-		sk_X509_CRL_free(crls);
-		return 0;
+		goto out;
 	}
 
+	if (cert->purpose != CERT_PURPOSE_TA) {
+		if (strcmp(cert->crl, crl->mftcrldp) != 0) {
+			*errstr = "invalid CRLDP pointer";
+			goto out;
+		}
+		if (!valid_resources(file, a, cert))
+			goto out;
+	}
+
+	ret = 1;
+ out:
 	X509_STORE_CTX_cleanup(store_ctx);
 	sk_X509_free(intermediates);
 	sk_X509_free(root);
 	sk_X509_CRL_free(crls);
-	return 1;
+	return ret;
 }
 
 /*

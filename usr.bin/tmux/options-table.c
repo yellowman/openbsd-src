@@ -1,4 +1,4 @@
-/* $OpenBSD: options-table.c,v 1.242 2026/07/27 08:03:01 nicm Exp $ */
+/* $OpenBSD: options-table.c,v 1.247 2026/09/21 10:22:31 nicm Exp $ */
 
 /*
  * Copyright (c) 2011 Nicholas Marriott <nicholas.marriott@gmail.com>
@@ -77,9 +77,10 @@ static const char *options_table_pane_border_indicators_list[] = {
 	"off", "colour", "arrows", "both", NULL
 };
 static const char *options_table_pane_border_lines_list[] = {
-	"single", "double", "heavy", "simple", "number", "spaces", "none", NULL
+	"single", "double", "heavy", "simple", "number", "spaces", "none",
+	"rounded", NULL
 };
-static const char *options_table_popup_border_lines_list[] = {
+static const char *options_table_menu_border_lines_list[] = {
 	"single", "double", "heavy", "simple", "rounded", "padded", "none", NULL
 };
 static const char *options_table_set_clipboard_list[] = {
@@ -92,7 +93,7 @@ static const char *options_table_window_size_list[] = {
 	"largest", "smallest", "manual", "latest", NULL
 };
 static const char *options_table_remain_on_exit_list[] = {
-	"off", "on", "failed", "key", NULL
+	"off", "on", "failed", "key", "failed-key", NULL
 };
 static const char *options_table_destroy_unattached_list[] = {
 	"off", "on", "keep-last", "keep-group", NULL
@@ -306,6 +307,16 @@ const struct options_table_entry options_table[] = {
 		  "When this is reached, the oldest buffer is deleted."
 	},
 
+	{ .name = "clear-on-attach",
+	  .type = OPTIONS_TABLE_FLAG,
+	  .scope = OPTIONS_TABLE_SERVER,
+	  .default_num = 1,
+	  .text = "Whether to use the alternate screen and clear it when "
+		  "a client is attached. When disabled, tmux does not "
+		  "enter the alternate screen on attach so terminal "
+		  "content before tmux remains in scrollback."
+	},
+
 	{ .name = "command-alias",
 	  .type = OPTIONS_TABLE_STRING,
 	  .scope = OPTIONS_TABLE_SERVER,
@@ -483,7 +494,7 @@ const struct options_table_entry options_table[] = {
 	{ .name = "menu-border-lines",
 	  .type = OPTIONS_TABLE_CHOICE,
 	  .scope = OPTIONS_TABLE_WINDOW,
-	  .choices = options_table_popup_border_lines_list,
+	  .choices = options_table_menu_border_lines_list,
 	  .default_num = BOX_LINES_SINGLE,
 	  .text = "Type of characters used to draw menu border lines. Some of "
 		  "these are only supported on terminals with UTF-8 support."
@@ -1241,7 +1252,8 @@ const struct options_table_entry options_table[] = {
 	   * underscore.
 	   */
 	  .default_str = "!\"#$%&'()*+,-./:;<=>?@[\\]^`{|}~",
-	  .text = "Characters considered to separate words."
+	  .text = "Characters considered to separate words; a space matches "
+		  "any character with the Unicode White_Space property."
 	},
 
 	/* Window options. */
@@ -1655,40 +1667,14 @@ const struct options_table_entry options_table[] = {
 	  .text = "Pane scrollbar position."
 	},
 
-	{ .name = "popup-style",
-	  .type = OPTIONS_TABLE_STRING,
-	  .scope = OPTIONS_TABLE_WINDOW,
-	  .default_str = "bg=themedarkgrey,fg=themewhite",
-	  .flags = OPTIONS_TABLE_IS_STYLE,
-	  .separator = ",",
-	  .text = "Default style of popups."
-	},
-
-	{ .name = "popup-border-style",
-	  .type = OPTIONS_TABLE_STRING,
-	  .scope = OPTIONS_TABLE_WINDOW,
-	  .default_str = "bg=themedarkgrey,fg=themelightgrey",
-	  .flags = OPTIONS_TABLE_IS_STYLE,
-	  .separator = ",",
-	  .text = "Default style of popup borders."
-	},
-
-	{ .name = "popup-border-lines",
-	  .type = OPTIONS_TABLE_CHOICE,
-	  .scope = OPTIONS_TABLE_WINDOW,
-	  .choices = options_table_popup_border_lines_list,
-	  .default_num = BOX_LINES_SINGLE,
-	  .text = "Type of characters used to draw popup border lines. Some of "
-		  "these are only supported on terminals with UTF-8 support."
-	},
-
 	{ .name = "remain-on-exit",
 	  .type = OPTIONS_TABLE_CHOICE,
 	  .scope = OPTIONS_TABLE_WINDOW|OPTIONS_TABLE_PANE,
 	  .choices = options_table_remain_on_exit_list,
 	  .default_num = 0,
 	  .text = "Whether panes should remain ('on'), remain until a key is "
-		  "pressed ('key') or be automatically killed ('off' or "
+		  "pressed after any exit ('key') or after a failure "
+		  "('failed-key'), or be automatically killed ('off' or "
 		  "'failed') when the program inside exits."
 	},
 

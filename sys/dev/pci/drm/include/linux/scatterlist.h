@@ -1,4 +1,4 @@
-/*	$OpenBSD: scatterlist.h,v 1.11 2026/08/19 01:34:10 jsg Exp $	*/
+/*	$OpenBSD: scatterlist.h,v 1.13 2026/09/15 01:24:06 jsg Exp $	*/
 /*
  * Copyright (c) 2013, 2014, 2015 Mark Kettenis
  *
@@ -58,6 +58,9 @@ sg_next(struct scatterlist *sgl)
 
 int sg_alloc_table(struct sg_table *, unsigned int, gfp_t);
 void sg_free_table(struct sg_table *);
+
+int sg_alloc_table_from_pages_segment(struct sg_table *, struct vm_page **,
+    unsigned int, unsigned int, unsigned long, unsigned int, gfp_t);
 
 static inline void
 sg_mark_end(struct scatterlist *sgl)
@@ -130,6 +133,9 @@ sg_set_page(struct scatterlist *sgl, struct vm_page *page,
 
 #define for_each_sgtable_sg(st, iter, i) \
 	for_each_sg((st)->sgl, iter, (st)->orig_nents, i)
+
+#define for_each_sgtable_dma_sg(st, iter, i) \
+	for_each_sg((st)->sgl, iter, (st)->nents, i)
 
 #define for_each_sg_page(sgl, iter, nents, pgoffset) \
   __sg_page_iter_start((iter), (sgl), (nents), (pgoffset)); \

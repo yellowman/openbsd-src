@@ -1,4 +1,4 @@
-/*	$OpenBSD: aspa.c,v 1.44 2026/06/25 07:51:58 tb Exp $ */
+/*	$OpenBSD: aspa.c,v 1.47 2026/09/14 09:21:41 tb Exp $ */
 /*
  * Copyright (c) 2022 Job Snijders <job@fastly.com>
  * Copyright (c) 2022 Theo Buehler <tb@openbsd.org>
@@ -179,6 +179,12 @@ aspa_validate(const char *fn, void *obj, struct cert *cert)
 	return 1; /* XXX */
 }
 
+static const ASN1_OBJECT *
+aspa_obj_oid(void)
+{
+	return aspa_oid;
+}
+
 static void *
 aspa_obj_new(size_t der_len, time_t signtime)
 {
@@ -199,11 +205,14 @@ aspa_obj_free(void *obj)
 
 static const struct signed_obj aspa_signed_obj = {
 	.rtype = RTYPE_ASPA,
+
 	.new = aspa_obj_new,
 	.free = aspa_obj_free,
 	.cert_info = aspa_cert_info,
 	.parse_econtent = aspa_parse_econtent,
 	.validate = aspa_validate,
+
+	.oid = aspa_obj_oid,
 };
 
 const struct signed_obj *
@@ -213,60 +222,17 @@ aspa_obj(void)
 }
 
 /*
- * Parse a full ASPA file.
- * Returns the payload or NULL if the file was malformed.
- */
-struct aspa *
-aspa_parse(struct cert **out_cert, const char *fn, int talid,
-    const unsigned char *der, size_t len)
-{
-	struct aspa	*aspa;
-	struct cert	*cert = NULL;
-	size_t		 cmsz;
-	unsigned char	*cms;
-	time_t		 signtime = 0;
-	int		 rc = 0;
-
-	assert(*out_cert == NULL);
-
-	cms = cms_parse_validate(&cert, fn, talid, der, len, aspa_oid, &cmsz,
-	    &signtime);
-	if (cms == NULL)
-		return NULL;
-
-	aspa = aspa_obj_new(len, signtime);
-	if (!aspa_cert_info(fn, aspa, cert))
-		goto out;
-	if (!aspa_parse_econtent(fn, aspa, cms, cmsz))
-		goto out;
-	(void)aspa_validate(fn, aspa, cert);
-
-	*out_cert = cert;
-	cert = NULL;
-
-	rc = 1;
- out:
-	if (rc == 0) {
-		aspa_free(aspa);
-		aspa = NULL;
-	}
-	cert_free(cert);
-	free(cms);
-	return aspa;
-}
-
-/*
  * Free an ASPA pointer.
  * Safe to call with NULL.
  */
 void
-aspa_free(struct aspa *p)
+aspa_free(struct aspa *aspa)
 {
-	if (p == NULL)
+	if (aspa == NULL)
 		return;
 
-	free(p->providers);
-	free(p);
+	free(aspa->providers);
+	free(aspa);
 }
 
 /*
@@ -274,16 +240,16 @@ aspa_free(struct aspa *p)
  * See aspa_read() for the reader on the other side.
  */
 void
-aspa_buffer(struct ibuf *b, const struct aspa *p)
+aspa_buffer(struct ibuf *b, const struct aspa *aspa)
 {
-	io_simple_buffer(b, &p->valid, sizeof(p->valid));
-	io_simple_buffer(b, &p->custasid, sizeof(p->custasid));
-	io_simple_buffer(b, &p->talid, sizeof(p->talid));
-	io_simple_buffer(b, &p->expires, sizeof(p->expires));
+	io_simple_buffer(b, &aspa->valid, sizeof(aspa->valid));
+	io_simple_buffer(b, &aspa->custasid, sizeof(aspa->custasid));
+	io_simple_buffer(b, &aspa->talid, sizeof(aspa->talid));
+	io_simple_buffer(b, &aspa->expires, sizeof(aspa->expires));
 
-	io_simple_buffer(b, &p->num_providers, sizeof(size_t));
-	io_simple_buffer(b, p->providers,
-	    p->num_providers * sizeof(p->providers[0]));
+	io_simple_buffer(b, &aspa->num_providers, sizeof(size_t));
+	io_simple_buffer(b, aspa->providers,
+	    aspa->num_providers * sizeof(aspa->providers[0]));
 }
 
 /*
@@ -294,27 +260,27 @@ aspa_buffer(struct ibuf *b, const struct aspa *p)
 struct aspa *
 aspa_read(struct ibuf *b)
 {
-	struct aspa	*p;
+	struct aspa	*aspa;
 
-	if ((p = calloc(1, sizeof(struct aspa))) == NULL)
+	if ((aspa = calloc(1, sizeof(struct aspa))) == NULL)
 		err(1, NULL);
 
-	io_read_buf(b, &p->valid, sizeof(p->valid));
-	io_read_buf(b, &p->custasid, sizeof(p->custasid));
-	io_read_buf(b, &p->talid, sizeof(p->talid));
-	io_read_buf(b, &p->expires, sizeof(p->expires));
+	io_read_buf(b, &aspa->valid, sizeof(aspa->valid));
+	io_read_buf(b, &aspa->custasid, sizeof(aspa->custasid));
+	io_read_buf(b, &aspa->talid, sizeof(aspa->talid));
+	io_read_buf(b, &aspa->expires, sizeof(aspa->expires));
 
-	io_read_buf(b, &p->num_providers, sizeof(size_t));
+	io_read_buf(b, &aspa->num_providers, sizeof(size_t));
 
-	if (p->num_providers > 0) {
-		if ((p->providers = calloc(p->num_providers,
-		    sizeof(p->providers[0]))) == NULL)
+	if (aspa->num_providers > 0) {
+		if ((aspa->providers = calloc(aspa->num_providers,
+		    sizeof(aspa->providers[0]))) == NULL)
 			err(1, NULL);
-		io_read_buf(b, p->providers,
-		    p->num_providers * sizeof(p->providers[0]));
+		io_read_buf(b, aspa->providers,
+		    aspa->num_providers * sizeof(aspa->providers[0]));
 	}
 
-	return p;
+	return aspa;
 }
 
 /*

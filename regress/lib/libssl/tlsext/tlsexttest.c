@@ -1,4 +1,4 @@
-/* $OpenBSD: tlsexttest.c,v 1.97 2026/04/03 07:37:52 jsing Exp $ */
+/* $OpenBSD: tlsexttest.c,v 1.99 2026/09/22 02:58:02 jsing Exp $ */
 /*
  * Copyright (c) 2017 Joel Sing <jsing@openbsd.org>
  * Copyright (c) 2017 Doug Hogan <doug@openbsd.org>
@@ -151,6 +151,14 @@ const uint8_t tlsext_alpn_single_proto[] = {
 	/* opaque ProtocolName<1..2^8-1> -- 'http/1.1' */
 	0x08, /* len */
 	0x68, 0x74, 0x74, 0x70, 0x2f, 0x31, 0x2e, 0x31
+};
+
+const uint8_t tlsext_alpn_single_proto_unadvertised[] = {
+	/* ProtocolName protocol_name_list<2..2^16-1> -- ALPN names */
+	0x00, 0x09, /* len of all names */
+	/* opaque ProtocolName<1..2^8-1> -- 'http/1.2' */
+	0x08, /* len */
+	0x68, 0x74, 0x74, 0x70, 0x2f, 0x31, 0x2e, 0x32
 };
 
 #define TLSEXT_TYPE_alpn TLSEXT_TYPE_application_layer_protocol_negotiation
@@ -331,6 +339,21 @@ test_tlsext_alpn_client(void)
 		FAIL("client ALPN differs:\n");
 		compare_data(data, dlen, tlsext_alpn_multiple_protos_val,
 		    sizeof(tlsext_alpn_multiple_protos_val));
+		goto err;
+	}
+
+	/* Make sure we don't accept a protocol we did not advertise. */
+
+	CBS_init(&cbs, tlsext_alpn_single_proto_unadvertised,
+	    sizeof(tlsext_alpn_single_proto_unadvertised));
+
+	if (client_funcs->process(ssl, SSL_TLSEXT_MSG_SH, &cbs, &alert)) {
+		FAIL("failed to reject unadvertised ALPN protocol\n");
+		goto err;
+	}
+	if (alert != SSL_AD_ILLEGAL_PARAMETER) {
+		FAIL("unadvertised ALPN: want illegal_parameter, got %s\n",
+		    SSL_alert_desc_string_long(alert));
 		goto err;
 	}
 
@@ -1410,7 +1433,7 @@ test_tlsext_ri_client(void)
 	    sizeof(tlsext_ri_prev_client));
 	ssl->s3->previous_client_finished_len = sizeof(tlsext_ri_prev_client);
 
-	ssl->s3->renegotiate_seen = 0;
+	ssl->s3->secure_renegotiation = 0;
 
 	if (!client_funcs->build(ssl, SSL_TLSEXT_MSG_CH, &cbb)) {
 		FAIL("client failed to build RI\n");
@@ -1445,19 +1468,15 @@ test_tlsext_ri_client(void)
 		goto err;
 	}
 
-	if (ssl->s3->renegotiate_seen != 1) {
-		FAIL("renegotiate seen not set\n");
-		goto err;
-	}
-	if (ssl->s3->send_connection_binding != 1) {
-		FAIL("send connection binding not set\n");
+	if (ssl->s3->secure_renegotiation != 1) {
+		FAIL("secure renegotiation not set\n");
 		goto err;
 	}
 
 	memset(ssl->s3->previous_client_finished, 0,
 	    sizeof(ssl->s3->previous_client_finished));
 
-	ssl->s3->renegotiate_seen = 0;
+	ssl->s3->secure_renegotiation = 0;
 
 	CBS_init(&cbs, tlsext_ri_client, sizeof(tlsext_ri_client));
 	if (server_funcs->process(ssl, SSL_TLSEXT_MSG_CH, &cbs, &alert)) {
@@ -1465,8 +1484,8 @@ test_tlsext_ri_client(void)
 		goto err;
 	}
 
-	if (ssl->s3->renegotiate_seen == 1) {
-		FAIL("renegotiate seen set\n");
+	if (ssl->s3->secure_renegotiation == 1) {
+		FAIL("secure renegotiation set\n");
 		goto err;
 	}
 
@@ -1515,7 +1534,7 @@ test_tlsext_ri_server(void)
 		goto err;
 	}
 
-	ssl->s3->send_connection_binding = 1;
+	ssl->s3->secure_renegotiation = 1;
 
 	if (!server_funcs->needs(ssl, SSL_TLSEXT_MSG_SH)) {
 		FAIL("server should need RI\n");
@@ -1530,7 +1549,7 @@ test_tlsext_ri_server(void)
 	    sizeof(tlsext_ri_prev_server));
 	ssl->s3->previous_server_finished_len = sizeof(tlsext_ri_prev_server);
 
-	ssl->s3->renegotiate_seen = 0;
+	ssl->s3->secure_renegotiation = 0;
 
 	if (!server_funcs->build(ssl, SSL_TLSEXT_MSG_SH, &cbb)) {
 		FAIL("server failed to build RI\n");
@@ -1565,12 +1584,8 @@ test_tlsext_ri_server(void)
 		goto err;
 	}
 
-	if (ssl->s3->renegotiate_seen != 1) {
-		FAIL("renegotiate seen not set\n");
-		goto err;
-	}
-	if (ssl->s3->send_connection_binding != 1) {
-		FAIL("send connection binding not set\n");
+	if (ssl->s3->secure_renegotiation != 1) {
+		FAIL("secure renegotiation not set\n");
 		goto err;
 	}
 
@@ -1579,7 +1594,7 @@ test_tlsext_ri_server(void)
 	memset(ssl->s3->previous_server_finished, 0,
 	    sizeof(ssl->s3->previous_server_finished));
 
-	ssl->s3->renegotiate_seen = 0;
+	ssl->s3->secure_renegotiation = 0;
 
 	CBS_init(&cbs, tlsext_ri_server, sizeof(tlsext_ri_server));
 	if (client_funcs->process(ssl, SSL_TLSEXT_MSG_SH, &cbs, &alert)) {
@@ -1587,8 +1602,8 @@ test_tlsext_ri_server(void)
 		goto err;
 	}
 
-	if (ssl->s3->renegotiate_seen == 1) {
-		FAIL("renegotiate seen set\n");
+	if (ssl->s3->secure_renegotiation == 1) {
+		FAIL("secure renegotiation set\n");
 		goto err;
 	}
 
@@ -3395,7 +3410,7 @@ test_tlsext_serverhello_build(void)
 		errx(1, "Failed to create CBB");
 
 	/* Turn a few things on so we get extensions... */
-	ssl->s3->send_connection_binding = 1;
+	ssl->s3->secure_renegotiation = 1;
 	ssl->s3->hs.cipher = ssl3_get_cipher_by_value(0xc027);
 	ssl->tlsext_status_expected = 1;
 	ssl->tlsext_ticket_expected = 1;

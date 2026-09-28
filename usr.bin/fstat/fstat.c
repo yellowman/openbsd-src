@@ -1,4 +1,4 @@
-/*	$OpenBSD: fstat.c,v 1.104 2025/12/12 06:33:18 tb Exp $	*/
+/*	$OpenBSD: fstat.c,v 1.106 2026/09/26 15:00:42 deraadt Exp $	*/
 
 /*
  * Copyright (c) 2009 Todd C. Miller <millert@openbsd.org>
@@ -127,6 +127,7 @@ void print_inet6_details(struct kinfo_file *);
 void print_sock_details(struct kinfo_file *);
 void socktrans(struct kinfo_file *);
 void vtrans(struct kinfo_file *);
+void vmmtrans(struct kinfo_file *);
 const char *inet6_addrstr(struct in6_addr *);
 int signame_to_signum(char *);
 void hide(void *p);
@@ -226,7 +227,7 @@ main(int argc, char *argv[])
 				uid_t uid;
 
 				if (uid_from_user(optarg, &uid) == -1) {
-					uid = strtonum(optarg, 0, UID_MAX,
+					uid = strtonum(optarg, 0, UINT_MAX - 1,
 					    &errstr);
 					if (errstr != NULL) {
 						errx(1, "%s: unknown uid",
@@ -414,6 +415,10 @@ fstat_dofile(struct kinfo_file *kf)
 		if (checkfile == 0)
 			kqueuetrans(kf);
 		break;
+	case DTYPE_VMM:
+		if (checkfile == 0)
+			vmmtrans(kf);
+		break;
 	default:
 		if (vflg) {
 			warnx("unknown file type %d for file %d of pid %ld",
@@ -521,6 +526,18 @@ vtrans(struct kinfo_file *kf)
 	}
 	if (filename && !fsflg)
 		printf(" %s", filename);
+	putchar('\n');
+}
+
+void
+vmmtrans(struct kinfo_file *kf)
+{
+	PREFIX(kf->fd_fd);
+
+	printf(" ");
+
+	printf("vmm ");
+	hide((void *)(uintptr_t)kf->f_data);
 	putchar('\n');
 }
 

@@ -1,4 +1,4 @@
-/*	$OpenBSD: kern_pledge.c,v 1.361 2026/08/23 16:06:25 deraadt Exp $	*/
+/*	$OpenBSD: kern_pledge.c,v 1.369 2026/09/21 00:46:13 jan Exp $	*/
 
 /*
  * Copyright (c) 2015 Nicholas Marriott <nicm@openbsd.org>
@@ -32,6 +32,8 @@
 #include <sys/ktrace.h>
 #include <sys/acct.h>
 #include <sys/swap.h>
+#include <sys/protosw.h>
+#include <sys/domain.h>
 
 #include <sys/ioctl.h>
 #include <sys/termios.h>
@@ -46,11 +48,14 @@
 #include <net/route.h>
 #include <net/if.h>
 #include <net/if_var.h>
+#include <net/if_tun.h>
 #include <netinet/in.h>
 #include <netinet6/in6_var.h>
 #include <netinet6/nd6.h>
 #include <netinet/tcp.h>
 #include <net/pfvar.h>
+#include <net/frame.h>
+#include <net/if_types.h>
 
 #include <sys/conf.h>
 #include <sys/specdev.h>
@@ -75,6 +80,7 @@
 #include "vmm.h"
 #include "psp.h"
 #include <machine/conf.h>
+#include <dev/vmm/vmm.h>
 #endif
 
 #include "drm.h"
@@ -679,6 +685,10 @@ pledge_namei(struct proc *p, struct nameidata *ni, char *path)
 	/*
 	 * In specific promise situations, __pledge_open() can open
 	 * specific paths and ignores rpath, wpath, or unveil restrictions.
+	 * Using visibility rules, only libc calls __pledge_open().  In most
+	 * cases the file descriptor returned is used only a short moment of
+	 * time and then closed.  The file descriptors are marked UF_PLEDGEOPEN
+	 * and various operations are prohibited.
 	 */
 	if (ni->ni_unveil & UNVEIL_PLEDGEOPEN) {
 #ifdef SMALL_KERNEL
@@ -1349,11 +1359,33 @@ pledge_ioctl(struct proc *p, long com, struct file *fp)
 
 #if NVMM > 0
 	if ((pledge & PLEDGE_VMM)) {
+		if (fp->f_type == DTYPE_VMM) {
+			switch (com) {
+			case VMM_IOC_RUN:
+			case VMM_IOC_RESETCPU:
+			case VMM_IOC_READREGS:
+			case VMM_IOC_WRITEREGS:
+			case VMM_IOC_READVMPARAMS:
+			case VMM_IOC_WRITEVMPARAMS:
+			case VMM_IOC_SHAREMEM:
+			case VMM_IOC_INTR:
+				return (0);
+			default:
+				break;
+			}
+		}
 		if (fp->f_type == DTYPE_VNODE &&
 		    vp->v_type == VCHR &&
 		    cdevsw[major(vp->v_rdev)].d_open == vmmopen) {
-			error = pledge_ioctl_vmm(p, com);
-			if (error == 0)
+			switch (com) {
+			case VMM_IOC_CREATE:
+				return (0);
+			}
+		}
+		if ((fp->f_type == DTYPE_VNODE) &&
+		    (vp->v_type == VCHR) &&
+		    (cdevsw[major(vp->v_rdev)].d_open == tapopen)) {
+			if (com == TUNSCAP)
 				return 0;
 		}
 	}
@@ -1375,13 +1407,38 @@ pledge_ioctl(struct proc *p, long com, struct file *fp)
 }
 
 int
-pledge_sockopt(struct proc *p, int set, int level, int optname)
+pledge_sockopt(struct proc *p, int set, const struct protosw *pr,
+    int level, int optname)
 {
 	uint64_t pledge;
+	int af, af_inet = 0;
+	short proto;
 
 	if ((p->p_p->ps_flags & PS_PLEDGE) == 0)
 		return (0);
 	pledge = p->p_pledge;
+
+	/*
+	 * the meaning of level and optname is scoped to the protocol
+	 * handler, which in turn is scoped by an address family.
+	 * there are exceptions though.
+	 *
+	 * optnames at the SOL_SOCKET level apply regardless of the
+	 * address family and protocol, so those variables are ignored
+	 * for that level.
+	 *
+	 * similarly, an address family may have a level that applies
+	 * to all protocols, eg, optnames at the level of IPPROTO_IP
+	 * in the the AF_INET family apply to all protocols.
+	 *
+	 * some protocols are implemented in multiple address families. eg,
+	 * the IPPROTO_TCP protocol and it's associated IPPROTO_TCP level
+	 * operates under both the AF_INET and AF_INET6 address families,
+	 * and should be handled for both.
+	 */
+
+	af = pr->pr_domain->dom_family;
+	proto = pr->pr_protocol;
 
 	/* Always allow these, which are too common to reject */
 	switch (level) {
@@ -1392,22 +1449,45 @@ pledge_sockopt(struct proc *p, int set, int level, int optname)
 			return (0);
 		}
 		break;
-	case IPPROTO_TCP:
-		switch (optname) {
-		case TCP_NODELAY:
-			return (0);
+	}
+
+	switch (af) {
+	case AF_INET:
+	case AF_INET6:
+		af_inet = af;
+	case AF_UNIX: /* some software assumes all streams are tcp */
+		if (level == IPPROTO_TCP) {
+			switch (optname) {
+			case TCP_NODELAY:
+				return (0);
+			}
 		}
 		break;
-	case IPPROTO_IP:
-		switch (optname) {
-		case IP_TOS:
-			return (0);
+	}
+
+	switch (af) {
+	case AF_INET:
+		if (level == IPPROTO_IP) {
+			switch (optname) {
+			case IP_TOS:
+				return (0);
+			}
 		}
 		break;
-	case IPPROTO_IPV6:
-		switch (optname) {
-		case IPV6_TCLASS:
-			return (0);
+	case AF_INET6:
+		switch (level) {
+		case IPPROTO_IPV6:
+			switch (optname) {
+			case IPV6_TCLASS:
+				return (0);
+			}
+			break;
+		/* Lots of software tries IPPROTO_IP / IP_TOS on v6 sockets */
+		case IPPROTO_IP:
+			switch (optname) {
+			case IP_TOS:
+				return (0);
+			}
 		}
 		break;
 	}
@@ -1417,6 +1497,18 @@ pledge_sockopt(struct proc *p, int set, int level, int optname)
 		case SOL_SOCKET:
 			switch (optname) {
 			case SO_RTABLE:
+				return (0);
+			}
+		}
+	}
+
+	if ((pledge & PLEDGE_MCAST)) {
+		if (af == AF_FRAME &&
+		    proto == IFT_ETHER &&
+		    level == IFT_ETHER) {
+			switch (optname) {
+			case FRAME_ADD_MEMBERSHIP:
+			case FRAME_DEL_MEMBERSHIP:
 				return (0);
 			}
 		}
@@ -1436,8 +1528,8 @@ pledge_sockopt(struct proc *p, int set, int level, int optname)
 
 	/* DNS resolver may do these requests */
 	if ((pledge & PLEDGE_DNS)) {
-		switch (level) {
-		case IPPROTO_IPV6:
+		if (af == AF_INET6 &&
+		    level == IPPROTO_IPV6) {
 			switch (optname) {
 			case IPV6_RECVPKTINFO:
 			case IPV6_USE_MIN_MTU:
@@ -1459,8 +1551,10 @@ pledge_sockopt(struct proc *p, int set, int level, int optname)
 
 	if ((pledge & PLEDGE_INET) == 0)
 		return pledge_fail(p, EPERM, PLEDGE_INET);
-	switch (level) {
-	case IPPROTO_TCP:
+	if (!af_inet) /* af must be AF_INET or AF_INET6 after this point */
+		return pledge_fail(p, EPERM, PLEDGE_INET);
+
+	if (proto == IPPROTO_TCP && level == IPPROTO_TCP) {
 		switch (optname) {
 		case TCP_MD5SIG:
 		case TCP_SACK_ENABLE:
@@ -1469,8 +1563,13 @@ pledge_sockopt(struct proc *p, int set, int level, int optname)
 		case TCP_INFO:
 			return (0);
 		}
-		break;
-	case IPPROTO_IP:
+	}
+
+	switch (af_inet) {
+	case AF_INET:
+		if (level != IPPROTO_IP)
+			break;
+
 		switch (optname) {
 		case IP_OPTIONS:
 			if (!set)
@@ -1493,9 +1592,11 @@ pledge_sockopt(struct proc *p, int set, int level, int optname)
 			break;
 		}
 		break;
-	case IPPROTO_ICMP:
-		break;
-	case IPPROTO_IPV6:
+
+	case AF_INET6:
+		if (level != IPPROTO_IPV6)
+			break;
+
 		switch (optname) {
 		case IPV6_DONTFRAG:
 		case IPV6_UNICAST_HOPS:
@@ -1516,8 +1617,6 @@ pledge_sockopt(struct proc *p, int set, int level, int optname)
 				return (0);
 			break;
 		}
-		break;
-	case IPPROTO_ICMPV6:
 		break;
 	}
 	return pledge_fail(p, EPERM, PLEDGE_INET);

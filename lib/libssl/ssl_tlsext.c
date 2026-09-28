@@ -1,4 +1,4 @@
-/* $OpenBSD: ssl_tlsext.c,v 1.166 2026/08/21 17:15:22 tb Exp $ */
+/* $OpenBSD: ssl_tlsext.c,v 1.170 2026/09/21 23:37:20 jsing Exp $ */
 /*
  * Copyright (c) 2016, 2017, 2019 Joel Sing <jsing@openbsd.org>
  * Copyright (c) 2017 Doug Hogan <doug@openbsd.org>
@@ -163,28 +163,42 @@ tlsext_alpn_server_build(SSL *s, uint16_t msg_type, CBB *cbb)
 static int
 tlsext_alpn_client_process(SSL *s, uint16_t msg_type, CBS *cbs, int *alert)
 {
-	CBS list, proto;
+	CBS server_list, supported_list;
+	CBS selected, proto;
 
 	if (s->alpn_client_proto_list == NULL) {
 		*alert = SSL_AD_UNSUPPORTED_EXTENSION;
 		return 0;
 	}
 
-	if (!CBS_get_u16_length_prefixed(cbs, &list))
+	if (!CBS_get_u16_length_prefixed(cbs, &server_list))
+		return 0;
+	if (!CBS_get_u8_length_prefixed(&server_list, &selected))
 		return 0;
 
-	if (!CBS_get_u8_length_prefixed(&list, &proto))
+	if (CBS_len(&server_list) != 0)
+		return 0;
+	if (CBS_len(&selected) == 0)
 		return 0;
 
-	if (CBS_len(&list) != 0)
-		return 0;
-	if (CBS_len(&proto) == 0)
-		return 0;
+	/*
+	 * Check the server selected a protocol that we advertised as supported.
+	 */
 
-	if (!CBS_stow(&proto, &s->s3->alpn_selected, &s->s3->alpn_selected_len))
-		return 0;
+	CBS_init(&supported_list, s->alpn_client_proto_list,
+	    s->alpn_client_proto_list_len);
 
-	return 1;
+	while (CBS_len(&supported_list) > 0) {
+		if (!CBS_get_u8_length_prefixed(&supported_list, &proto))
+			return 0;
+		if (CBS_mem_equal(&selected, CBS_data(&proto), CBS_len(&proto)))
+			return CBS_stow(&selected,
+			    &s->s3->alpn_selected, &s->s3->alpn_selected_len);
+	}
+
+	*alert = SSL_AD_ILLEGAL_PARAMETER;
+
+	return 0;
 }
 
 /*
@@ -482,8 +496,7 @@ tlsext_ri_server_process(SSL *s, uint16_t msg_type, CBS *cbs, int *alert)
 		return 0;
 	}
 
-	s->s3->renegotiate_seen = 1;
-	s->s3->send_connection_binding = 1;
+	s->s3->secure_renegotiation = 1;
 
 	return 1;
 }
@@ -492,7 +505,7 @@ static int
 tlsext_ri_server_needs(SSL *s, uint16_t msg_type)
 {
 	return (s->s3->hs.negotiated_tls_version < TLS1_3_VERSION &&
-	    s->s3->send_connection_binding);
+	    s->s3->secure_renegotiation);
 }
 
 static int
@@ -563,8 +576,7 @@ tlsext_ri_client_process(SSL *s, uint16_t msg_type, CBS *cbs, int *alert)
 		return 0;
 	}
 
-	s->s3->renegotiate_seen = 1;
-	s->s3->send_connection_binding = 1;
+	s->s3->secure_renegotiation = 1;
 
 	return 1;
 }
@@ -2707,7 +2719,6 @@ static void
 tlsext_server_reset_state(SSL *s)
 {
 	s->tlsext_status_type = -1;
-	s->s3->renegotiate_seen = 0;
 	free(s->s3->alpn_selected);
 	s->s3->alpn_selected = NULL;
 	s->s3->alpn_selected_len = 0;
@@ -2749,7 +2760,6 @@ tlsext_server_parse(SSL *s, uint16_t msg_type, CBS *cbs, int *alert)
 static void
 tlsext_client_reset_state(SSL *s)
 {
-	s->s3->renegotiate_seen = 0;
 	free(s->s3->alpn_selected);
 	s->s3->alpn_selected = NULL;
 	s->s3->alpn_selected_len = 0;

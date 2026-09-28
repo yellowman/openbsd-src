@@ -1,4 +1,4 @@
-/* $OpenBSD: x509_verify.c,v 1.78 2026/07/31 03:59:50 kenjiro Exp $ */
+/* $OpenBSD: x509_verify.c,v 1.81 2026/09/21 03:34:15 tb Exp $ */
 /*
  * Copyright (c) 2020-2021 Bob Beck <beck@openbsd.org>
  *
@@ -760,8 +760,11 @@ x509_verify_cert_hostname(struct x509_verify_ctx *ctx, X509 *cert, char *name)
 		if (ctx->xsc != NULL) {
 			int ret;
 
-			if ((ret = x509_vfy_check_id(ctx->xsc)) == 0)
+			ret = x509_vfy_check_id(ctx->xsc);
+			if (ctx->xsc->error != X509_V_OK) {
 				ctx->error = ctx->xsc->error;
+				ctx->error_depth = ctx->xsc->error_depth;
+			}
 			return ret;
 		}
 		return 1;
@@ -1146,6 +1149,11 @@ x509_verify(struct x509_verify_ctx *ctx, X509 *leaf, char *name)
 		ctx->error = X509_V_ERR_OUT_OF_MEM;
 		goto err;
 	}
+
+        if (!x509_verify_cert_cache_extensions(leaf)) {
+		ctx->error = X509_V_ERR_OUT_OF_MEM;	/* XXX */
+		goto err;
+        }
 
 	/*
 	 * Add the leaf to the chain and try to build chains from it.

@@ -1,4 +1,4 @@
-/*	$OpenBSD: parse.y,v 1.503 2026/06/02 08:40:02 claudio Exp $ */
+/*	$OpenBSD: parse.y,v 1.506 2026/09/24 11:41:41 job Exp $ */
 
 /*
  * Copyright (c) 2002, 2003, 2004 Henning Brauer <henning@openbsd.org>
@@ -663,12 +663,6 @@ aspa_tas_l	: aspa_tas			{ $$ = $1; }
 		;
 
 aspa_tas	: as4number_any {
-			if (($$ = calloc(1, sizeof(*$$))) == NULL)
-				fatal(NULL);
-			$$->as = $1;
-			$$->num = 1;
-		}
-		| as4number_any af {
 			if (($$ = calloc(1, sizeof(*$$))) == NULL)
 				fatal(NULL);
 			$$->as = $1;
@@ -2905,7 +2899,7 @@ filter_elm	: filter_prefix_h	{
 		}
 		| MAXCOMMUNITIES NUMBER {
 			if ($2 < 0 || $2 > INT16_MAX) {
-				yyerror("bad max-comunities %lld", $2);
+				yyerror("bad max-communities %lld", $2);
 				YYERROR;
 			}
 			if (fmopts.m.maxcomm != 0) {
@@ -4465,6 +4459,10 @@ parsecommunity(struct community *c, int type, char *s)
 	} else if (strcasecmp(s, "BLACKHOLE") == 0) {
 		setcommunity(c, COMMUNITY_WELLKNOWN,
 		    COMMUNITY_BLACKHOLE, 0, 0);
+		return (0);
+	} else if (strcasecmp(s, "DOWNGRADE") == 0) {
+		setcommunity(c, COMMUNITY_WELLKNOWN,
+		    COMMUNITY_DOWNGRADE, 0, 0);
 		return (0);
 	}
 

@@ -1,4 +1,4 @@
-/* $OpenBSD: openssl.c,v 1.41 2026/01/02 00:14:24 kenjiro Exp $ */
+/* $OpenBSD: openssl.c,v 1.43 2026/09/14 23:36:58 kenjiro Exp $ */
 /* Copyright (C) 1995-1998 Eric Young (eay@cryptsoft.com)
  * All rights reserved.
  *
@@ -347,7 +347,6 @@ openssl_startup(void)
 {
 	signal(SIGPIPE, SIG_IGN);
 
-	OpenSSL_add_all_algorithms();
 	SSL_library_init();
 	SSL_load_error_strings();
 
@@ -360,10 +359,6 @@ openssl_shutdown(void)
 	CONF_modules_unload(1);
 	destroy_ui();
 	OBJ_cleanup();
-	EVP_cleanup();
-	CRYPTO_cleanup_all_ex_data();
-	ERR_remove_thread_state(NULL);
-	ERR_free_strings();
 }
 
 int
@@ -461,6 +456,9 @@ main(int argc, char **argv)
 		BIO_free(bio_err);
 		bio_err = NULL;
 	}
+	ERR_remove_thread_state(NULL);
+	OPENSSL_cleanup();
+
 	return (ret);
 }
 
