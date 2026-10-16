@@ -346,7 +346,7 @@ hammer2_bioq_enter(hammer2_pfs_t *pmp)
 		if (lowat < 1)
 			lowat = 1;
 		do {
-			hammer2_lkc_sleep(&pmp->bioq_cv, &pmp->bioq_lock,
+			rwsleep(&pmp->bioq_cv, &pmp->bioq_lock, PRIBIO,
 			    "h2wpipe", 0);
 		} while (pmp->bioq_inprog > lowat);
 	}
@@ -376,7 +376,7 @@ hammer2_bioq_wait(hammer2_pfs_t *pmp, int count)
 
 	hammer2_lk_ex(&pmp->bioq_lock);
 	while (pmp->bioq_inprog > count)
-		hammer2_lkc_sleep(&pmp->bioq_cv, &pmp->bioq_lock,
+		rwsleep(&pmp->bioq_cv, &pmp->bioq_lock, PRIBIO,
 		    "h2lwinp", 0);
 	hammer2_lk_unlock(&pmp->bioq_lock);
 }
