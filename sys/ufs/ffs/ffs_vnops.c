@@ -280,7 +280,6 @@ ffs_write(void *v)
 	daddr_t lbn;
 	off_t osize;
 	int blkoffset, error, extended, flags, ioflag, size, xfersize;
-	int write_error;
 	size_t resid;
 	ssize_t overrun;
 
@@ -374,11 +373,9 @@ ffs_write(void *v)
 		if (ioflag & IO_NOCACHE)
 			bp->b_flags |= B_NOCACHE;
 
-		if (ioflag & IO_SYNC) {
-			write_error = bwrite(bp);
-			if (error == 0)
-				error = write_error;
-		} else if (xfersize + blkoffset == fs->fs_bsize) {
+		if (ioflag & IO_SYNC)
+			(void)bwrite(bp);
+		else if (xfersize + blkoffset == fs->fs_bsize) {
 			bawrite(bp);
 		} else
 			bdwrite(bp);
