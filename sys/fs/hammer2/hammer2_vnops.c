@@ -1299,7 +1299,7 @@ hammer2_extend_buffers(hammer2_inode_t *ip, hammer2_key_t osize,
 	lblksize = hammer2_calc_logical(ip, osize - 1, &lbase, NULL);
 	KKASSERT(lblksize <= MAXBSIZE);
 	boff = (int)(osize - lbase);
-	if (boff == 0)
+	if (boff == lblksize)
 		return (0);
 
 	lbn = lbase / lblksize;
@@ -1394,7 +1394,10 @@ hammer2_extend_file(hammer2_inode_t *ip, hammer2_key_t nsize)
 	osize = ip->meta.size;
 	bp = NULL;
 
+	/* As for truncation, writeback must be able to lock this inode. */
+	hammer2_mtx_unlock(&ip->lock);
 	error = hammer2_extend_buffers(ip, osize, nsize, &bp);
+	hammer2_mtx_ex(&ip->lock);
 	if (error)
 		return (error);
 
@@ -1414,7 +1417,8 @@ hammer2_extend_file(hammer2_inode_t *ip, hammer2_key_t nsize)
 	 */
 	if (osize <= HAMMER2_EMBEDDED_BYTES && nsize > HAMMER2_EMBEDDED_BYTES) {
 		atomic_set_int(&ip->flags, HAMMER2_INODE_RESIZED);
-		hammer2_inode_chain_sync(ip);
+		error = hammer2_error_to_errno(hammer2_inode_chain_sync(ip));
+		hammer2_pfs_record_error(ip->pmp, error);
 	}
 	hammer2_mtx_unlock(&ip->lock);
 	if (ip->vp) {
@@ -1425,7 +1429,7 @@ hammer2_extend_file(hammer2_inode_t *ip, hammer2_key_t nsize)
 		bdwrite(bp);
 	hammer2_mtx_ex(&ip->lock);
 
-	return (0);
+	return (error);
 }
 
 static int
