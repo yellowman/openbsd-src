@@ -492,6 +492,11 @@ hammer2_setattr(void *v)
 	    vap->va_gen != (u_long)VNOVAL)
 		return (EINVAL);
 
+	error = hammer2_pfs_memory_check(ip->pmp,
+	    vap->va_size != (u_quad_t)VNOVAL && vap->va_size <= ip->meta.size);
+	if (error)
+		return (error);
+
 	hammer2_trans_init(ip->pmp, 0);
 	hammer2_inode_lock(ip, 0);
 
@@ -1110,6 +1115,10 @@ hammer2_write(void *v)
 	if (vp->v_type != VREG)
 		return (EINVAL);
 
+	error = hammer2_pfs_memory_check(ip->pmp, uio->uio_segflg == UIO_SYSSPACE);
+	if (error)
+		return (error);
+
 	if (ip->pmp->rdonly || (ip->pmp->flags & HAMMER2_PMPF_EMERG))
 		return (EROFS);
 
@@ -1707,6 +1716,10 @@ hammer2_mknod(void *v)
 	uint64_t mtime;
 	int error;
 
+	error = hammer2_pfs_memory_check(dip->pmp, 0);
+	if (error)
+		return (error);
+
 	if (dip->pmp->rdonly || (dip->pmp->flags & HAMMER2_PMPF_EMERG))
 		return (EROFS);
 
@@ -1807,6 +1820,10 @@ hammer2_mkdir(void *v)
 		goto out;
 	}
 
+	error = hammer2_pfs_memory_check(dip->pmp, 0);
+	if (error)
+		goto out;
+
 	if (dip->pmp->rdonly || (dip->pmp->flags & HAMMER2_PMPF_EMERG)) {
 		error = EROFS;
 		goto out;
@@ -1901,6 +1918,10 @@ hammer2_create(void *v)
 		hpanic("no name");
 #endif
 	*ap->a_vpp = NULL; /* out */
+	error = hammer2_pfs_memory_check(dip->pmp, 0);
+	if (error)
+		goto out;
+
 	if (dip->pmp->rdonly || (dip->pmp->flags & HAMMER2_PMPF_EMERG)) {
 		error = EROFS;
 		goto out;
@@ -2002,6 +2023,10 @@ hammer2_rmdir(void *v)
 		goto out;
 	}
 
+	error = hammer2_pfs_memory_check(dip->pmp, 1);
+	if (error)
+		goto out;
+
 	if (dip->pmp->rdonly) {
 		error = EROFS;
 		goto out;
@@ -2091,6 +2116,10 @@ hammer2_remove(void *v)
 		error = EPERM;
 		goto out;
 	}
+
+	error = hammer2_pfs_memory_check(dip->pmp, 1);
+	if (error)
+		goto out;
 
 	if (dip->pmp->rdonly) {
 		error = EROFS;
@@ -2206,6 +2235,10 @@ hammer2_rename(void *v)
 		error = EPERM;
 		goto abortit;
 	}
+
+	error = hammer2_pfs_memory_check(fdip->pmp, 0);
+	if (error)
+		goto abortit;
 
 	if (fdip->pmp->rdonly || (fdip->pmp->flags & HAMMER2_PMPF_EMERG)) {
 		error = EROFS;
@@ -2568,6 +2601,10 @@ hammer2_link(void *v)
 		goto out;
 	}
 
+	error = hammer2_pfs_memory_check(tdip->pmp, 0);
+	if (error)
+		goto out;
+
 	if (tdip->pmp->rdonly || (tdip->pmp->flags & HAMMER2_PMPF_EMERG)) {
 		error = EROFS;
 		goto out;
@@ -2653,6 +2690,10 @@ hammer2_symlink(void *v)
 		hpanic("no name");
 #endif
 	*ap->a_vpp = NULL; /* out */
+	error = hammer2_pfs_memory_check(dip->pmp, 0);
+	if (error)
+		goto out;
+
 	if (dip->pmp->rdonly || (dip->pmp->flags & HAMMER2_PMPF_EMERG)) {
 		error = EROFS;
 		goto out;

@@ -54,7 +54,6 @@ static int hammer2_devvp_same(const hammer2_devvp_t *,
 static int hammer2_devvp_list_exact_match(const hammer2_devvp_list_t *,
     const hammer2_devvp_list_t *);
 static void hammer2_pfs_schedule_sync(hammer2_pfs_t *);
-static int hammer2_vfs_modifying(struct mount *, struct vnode *, int);
 static void hammer2_mount_helper(struct mount *, hammer2_pfs_t *);
 static void hammer2_unmount_helper(struct mount *, hammer2_pfs_t *,
     hammer2_dev_t *);
@@ -254,7 +253,6 @@ hammer2_pfsalloc(hammer2_chain_t *chain, const hammer2_inode_data_t *ripdata,
 		hammer2_lk_init(&pmp->bioq_lock, "h2mp_bioq");
 		hammer2_lkc_init(&pmp->bioq_cv, "h2mp_bioq_cv");
 		hammer2_lk_init(&pmp->memory_lock, "h2mp_mem");
-		hammer2_lkc_init(&pmp->memory_cv, "h2mp_mem_cv");
 		TAILQ_INIT(&pmp->syncq);
 		TAILQ_INIT(&pmp->depq);
 		hammer2_inum_hash_init(pmp);
@@ -421,7 +419,6 @@ hammer2_pfsfree(hammer2_pfs_t *pmp)
 		hammer2_lk_destroy(&pmp->bioq_lock);
 		hammer2_lkc_destroy(&pmp->bioq_cv);
 		hammer2_lk_destroy(&pmp->memory_lock);
-		hammer2_lkc_destroy(&pmp->memory_cv);
 		hammer2_inum_hash_destroy(pmp);
 		hashfree(pmp->ipdep_lists, HAMMER2_IHASH_SIZE, M_HAMMER2);
 		if (pmp->fspec)
@@ -1247,70 +1244,34 @@ hammer2_pfs_error(hammer2_pfs_t *pmp)
 	return (error);
 }
 
+/*
+ * Called before starting a modifying transaction.  Vnode locks may be held:
+ * never sleep waiting for the syncer and never drop a caller's vnode lock.
+ * Pageout and operations releasing space may bypass pressure, not I/O errors.
+ */
 int
-hammer2_pfs_memory_wait(hammer2_pfs_t *pmp)
+hammer2_pfs_memory_check(hammer2_pfs_t *pmp, int reclaim)
 {
-	int dirty_chains;
-	int dirty_inodes;
-	int error;
+	unsigned long inodes;
+	int chains, error, high, busy;
 
-	if (pmp == NULL || pmp->mp == NULL)
-		return (0);
-
-	for (;;) {
-		hammer2_lk_ex(&pmp->memory_lock);
-		dirty_chains = pmp->inmem_dirty_chains;
-		dirty_inodes = atomic_load_long((volatile unsigned long *)&pmp->sideq_count);
-
-		if (dirty_chains > hammer2_limit_dirty_chains / 2 ||
-		    dirty_inodes > hammer2_limit_dirty_inodes / 2)
-			hammer2_pfs_schedule_sync(pmp);
-
-		if (dirty_chains < hammer2_limit_dirty_chains &&
-		    dirty_inodes < hammer2_limit_dirty_inodes) {
-			hammer2_lk_unlock(&pmp->memory_lock);
-			break;
-		}
-
-		error = hammer2_lkc_sleep(&pmp->memory_cv, &pmp->memory_lock,
-		    "h2memw", hz);
-		hammer2_lk_unlock(&pmp->memory_lock);
-		if (error == ERESTART || error == EINTR)
-			return (error);
-	}
-
-	return (0);
+	error = hammer2_pfs_error(pmp);
+	if (error)
+		return (error);
+	hammer2_lk_ex(&pmp->memory_lock);
+	chains = pmp->inmem_dirty_chains;
+	inodes = atomic_load_long((volatile unsigned long *)&pmp->sideq_count);
+	high = chains > hammer2_limit_dirty_chains / 2 ||
+	    inodes > (unsigned long)hammer2_limit_dirty_inodes / 2;
+	busy = chains >= hammer2_limit_dirty_chains ||
+	    inodes >= (unsigned long)hammer2_limit_dirty_inodes;
+	hammer2_lk_unlock(&pmp->memory_lock);
+	if (high)
+		hammer2_pfs_schedule_sync(pmp);
+	return (busy && !reclaim ? EAGAIN : 0);
 }
 
-static int
-hammer2_vfs_modifying(struct mount *mp, struct vnode *vp, int flags)
-{
-	hammer2_pfs_t *pmp;
-	int dirty_chains;
-	int dirty_inodes;
 
-	(void)vp;
-	if (mp == NULL)
-		return (0);
-	pmp = MPTOPMP(mp);
-	if (pmp == NULL)
-		return (0);
-	if (flags & VFS_MODIFYING_BUFCACHE)
-		return (0);
-	if (mp->mnt_flag & MNT_RDONLY)
-		return (EROFS);
-	if (flags & VFS_MODIFYING_LOCKHELD) {
-		hammer2_lk_ex(&pmp->memory_lock);
-		dirty_chains = pmp->inmem_dirty_chains;
-		dirty_inodes = atomic_load_long((volatile unsigned long *)&pmp->sideq_count);
-		hammer2_lk_unlock(&pmp->memory_lock);
-		if (dirty_chains > hammer2_limit_dirty_chains / 2 ||
-		    dirty_inodes > hammer2_limit_dirty_inodes / 2)
-			hammer2_pfs_schedule_sync(pmp);
-		return (0);
-	}
-	return (hammer2_pfs_memory_wait(pmp));
-}
 
 int
 hammer2_pfs_fsync_devices(hammer2_pfs_t *pmp, struct ucred *cred, int waitfor,
@@ -1361,22 +1322,12 @@ hammer2_pfs_fsync_devices(hammer2_pfs_t *pmp, struct ucred *cred, int waitfor,
 void
 hammer2_pfs_memory_wakeup(hammer2_pfs_t *pmp, int count)
 {
-	int dirty_chains;
-	int dirty_inodes;
-
 	if (pmp == NULL)
 		return;
-
 	hammer2_lk_ex(&pmp->memory_lock);
 	pmp->inmem_dirty_chains += count;
 	if (pmp->inmem_dirty_chains < 0)
 		pmp->inmem_dirty_chains = 0;
-	dirty_chains = pmp->inmem_dirty_chains;
-	dirty_inodes = atomic_load_long((volatile unsigned long *)&pmp->sideq_count);
-
-	if (dirty_chains <= hammer2_limit_dirty_chains * 2 / 3 &&
-	    dirty_inodes <= hammer2_limit_dirty_inodes * 2 / 3)
-		hammer2_lkc_wakeup(&pmp->memory_cv);
 	hammer2_lk_unlock(&pmp->memory_lock);
 }
 
@@ -2571,7 +2522,6 @@ const struct vfsops hammer2_vfsops = {
 	.vfs_quotactl = hammer2_quotactl,
 	.vfs_statfs = hammer2_statfs,
 	.vfs_sync = hammer2_sync,
-	.vfs_modifying = hammer2_vfs_modifying,
 	.vfs_vget = hammer2_vget,
 	.vfs_fhtovp = hammer2_fhtovp,
 	.vfs_vptofh = hammer2_vptofh,

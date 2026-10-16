@@ -906,7 +906,6 @@ struct hammer2_pfs {
 	int			bioq_inprog;
 	volatile unsigned int	write_error;	/* sticky native backend errno */
 	hammer2_lk_t		memory_lock;
-	hammer2_lkc_t		memory_cv;
 	int			inmem_dirty_chains;
 	struct mount		*mp;
 	struct uuid		pfs_clid;
@@ -1163,7 +1162,7 @@ int hammer2_strategy(void *v);
 void hammer2_xop_strategy_read(hammer2_xop_t *, void *, int);
 void hammer2_xop_strategy_write(hammer2_xop_t *, void *, int);
 void hammer2_bioq_sync(hammer2_pfs_t *);
-int hammer2_pfs_memory_wait(hammer2_pfs_t *);
+int hammer2_pfs_memory_check(hammer2_pfs_t *, int);
 void hammer2_pfs_record_error(hammer2_pfs_t *, int);
 int hammer2_pfs_error(hammer2_pfs_t *);
 void hammer2_pfs_memory_wakeup(hammer2_pfs_t *, int);
