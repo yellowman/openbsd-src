@@ -456,7 +456,7 @@ hammer2_xop_strategy_write(hammer2_xop_t *arg, void *scratch, int clindex)
 		splx(s);
 	}
 	if (wref)
-		hammer2_wref_complete(wref);
+		hammer2_wref_complete(wref, hammer2_error_to_errno(error));
 	xop->wref = NULL;
 	hammer2_trans_assert_strategy(ip->pmp);
 	hammer2_trans_done(ip->pmp, HAMMER2_TRANS_BUFCACHE);

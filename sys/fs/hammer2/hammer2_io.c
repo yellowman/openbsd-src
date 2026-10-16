@@ -79,7 +79,7 @@ hammer2_io_track_iodone(struct buf *bp)
 	hammer2_wref_t *wref, *next;
 	void (*iodone)(struct buf *);
 	void *saveaddr;
-	int docall;
+	int docall, error;
 
 	track = bp->b_saveaddr;
 	KASSERT(track);
@@ -91,13 +91,10 @@ hammer2_io_track_iodone(struct buf *bp)
 	bp->b_iodone = iodone;
 	hfree(track, M_HAMMER2, sizeof(*track));
 
+	error = (bp->b_flags & B_ERROR) ? (bp->b_error ? bp->b_error : EIO) : 0;
 	while (wref) {
 		next = wref->next;
-		if ((bp->b_flags & B_ERROR) && wref->wsync) {
-			(void)atomic_cas_uint(&wref->wsync->error, 0,
-			    bp->b_error ? (unsigned int)bp->b_error : (unsigned int)EIO);
-		}
-		hammer2_wref_complete(wref);
+		hammer2_wref_complete(wref, error);
 		wref = next;
 	}
 

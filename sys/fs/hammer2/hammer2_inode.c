@@ -525,14 +525,21 @@ hammer2_inode_ref(hammer2_inode_t *ip)
 	atomic_add_int(&ip->refs, 1);
 }
 
-static void
-hammer2_wsync_ref(hammer2_wsync_t *wsync)
+/* A callback may outlive the inode or mount owning the initial reference. */
+hammer2_wsync_t *
+hammer2_wsync_alloc(void)
 {
-	if (wsync)
-		atomic_inc_int(&wsync->refs);
+	hammer2_wsync_t *wsync;
+
+	wsync = hmalloc(sizeof(*wsync), M_HAMMER2, M_WAITOK | M_ZERO);
+	wsync->refs = 1;
+	mtx_init(&wsync->lock, IPL_BIO);
+	return (wsync);
 }
 
-static void
+
+
+void
 hammer2_wsync_drop(hammer2_wsync_t *wsync)
 {
 	if (wsync == NULL)
@@ -544,66 +551,74 @@ hammer2_wsync_drop(hammer2_wsync_t *wsync)
 hammer2_wref_t *
 hammer2_wref_alloc(hammer2_inode_t *ip)
 {
-	hammer2_wref_t *wref;
-	hammer2_wsync_t *wsync;
+	return (hammer2_wsync_getref(ip->wsync));
+}
 
-	wref = hmalloc(sizeof(*wref), M_HAMMER2, M_WAITOK | M_ZERO);
-	wsync = ip->wsync;
+hammer2_wref_t *
+hammer2_wsync_getref(hammer2_wsync_t *wsync)
+{
+	hammer2_wref_t *wref;
+
 	KASSERT(wsync);
-	hammer2_wsync_ref(wsync);
-	atomic_inc_int(&wsync->count);
+	wref = hmalloc(sizeof(*wref), M_HAMMER2, M_WAITOK | M_ZERO);
+	atomic_inc_int(&wsync->refs);
+	mtx_enter(&wsync->lock);
+	++wsync->count;
+	mtx_leave(&wsync->lock);
 	wref->wsync = wsync;
 	return (wref);
 }
 
 void
-hammer2_wref_complete(hammer2_wref_t *wref)
+hammer2_wref_complete(hammer2_wref_t *wref, int error)
 {
 	hammer2_wsync_t *wsync;
-	int s;
 
 	if (wref == NULL)
 		return;
 	wsync = wref->wsync;
-	wref->wsync = NULL;
 	if (wsync) {
-		(void)atomic_dec_int_nv(&wsync->count);
-		s = splbio();
-		wakeup(wsync);
-		splx(s);
+		mtx_enter(&wsync->lock);
+		KASSERT(wsync->count != 0);
+		if (wsync->error == 0)
+			wsync->error = error;
+		if (--wsync->count == 0)
+			wakeup(wsync);
+		mtx_leave(&wsync->lock);
 		hammer2_wsync_drop(wsync);
 	}
 	hfree(wref, M_HAMMER2, sizeof(*wref));
 }
 
+/* The owner supplies a live reference for the entire wait. */
+int
+hammer2_wsync_wait(hammer2_wsync_t *wsync)
+{
+	int error;
+
+	mtx_enter(&wsync->lock);
+	while (wsync->count != 0)
+		msleep_nsec(wsync, &wsync->lock, PRIBIO, "h2wsync", INFSLP);
+	error = wsync->error;
+	mtx_leave(&wsync->lock);
+	return (error);
+}
+
+int
+hammer2_wsync_error(hammer2_wsync_t *wsync)
+{
+	int error;
+
+	mtx_enter(&wsync->lock);
+	error = wsync->error;
+	mtx_leave(&wsync->lock);
+	return (error);
+}
+
 int
 hammer2_inode_wsync_wait(hammer2_inode_t *ip)
 {
-	hammer2_wsync_t *wsync;
-	unsigned int saved_error;
-	int s, error = 0;
-
-	wsync = ip->wsync;
-	if (wsync == NULL)
-		return (0);
-	hammer2_wsync_ref(wsync);
-	s = splbio();
-	while (wsync->count != 0) {
-		error = tsleep_nsec(wsync, PRIBIO + 1, "h2wsync", INFSLP);
-		if (error == ERESTART || error == EINTR)
-			break;
-		error = 0;
-	}
-	if (error == 0) {
-		saved_error = wsync->error;
-		if (saved_error) {
-			(void)atomic_cas_uint(&wsync->error, saved_error, 0);
-			error = (int)saved_error;
-		}
-	}
-	splx(s);
-	hammer2_wsync_drop(wsync);
-	return (error);
+	return (hammer2_wsync_wait(ip->wsync));
 }
 
 /*
@@ -857,9 +872,7 @@ again:
 	}
 
 	nip->pmp = pmp;
-	nip->wsync = hmalloc(sizeof(*nip->wsync), M_HAMMER2,
-	    M_WAITOK | M_ZERO);
-	nip->wsync->refs = 1;
+	nip->wsync = hammer2_wsync_alloc();
 
 	/* Calculate ipdep index. */
 	nip->ipdep_idx = nip->meta.inum % HAMMER2_IHASH_SIZE;
