@@ -43,7 +43,7 @@
 #include <err.h>
 #include <mntopts.h>
 
-#include <fs/hammer2/hammer2_mount.h>
+#include <hammer2/hammer2_mount.h>
 
 static void usage(const char *ctl, ...);
 
@@ -59,7 +59,7 @@ main(int argc, char **argv)
 	struct hammer2_mount_info args;
 	char canon_dev[MAXPATHLEN], canon_dir[MAXPATHLEN];
 	const char *errcause;
-	char *val, *p, **argp;
+	char *val, **argp;
 	int ch, mntflags = 0, initflags = 0;
 
 	setprogname(argv[0]);
@@ -109,15 +109,7 @@ main(int argc, char **argv)
 		free(val);
 	}
 
-	/* Prefix if necessary. */
-	if (!strchr(canon_dev, ':') && canon_dev[0] != '/' &&
-	    canon_dev[0] != '@') {
-		if (asprintf(&val, "/dev/%s", canon_dev) == -1)
-			err(1, "asprintf");
-		strlcpy(canon_dev, val, MAXPATHLEN);
-		free(val);
-	}
-
+	/* Leave DUIDs intact for the kernel's disk_map(). */
 	args.fspec = strcmp(*argp, "") ? canon_dev : NULL;
 	argp++;
 ignore_special:

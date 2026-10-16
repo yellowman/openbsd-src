@@ -50,10 +50,11 @@
 #include <assert.h>
 #include <err.h>
 #include <uuid.h>
+#include <util.h>
 
-#include <fs/hammer2/hammer2_disk.h>
-#include <fs/hammer2/hammer2_xxhash.h>
-#include <fs/hammer2/hammer2_mount.h>
+#include <hammer2/hammer2_disk.h>
+#include <hammer2/hammer2_xxhash.h>
+#include <hammer2/hammer2_mount.h>
 
 #include "mkfs_hammer2.h"
 #include "hammer2_subs.h"
@@ -760,7 +761,12 @@ hammer2_mkfs(int ac, char **av, hammer2_mkfs_options_t *opt)
 	for (i = 0; i < fso.nvolumes; ++i) {
 		hammer2_volume_t *vol = &fso.volumes[i];
 		hammer2_off_t size;
-		int fd = open(av[i], O_RDWR);
+		int fd;
+
+		if (isduid(av[i], 0))
+			fd = opendev(av[i], O_RDWR, 0, NULL);
+		else
+			fd = open(av[i], O_RDWR);
 		if (fd < 0)
 			err(1, "Unable to open %s R+W", av[i]);
 		size = check_volume(fd);

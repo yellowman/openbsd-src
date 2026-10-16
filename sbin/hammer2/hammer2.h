@@ -52,10 +52,10 @@
 #include <sys/ioctl.h>
 #include <dirent.h>
 
-#include <fs/hammer2/hammer2_disk.h>
-#include <fs/hammer2/hammer2_mount.h>
-#include <fs/hammer2/hammer2_ioctl.h>
-#include <fs/hammer2/hammer2_xxhash.h>
+#include <hammer2/hammer2_disk.h>
+#include <hammer2/hammer2_mount.h>
+#include <hammer2/hammer2_ioctl.h>
+#include <hammer2/hammer2_xxhash.h>
 
 #include <stdio.h>
 #include <stdlib.h>

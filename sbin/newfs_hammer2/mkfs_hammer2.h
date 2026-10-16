@@ -38,7 +38,7 @@
 #ifndef NEWFS_HAMMER2_H_
 #define NEWFS_HAMMER2_H_
 
-#include <fs/hammer2/hammer2_disk.h>
+#include <hammer2/hammer2_disk.h>
 
 #include <uuid.h>
 

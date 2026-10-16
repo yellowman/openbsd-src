@@ -48,8 +48,9 @@
 #include <assert.h>
 #include <errno.h>
 #include <err.h>
+#include <util.h>
 
-#include <fs/hammer2/hammer2_disk.h>
+#include <hammer2/hammer2_disk.h>
 
 #include "hammer2_subs.h"
 
@@ -211,9 +212,12 @@ hammer2_add_volume(const char *path, int rdonly)
 	int fd, i;
 	uuid_t uuid;
 
-	fd = open(path, rdonly ? O_RDONLY : O_RDWR);
+	if (isduid(path, 0))
+		fd = opendev(path, rdonly ? O_RDONLY : O_RDWR, 0, NULL);
+	else
+		fd = open(path, rdonly ? O_RDONLY : O_RDWR);
 	if (fd == -1)
-		err(1, "open");
+		err(1, "%s", path);
 
 	if (fstat(fd, &st) == -1)
 		err(1, "fstat");
@@ -304,8 +308,6 @@ hammer2_verify_volumes_common(const hammer2_ondisk_t *fsp,
 			continue;
 		path = vol->path;
 		/* check volumes are unique */
-		if (stat(path, &st[i]) != 0)
-			errx(1, "Failed to stat %s", path);
 		if (fstat(vol->fd, &st[i]) != 0)
 			errx(1, "Failed to fstat %d", vol->fd);
 		for (j = 0; j < i; ++j) {
@@ -507,7 +509,7 @@ void
 hammer2_init_volumes(const char *blkdevs, int rdonly)
 {
 	hammer2_volume_data_t *rootvoldata;
-	char *o, *p, *devpath;
+	char *o, *p, *devpath, *label;
 
 	if (hammer2_volumes_initialized)
 		errx(1, "Already initialized");
@@ -516,6 +518,9 @@ hammer2_init_volumes(const char *blkdevs, int rdonly)
 
 	hammer2_init_ondisk(&fso);
 	o = p = strdup(blkdevs);
+	/* A mount specification may include a PFS label; check its volumes. */
+	if ((label = strchr(p, '@')) != NULL)
+		*label = '\0';
 	while ((devpath = p) != NULL) {
 		if ((p = strchr(p, ':')) != NULL)
 			*p++ = 0;

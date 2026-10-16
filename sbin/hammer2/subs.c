@@ -54,8 +54,8 @@
 #include <err.h>
 #include <uuid.h>
 
-#include <fs/hammer2/hammer2_disk.h>
-#include <fs/hammer2/hammer2_ioctl.h>
+#include <hammer2/hammer2_disk.h>
+#include <hammer2/hammer2_ioctl.h>
 
 #include "hammer2_subs.h"
 
