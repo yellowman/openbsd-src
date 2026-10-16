@@ -1202,8 +1202,20 @@ hammer2_pfs_schedule_sync(hammer2_pfs_t *pmp)
 void
 hammer2_pfs_record_error(hammer2_pfs_t *pmp, int error)
 {
-	if (error)
-		(void)atomic_cas_uint(&pmp->write_error, 0, error);
+	hammer2_dev_t *hmp;
+	int i;
+
+	if (error == 0)
+		return;
+	(void)atomic_cas_uint(&pmp->write_error, 0, error);
+	/* PFSs share a volume root: another PFS must not publish failed state. */
+	for (i = 0; i < HAMMER2_MAXCLUSTER; ++i) {
+		hmp = pmp->pfs_hmps[i];
+		if (hmp)
+			hammer2_wsync_record_error(hmp->wsync, error);
+	}
+	if (pmp->spmp_hmp)
+		hammer2_wsync_record_error(pmp->spmp_hmp->wsync, error);
 }
 
 int

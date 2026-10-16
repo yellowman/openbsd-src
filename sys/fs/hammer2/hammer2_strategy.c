@@ -439,10 +439,12 @@ hammer2_xop_strategy_write(hammer2_xop_t *arg, void *scratch, int clindex)
 	hammer2_xop_feed(&xop->head, NULL, clindex, error);
 
 	error = hammer2_xop_collect(&xop->head, HAMMER2_XOP_COLLECT_NOWAIT);
-	if (error != 0 && error != HAMMER2_ERROR_ENOENT)
+	if (error == HAMMER2_ERROR_ENOENT)
+		error = 0;
+	if (error != 0)
 		hammer2_pfs_record_error(ip->pmp, hammer2_error_to_errno(error));
 	bp = xop->bp; /* now owned by us */
-	if (error == HAMMER2_ERROR_ENOENT || error == 0) {
+	if (error == 0) {
 		bp->b_resid = 0;
 		bp->b_error = 0;
 		s = splbio();

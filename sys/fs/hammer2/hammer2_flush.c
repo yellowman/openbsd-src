@@ -1313,5 +1313,6 @@ hammer2_xop_inode_flush(hammer2_xop_t *arg, void *scratch, int clindex)
 	hammer2_trans_done(hmp->spmp, HAMMER2_TRANS_ISFLUSH);
 skip:
 	total_error = flush_error | hammer2_errno_to_error(fsync_error);
+	hammer2_pfs_record_error(pmp, hammer2_error_to_errno(total_error));
 	hammer2_xop_feed(&xop->head, NULL, clindex, total_error);
 }
