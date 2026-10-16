@@ -199,7 +199,6 @@ typedef struct hammer2_io_hash	hammer2_io_hash_t;
 #define HAMMER2_DIO_GOOD	0x40000000U	/* dio->bp is stable */
 #define HAMMER2_DIO_DIRTY	0x10000000U	/* flush last drop */
 #define HAMMER2_DIO_FLUSH	0x08000000U	/* immediate flush */
-#define HAMMER2_DIO_SYNC	0x04000000U	/* wait for device completion */
 #define HAMMER2_DIO_MASK	0x00FFFFFFU
 
 struct hammer2_inum_hash {
@@ -1131,7 +1130,6 @@ int hammer2_io_bread(hammer2_dev_t *, int, hammer2_off_t, int, hammer2_io_t **);
 hammer2_io_t *hammer2_io_getquick(hammer2_dev_t *, off_t, int);
 void hammer2_io_bawrite(hammer2_io_t **);
 void hammer2_io_bdwrite(hammer2_io_t **);
-int hammer2_io_bwrite(hammer2_io_t **);
 void hammer2_io_track_write(hammer2_io_t *, hammer2_wref_t **);
 void hammer2_io_setdirty(hammer2_io_t *);
 void hammer2_io_brelse(hammer2_io_t **);

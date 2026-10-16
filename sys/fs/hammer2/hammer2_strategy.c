@@ -870,9 +870,7 @@ hammer2_compress_and_write(char *data, hammer2_inode_t *ip,
 			hammer2_dedup_record(chain, dio, bdata);
 			/* Now write the related dio. */
 			hammer2_io_track_write(dio, wrefp);
-			if (ioflag & IO_SYNC)
-				hammer2_io_bwrite(&dio);
-			else if (ioflag & IO_ASYNC)
+			if (ioflag & (IO_SYNC | IO_ASYNC))
 				hammer2_io_bawrite(&dio);
 			else
 				hammer2_io_bdwrite(&dio);
@@ -1043,9 +1041,7 @@ hammer2_write_bp(hammer2_chain_t *chain, char *data, int ioflag, int pblksize,
 		hammer2_dedup_record(chain, dio, bdata);
 		/* Now write the related dio. */
 		hammer2_io_track_write(dio, wrefp);
-		if (ioflag & IO_SYNC)
-			hammer2_io_bwrite(&dio);
-		else if (ioflag & IO_ASYNC)
+		if (ioflag & (IO_SYNC | IO_ASYNC))
 			hammer2_io_bawrite(&dio);
 		else
 			hammer2_io_bdwrite(&dio);

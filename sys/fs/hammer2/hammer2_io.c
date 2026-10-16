@@ -357,7 +357,7 @@ hammer2_io_putblk(hammer2_io_t **diop)
 			(void)hammer2_io_track_buffer(dio);
 		dio->refs--;
 		dio->refs &= ~(HAMMER2_DIO_GOOD | HAMMER2_DIO_DIRTY |
-		    HAMMER2_DIO_FLUSH | HAMMER2_DIO_SYNC);
+		    HAMMER2_DIO_FLUSH);
 	} else {
 		dio->refs--;
 		hammer2_mtx_unlock(&dio->lock);
@@ -376,10 +376,7 @@ hammer2_io_putblk(hammer2_io_t **diop)
 	if ((orefs & HAMMER2_DIO_GOOD) && bp) {
 		if (orefs & HAMMER2_DIO_DIRTY) {
 			if (orefs & HAMMER2_DIO_FLUSH) {
-				if (orefs & HAMMER2_DIO_SYNC)
-					do_write = 3;
-				else
-					do_write = 2;
+				do_write = 2;
 			} else {
 				do_write = 1;
 			}
@@ -399,10 +396,6 @@ hammer2_io_putblk(hammer2_io_t **diop)
 	/* Write out and dispose of buffer. */
 	if (bp) {
 		switch (do_write) {
-		case 3:
-			(void)bwrite(bp);
-			hammer2_inc_iostat(&hmp->iostat_write, btype, psize);
-			break;
 		case 2:
 			bawrite(bp);
 			hammer2_inc_iostat(&hmp->iostat_write, btype, psize);
@@ -503,15 +496,7 @@ hammer2_io_bdwrite(hammer2_io_t **diop)
 	hammer2_io_putblk(diop);
 }
 
-int
-hammer2_io_bwrite(hammer2_io_t **diop)
-{
-	atomic_set_32(&(*diop)->refs,
-	    HAMMER2_DIO_DIRTY | HAMMER2_DIO_FLUSH | HAMMER2_DIO_SYNC);
-	hammer2_io_putblk(diop);
 
-	return (0); /* XXX */
-}
 
 /* Caller holds the DIO lock and a reference keeping its buffer busy. */
 static hammer2_wtrack_t *
