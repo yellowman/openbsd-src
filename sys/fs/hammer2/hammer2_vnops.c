@@ -298,6 +298,25 @@ hammer2_fsync(void *v)
 	return (error);
 }
 
+/*
+ * This callback is deliberately NOT invoked by internal VOP_FSYNC callers
+ * such as vinvalbuf or the syncer.  The file-descriptor wrappers call it
+ * with the mount busy and all vnode/inode/normal-transaction locks released.
+ * A whole-PFS commit is conservative but includes ancestor dependencies.
+ */
+static int
+hammer2_fsync_commit(void *v)
+{
+	struct vop_fsync_args *ap = v;
+	hammer2_inode_t *ip = VTOI(ap->a_vp);
+	hammer2_pfs_t *pmp = ip->pmp;
+
+	if (pmp->rdonly)
+		return (hammer2_pfs_error(pmp));
+	return (hammer2_vfs_sync_pmp(pmp, MNT_WAIT));
+}
+
+
 static int
 hammer2_access(void *v)
 {
@@ -3130,6 +3149,7 @@ const struct vops hammer2_vops = {
 	.vop_kqfilter	= hammer2_kqfilter,
 	.vop_revoke	= vop_generic_revoke,
 	.vop_fsync	= hammer2_fsync,
+	.vop_fsync_commit = hammer2_fsync_commit,
 	.vop_remove	= hammer2_remove,
 	.vop_link	= hammer2_link,
 	.vop_rename	= hammer2_rename,

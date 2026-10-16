@@ -2883,10 +2883,7 @@ sys_fsync(struct proc *p, void *v, register_t *retval)
 	if ((error = getvnode(p, SCARG(uap, fd), &fp)) != 0)
 		return (error);
 	vp = fp->f_data;
-	vn_lock(vp, LK_EXCLUSIVE | LK_RETRY);
-	error = VOP_FSYNC(vp, fp->f_cred, MNT_WAIT, p);
-
-	VOP_UNLOCK(vp);
+	error = vn_fsync(vp, fp->f_cred, p);
 	FRELE(fp, p);
 	return (error);
 }

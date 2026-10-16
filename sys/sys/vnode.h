@@ -296,6 +296,8 @@ struct vops {
 	int	(*vop_symlink)(void *);
 	int	(*vop_write)(void *);
 	int	(*vop_kqfilter)(void *);
+	/* Optional durable-commit phase: referenced vnode, no vnode locks. */
+	int	(*vop_fsync_commit)(void *);
 };
 
 extern const struct vops dead_vops;
@@ -621,6 +623,8 @@ int	vop_generic_revoke(void *);
 int	vop_generic_lookup(void *);
 
 /* vfs_vnops.c */
+int	vn_fsync(struct vnode *, struct ucred *, struct proc *);
+int	vn_fsync_commit(struct vnode *, struct ucred *, struct proc *);
 int	vn_isunder(struct vnode *, struct vnode *, struct proc *);
 int	vn_close(struct vnode *, int, struct ucred *, struct proc *);
 int	vn_open(struct nameidata *, int, int);

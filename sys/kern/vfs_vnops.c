@@ -341,6 +341,71 @@ vn_rdwr(enum uio_rw rw, struct vnode *vp, caddr_t base, int len, off_t offset,
 }
 
 /*
+ * User-visible fsync consists of a vnode-locked cache flush followed, for
+ * filesystems that need it, by an unlocked durable-commit phase.  The caller
+ * owns a vnode reference and KERNEL_LOCK, but no vnode locks.  Pin the mount
+ * across BOTH phases; the filesystem may drop its vnode lock for pager I/O.
+ */
+int
+vn_fsync(struct vnode *vp, struct ucred *cred, struct proc *p)
+{
+	struct mount *mp = vp->v_mount;
+	struct vop_fsync_args a;
+	int error, commit = vp->v_op->vop_fsync_commit != NULL;
+
+	KERNEL_ASSERT_LOCKED();
+	if (commit) {
+		if (mp == NULL)
+			return (EIO);
+		error = vfs_busy(mp, VB_READ | VB_NOWAIT);
+		if (error)
+			return (error);
+	}
+	error = vn_lock(vp, LK_EXCLUSIVE | LK_RETRY);
+	if (error == 0) {
+		error = VOP_FSYNC(vp, cred, MNT_WAIT, p);
+		VOP_UNLOCK(vp);
+	}
+	if (commit) {
+		if (error == 0) {
+			a.a_vp = vp;
+			a.a_cred = cred;
+			a.a_waitfor = MNT_WAIT;
+			a.a_p = p;
+			error = vp->v_op->vop_fsync_commit(&a);
+		}
+		vfs_unbusy(mp);
+	}
+	return (error);
+}
+
+/* Post-write commit; the file reference owns vp, which is now unlocked. */
+int
+vn_fsync_commit(struct vnode *vp, struct ucred *cred, struct proc *p)
+{
+	struct mount *mp;
+	struct vop_fsync_args a;
+	int error;
+
+	KERNEL_ASSERT_LOCKED();
+	if (vp->v_op->vop_fsync_commit == NULL)
+		return (0);
+	mp = vp->v_mount;
+	if (mp == NULL)
+		return (EIO);
+	error = vfs_busy(mp, VB_READ | VB_NOWAIT);
+	if (error)
+		return (error);
+	a.a_vp = vp;
+	a.a_cred = cred;
+	a.a_waitfor = MNT_WAIT;
+	a.a_p = p;
+	error = vp->v_op->vop_fsync_commit(&a);
+	vfs_unbusy(mp);
+	return (error);
+}
+
+/*
  * File table vnode read routine.
  */
 int
@@ -421,6 +486,8 @@ vn_write(struct file *fp, struct uio *uio, int fflags)
 		mtx_leave(&fp->f_mtx);
 	}
 	VOP_UNLOCK(vp);
+	if (error == 0 && (ioflag & IO_SYNC))
+		error = vn_fsync_commit(vp, cred, curproc);
 
 	KERNEL_UNLOCK();
 	return (error);
