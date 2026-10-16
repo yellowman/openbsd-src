@@ -102,16 +102,6 @@ static struct vfsconf vfsconflist[] = {
 #endif
 
 #ifdef HAMMER2
-	{ &hammer2_vfsops, "hammer2", 20, 0, MNT_LOCAL,
-	    sizeof(struct hammer2_args) },
-#endif
-
-#ifdef HAMMER2
-	{ &hammer2_vfsops, MOUNT_HAMMER2, 20, 0, MNT_LOCAL,
-	    sizeof(struct hammer2_args) },
-#endif
-
-#ifdef HAMMER2
 	{ &hammer2_vfsops, MOUNT_HAMMER2, 20, 0, MNT_LOCAL,
 	    sizeof(struct hammer2_args) },
 #endif
