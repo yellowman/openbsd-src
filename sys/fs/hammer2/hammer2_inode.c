@@ -534,6 +534,7 @@ hammer2_wsync_alloc(void)
 	wsync = hmalloc(sizeof(*wsync), M_HAMMER2, M_WAITOK | M_ZERO);
 	wsync->refs = 1;
 	mtx_init(&wsync->lock, IPL_BIO);
+	TAILQ_INIT(&wsync->pending);
 	return (wsync);
 }
 
@@ -563,7 +564,9 @@ hammer2_wsync_getref(hammer2_wsync_t *wsync)
 	wref = hmalloc(sizeof(*wref), M_HAMMER2, M_WAITOK | M_ZERO);
 	atomic_inc_int(&wsync->refs);
 	mtx_enter(&wsync->lock);
-	++wsync->count;
+	wref->sequence = ++wsync->issued;
+	KASSERT(wref->sequence != 0);
+	TAILQ_INSERT_TAIL(&wsync->pending, wref, pending);
 	mtx_leave(&wsync->lock);
 	wref->wsync = wsync;
 	return (wref);
@@ -579,11 +582,10 @@ hammer2_wref_complete(hammer2_wref_t *wref, int error)
 	wsync = wref->wsync;
 	if (wsync) {
 		mtx_enter(&wsync->lock);
-		KASSERT(wsync->count != 0);
+		TAILQ_REMOVE(&wsync->pending, wref, pending);
 		if (wsync->error == 0)
 			wsync->error = error;
-		if (--wsync->count == 0)
-			wakeup(wsync);
+		wakeup(wsync);
 		mtx_leave(&wsync->lock);
 		hammer2_wsync_drop(wsync);
 	}
@@ -594,10 +596,14 @@ hammer2_wref_complete(hammer2_wref_t *wref, int error)
 int
 hammer2_wsync_wait(hammer2_wsync_t *wsync)
 {
+	hammer2_wref_t *first;
+	uint64_t target;
 	int error;
 
 	mtx_enter(&wsync->lock);
-	while (wsync->count != 0)
+	target = wsync->issued;
+	while ((first = TAILQ_FIRST(&wsync->pending)) != NULL &&
+	    first->sequence <= target)
 		msleep_nsec(wsync, &wsync->lock, PRIBIO, "h2wsync", INFSLP);
 	error = wsync->error;
 	mtx_leave(&wsync->lock);
@@ -613,6 +619,15 @@ hammer2_wsync_error(hammer2_wsync_t *wsync)
 	error = wsync->error;
 	mtx_leave(&wsync->lock);
 	return (error);
+}
+
+void
+hammer2_wsync_record_error(hammer2_wsync_t *wsync, int error)
+{
+	mtx_enter(&wsync->lock);
+	if (wsync->error == 0)
+		wsync->error = error;
+	mtx_leave(&wsync->lock);
 }
 
 int

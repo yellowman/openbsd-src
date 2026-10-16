@@ -171,16 +171,21 @@ struct hammer2_io {
 	uint64_t		dedup_alloc;	/* allocated / de-dupable */
 };
 
-/* refs owns memory; lock protects count and the sticky native errno. */
+TAILQ_HEAD(hammer2_wref_queue, hammer2_wref);
+
+/* refs owns memory; lock protects the completion queue and native errno. */
 struct hammer2_wsync {
 	volatile unsigned int	refs;
 	struct mutex		lock;
-	unsigned int		count;
+	struct hammer2_wref_queue pending;
+	uint64_t		issued;
 	int			error;
 };
 
 struct hammer2_wref {
 	struct hammer2_wref	*next;
+	TAILQ_ENTRY(hammer2_wref) pending;
+	uint64_t		sequence;
 	hammer2_wsync_t		*wsync;
 };
 
@@ -1091,6 +1096,7 @@ hammer2_wref_t *hammer2_wsync_getref(hammer2_wsync_t *);
 void hammer2_wref_complete(hammer2_wref_t *, int);
 int hammer2_wsync_wait(hammer2_wsync_t *);
 int hammer2_wsync_error(hammer2_wsync_t *);
+void hammer2_wsync_record_error(hammer2_wsync_t *, int);
 int hammer2_inode_wsync_wait(hammer2_inode_t *);
 int hammer2_igetv(hammer2_inode_t *, struct vnode **);
 hammer2_inode_t *hammer2_inode_get(hammer2_pfs_t *, hammer2_xop_head_t *,
