@@ -236,11 +236,14 @@ hammer2_fsync(void *v)
 
 	/*
 	 * OpenBSD's VM pager is separate from the logical buffer cache.
-	 * For an explicit fsync, flush mapped dirty pages first while the
-	 * vnode is unlocked so pager I/O can reacquire the vnode cleanly.
+	 * Flush mapped dirty pages with the vnode unlocked so pager I/O can
+	 * reacquire it.  During reclaim, vclean() has already terminated the
+	 * VM object and owns VXLOCK; dropping its drain lock and calling
+	 * vn_lock() here would wait for our own reclaim to finish.
 	 */
 	if (vp->v_type == VREG && ap->a_waitfor != MNT_LAZY && vp->v_mount &&
-	    (vp->v_mount->mnt_flag & MNT_RDONLY) == 0) {
+	    (vp->v_mount->mnt_flag & MNT_RDONLY) == 0 &&
+	    (vp->v_lflag & VXLOCK) == 0) {
 		VOP_UNLOCK(vp);
 		error = hammer2_vnode_mmap_sync(vp);
 		lock_error = vn_lock(vp, LK_EXCLUSIVE | LK_RETRY);
