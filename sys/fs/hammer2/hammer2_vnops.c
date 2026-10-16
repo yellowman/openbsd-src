@@ -232,7 +232,7 @@ hammer2_fsync(void *v)
 	} */ *ap = v;
 	struct vnode *vp = ap->a_vp;
 	hammer2_inode_t *ip = VTOI(vp);
-	int error1 = 0, error2, error3, mmap_error = 0;
+	int error = 0, chain_error = 0, error2, lock_error;
 
 	/*
 	 * OpenBSD's VM pager is separate from the logical buffer cache.
@@ -242,8 +242,10 @@ hammer2_fsync(void *v)
 	if (vp->v_type == VREG && ap->a_waitfor != MNT_LAZY && vp->v_mount &&
 	    (vp->v_mount->mnt_flag & MNT_RDONLY) == 0) {
 		VOP_UNLOCK(vp);
-		mmap_error = hammer2_vnode_mmap_sync(vp);
-		(void)vn_lock(vp, LK_EXCLUSIVE | LK_RETRY);
+		error = hammer2_vnode_mmap_sync(vp);
+		lock_error = vn_lock(vp, LK_EXCLUSIVE | LK_RETRY);
+		if (lock_error)
+			return (lock_error);
 	}
 
 	hammer2_trans_init(ip->pmp, 0);
@@ -260,16 +262,11 @@ hammer2_fsync(void *v)
 	 * doing scattered reads.
 	 */
 	vflushbuf(vp, ap->a_waitfor == MNT_WAIT);
-	if (ap->a_waitfor != MNT_LAZY) {
-		error2 = hammer2_inode_wsync_wait(ip);
-		if (error2 && error1 == 0)
-			error1 = error2;
-	}
 
 	/* Flush any inode changes. */
 	hammer2_inode_lock(ip, 0);
 	if (ip->flags & (HAMMER2_INODE_RESIZED|HAMMER2_INODE_MODIFIED))
-		error1 = hammer2_inode_chain_sync(ip);
+		chain_error |= hammer2_inode_chain_sync(ip);
 
 	/*
 	 * Flush dirty chains related to the inode.
@@ -278,23 +275,27 @@ hammer2_fsync(void *v)
 	 *	 the sideq so the filesystem syncer can synchronize it to
 	 *	 the volume root.
 	 */
-	error2 = hammer2_inode_chain_flush(ip, HAMMER2_XOP_INODE_STOP);
-	if (error2)
-		error1 = error2;
+	chain_error |= hammer2_inode_chain_flush(ip, HAMMER2_XOP_INODE_STOP);
 
 	hammer2_inode_unlock(ip);
 	hammer2_trans_done(ip->pmp, 0);
 
-	if (mmap_error && error1 == 0)
-		error1 = mmap_error;
+	if (error == 0)
+		error = hammer2_error_to_errno(chain_error);
 	if (ap->a_waitfor != MNT_LAZY) {
-		error3 = hammer2_pfs_fsync_devices(ip->pmp, ap->a_cred,
+		/* Drain delayed device buffers before waiting for their callbacks. */
+		error2 = hammer2_pfs_fsync_devices(ip->pmp, ap->a_cred,
 		    ap->a_waitfor, ap->a_p);
-		if (error3 && error1 == 0)
-			error1 = error3;
+		if (error == 0)
+			error = error2;
+		error2 = hammer2_inode_wsync_wait(ip);
+		if (error == 0)
+			error = error2;
 	}
-
-	return (error1);
+	if (error == 0)
+		error = hammer2_pfs_error(ip->pmp);
+	hammer2_pfs_record_error(ip->pmp, error);
+	return (error);
 }
 
 static int
