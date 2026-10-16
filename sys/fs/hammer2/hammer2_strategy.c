@@ -342,7 +342,7 @@ hammer2_bioq_enter(hammer2_pfs_t *pmp)
 		limit = hammer2_flush_pipe;
 		if (limit <= 0 || pmp->bioq_inprog < limit)
 			break;
-		lowat = limit - ((limit + 3) / 4);
+		lowat = limit - limit / 4 - (limit % 4 != 0);
 		if (lowat < 1)
 			lowat = 1;
 		do {

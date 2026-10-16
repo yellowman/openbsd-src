@@ -108,8 +108,8 @@ static const struct sysctl_bounded_args hammer2_vars[] = {
 	{ HAMMER2CTL_LIMIT_SAVED_CHAINS, &hammer2_limit_saved_chains, 0, INT_MAX, },
 	{ HAMMER2CTL_ALWAYS_COMPRESS, &hammer2_always_compress, 0, INT_MAX, },
 	{ HAMMER2CTL_FLUSH_PIPE, &hammer2_flush_pipe, 0, INT_MAX, },
-	{ HAMMER2CTL_LIMIT_DIRTY_CHAINS, &hammer2_limit_dirty_chains, 0, INT_MAX, },
-	{ HAMMER2CTL_LIMIT_DIRTY_INODES, &hammer2_limit_dirty_inodes, 0, INT_MAX, },
+	{ HAMMER2CTL_LIMIT_DIRTY_CHAINS, &hammer2_limit_dirty_chains, 1, INT_MAX, },
+	{ HAMMER2CTL_LIMIT_DIRTY_INODES, &hammer2_limit_dirty_inodes, 1, INT_MAX, },
 };
 
 static unsigned long

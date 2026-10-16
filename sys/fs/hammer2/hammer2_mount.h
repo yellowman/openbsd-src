@@ -97,6 +97,9 @@ struct hammer2_mount_info {
 	{ "limit_scan_depth", CTLTYPE_INT, }, \
 	{ "limit_saved_chains", CTLTYPE_INT, }, \
 	{ "always_compress", CTLTYPE_INT, }, \
+	{ "flush_pipe", CTLTYPE_INT, }, \
+	{ "limit_dirty_chains", CTLTYPE_INT, }, \
+	{ "limit_dirty_inodes", CTLTYPE_INT, }, \
 }
 
 #endif /* !_FS_HAMMER2_MOUNT_H_ */
