@@ -1297,6 +1297,7 @@ hammer2_errno_to_error(int error)
 		return (HAMMER2_ERROR_EINVAL);
 	case EEXIST:
 		return (HAMMER2_ERROR_EEXIST);
+	case ENOTTY:
 	case EOPNOTSUPP:
 		return (HAMMER2_ERROR_EOPNOTSUPP);
 	default:
