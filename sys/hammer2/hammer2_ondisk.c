@@ -55,9 +55,12 @@ hammer2_lookup_device(struct mount *mp, const char *path, struct vnode **devvpp,
 	KKASSERT(path);
 	KKASSERT(*path != '\0');
 
-	if (disk_map(__DECONST(char *, path), fname, MNAMELEN, DM_OPENBLCK)
-	    == -1)
-		memcpy(fname, path, MNAMELEN);
+	/* Resolve DUIDs before adding the device directory. */
+	if (disk_map(path, fname, MNAMELEN, DM_OPENBLCK) == -1) {
+		if (snprintf(fname, MNAMELEN, "%s%s",
+		    path[0] == '/' ? "" : "/dev/", path) >= MNAMELEN)
+			return (ENAMETOOLONG);
+	}
 
 	NDINIT(ndp, LOOKUP, FOLLOW, UIO_SYSSPACE, fname, runp);
 	error = namei(ndp);
@@ -174,44 +177,20 @@ hammer2_init_devvp(struct mount *mp, const char *blkdevs,
 {
 	hammer2_devvp_t *e;
 	struct vnode *devvp;
-	const char *p;
-	char *path, fname[MNAMELEN];
-	int i, error = 0;
+	char *paths, *p, *path, fname[MNAMELEN];
+	size_t len;
+	int error = 0;
 
 	KKASSERT(TAILQ_EMPTY(devvpl));
 	KKASSERT(blkdevs); /* Could be empty string. */
-	p = blkdevs;
-
-	path = hmalloc(MAXPATHLEN, M_TEMP, M_WAITOK | M_ZERO);
-	while (1) {
-		strlcpy(path, "", MAXPATHLEN);
-		if (*p != '/')
-			strlcpy(path, "/dev/", MAXPATHLEN); /* Relative path. */
-
-		/* Scan beyond "/dev/". */
-		for (i = strlen(path); i < MAXPATHLEN-1; ++i) {
-			if (*p == '\0') {
-				break;
-			} else if (*p == ':') {
-				p++;
-				break;
-			} else {
-				path[i] = *p;
-				p++;
-			}
-		}
-		path[i] = '\0';
-		/* Path shorter than "/dev/" means invalid or done. */
-		if (strlen(path) <= strlen("/dev/")) {
-			if (strlen(p)) {
-				hprintf("ignore incomplete path %s\n", path);
-				continue;
-			} else {
-				/* End of string. */
-				KKASSERT(*p == '\0');
-				break;
-			}
-		}
+	len = strlen(blkdevs) + 1;
+	paths = p = hmalloc(len, M_TEMP, M_WAITOK);
+	memcpy(paths, blkdevs, len);
+	while ((path = p) != NULL) {
+		if ((p = strchr(path, ':')) != NULL)
+			*p++ = '\0';
+		if (*path == '\0')
+			continue;
 
 		/* Lookup path for device vnode. */
 		devvp = NULL;
@@ -231,7 +210,7 @@ hammer2_init_devvp(struct mount *mp, const char *blkdevs,
 		e->fname = hstrdup(fname);
 		TAILQ_INSERT_TAIL(devvpl, e, entry);
 	}
-	hfree(path, M_TEMP, MAXPATHLEN);
+	hfree(paths, M_TEMP, len);
 
 	return (error);
 }
