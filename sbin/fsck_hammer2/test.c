@@ -55,8 +55,8 @@
 
 #include <openssl/sha.h>
 
-#include <fs/hammer2/hammer2_disk.h>
-#include <fs/hammer2/hammer2_xxhash.h>
+#include <hammer2/hammer2_disk.h>
+#include <hammer2/hammer2_xxhash.h>
 
 #include "hammer2_subs.h"
 #include "fsck_hammer2.h"

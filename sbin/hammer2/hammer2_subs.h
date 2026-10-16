@@ -41,7 +41,7 @@
 #include <sys/types.h>
 #include <uuid.h>
 
-#include <fs/hammer2/hammer2_disk.h>
+#include <hammer2/hammer2_disk.h>
 
 #define HAMMER2_CHECK_STRINGS		{ "none", "disabled", "crc32", \
 					  "xxhash64", "sha192", "freemap" }
