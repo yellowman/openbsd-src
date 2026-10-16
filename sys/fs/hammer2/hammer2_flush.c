@@ -1126,7 +1126,7 @@ hammer2_xop_inode_flush(hammer2_xop_t *arg, void *scratch, int clindex)
 			 */
 			if (chain->parent)
 				hammer2_chain_setflush(chain->parent);
-			hammer2_flush(chain, xflags);
+			flush_error |= hammer2_flush(chain, xflags);
 
 			/* XXX cluster */
 			if (ip == pmp->iroot && pmp != hmp->spmp) {
@@ -1308,13 +1308,10 @@ hammer2_xop_inode_flush(hammer2_xop_t *arg, void *scratch, int clindex)
 				fsync_error = vol_error;
 		}
 	}
-	if (flush_error)
-		total_error = flush_error;
-	if (fsync_error)
-		total_error = hammer2_errno_to_error(fsync_error);
 
 	/* spmp trans */
 	hammer2_trans_done(hmp->spmp, HAMMER2_TRANS_ISFLUSH);
 skip:
+	total_error = flush_error | hammer2_errno_to_error(fsync_error);
 	hammer2_xop_feed(&xop->head, NULL, clindex, total_error);
 }
