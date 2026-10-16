@@ -587,7 +587,6 @@ hammer2_chain_lastdrop(hammer2_chain_t *chain, int depth)
 		/* No-parent case. */
 		if (atomic_cmpset_int(&chain->refs, 1, 0) == 0) {
 			/* 1->0 transition failed, retry. */
-			hammer2_spin_unex(&parent->core.spin);
 			hammer2_spin_unex(&chain->core.spin);
 			hammer2_mtx_unlock(&chain->lock);
 			return (chain);
