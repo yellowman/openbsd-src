@@ -210,10 +210,12 @@ hammer2_bread(hammer2_dev_t *hmp, hammer2_io_t *dio, daddr_t lblkno)
 	int error;
 
 	error = bread(dio->devvp, lblkno, dio->psize, &dio->bp);
-	if (error)
+	if (error) {
 		brelse(dio->bp);
-	else
+		dio->bp = NULL;
+	} else {
 		hammer2_inc_iostat(&hmp->iostat_read, dio->btype, dio->psize);
+	}
 
 	return (error);
 }
@@ -299,7 +301,7 @@ hammer2_io_getblk(hammer2_dev_t *hmp, int btype, hammer2_off_t lbase, int lsize,
 			}
 		}
 	}
-	//KKASSERT(error == 0 || dio->bp == NULL);
+	KKASSERT(error == 0 || dio->bp == NULL);
 
 	/* XXX
 	if (dio->bp)
