@@ -64,6 +64,8 @@ struct hammer2_wtrack {
 
 typedef struct hammer2_wtrack hammer2_wtrack_t;
 
+static hammer2_wtrack_t *hammer2_io_track_buffer(hammer2_io_t *);
+
 static __inline void
 hammer2_assert_io_refs(hammer2_io_t *dio)
 {
@@ -114,6 +116,7 @@ hammer2_io_hash_init(hammer2_dev_t *hmp)
 	hammer2_io_hash_t *hash;
 	int i;
 
+	hmp->wsync = hammer2_wsync_alloc();
 	for (i = 0; i < HAMMER2_IOHASH_SIZE; ++i) {
 		hash = &hmp->iohash[i];
 		hammer2_spin_init(&hash->spin, "h2dev_io");
@@ -130,6 +133,8 @@ hammer2_io_hash_destroy(hammer2_dev_t *hmp)
 		hash = &hmp->iohash[i];
 		hammer2_spin_destroy(&hash->spin);
 	}
+	hammer2_wsync_drop(hmp->wsync);
+	hmp->wsync = NULL;
 }
 
 /*
@@ -347,6 +352,9 @@ hammer2_io_putblk(hammer2_io_t **diop)
 	 */
 	orefs = dio->refs;
 	if ((dio->refs & HAMMER2_DIO_MASK) == 1) {
+		if ((orefs & (HAMMER2_DIO_GOOD | HAMMER2_DIO_DIRTY)) ==
+		    (HAMMER2_DIO_GOOD | HAMMER2_DIO_DIRTY) && dio->bp)
+			(void)hammer2_io_track_buffer(dio);
 		dio->refs--;
 		dio->refs &= ~(HAMMER2_DIO_GOOD | HAMMER2_DIO_DIRTY |
 		    HAMMER2_DIO_FLUSH | HAMMER2_DIO_SYNC);
@@ -505,32 +513,41 @@ hammer2_io_bwrite(hammer2_io_t **diop)
 	return (0); /* XXX */
 }
 
+/* Caller holds the DIO lock and a reference keeping its buffer busy. */
+static hammer2_wtrack_t *
+hammer2_io_track_buffer(hammer2_io_t *dio)
+{
+	hammer2_wtrack_t *track;
+	struct buf *bp = dio->bp;
+
+	hammer2_mtx_assert_ex(&dio->lock);
+	KASSERT(bp);
+	if ((bp->b_flags & B_CALL) != 0 &&
+	    bp->b_iodone == hammer2_io_track_iodone)
+		return (bp->b_saveaddr);
+
+	track = hmalloc(sizeof(*track), M_HAMMER2, M_WAITOK | M_ZERO);
+	track->iodone = bp->b_iodone;
+	track->saveaddr = bp->b_saveaddr;
+	track->docall = ((bp->b_flags & B_CALL) != 0);
+	/* This reference, not a bare hmp pointer, survives device teardown. */
+	track->wrefs = hammer2_wsync_getref(dio->hmp->wsync);
+	bp->b_saveaddr = track;
+	bp->b_iodone = hammer2_io_track_iodone;
+	bp->b_flags |= B_CALL;
+	return (track);
+}
+
 void
 hammer2_io_track_write(hammer2_io_t *dio, hammer2_wref_t **wrefp)
 {
 	hammer2_wtrack_t *track;
-	hammer2_wref_t *wref;
-	struct buf *bp;
+	hammer2_wref_t *wref = *wrefp;
 
-	wref = *wrefp;
 	if (wref == NULL)
 		return;
-
 	hammer2_mtx_ex(&dio->lock);
-	bp = dio->bp;
-	KASSERT(bp);
-	if ((bp->b_flags & B_CALL) != 0 && bp->b_iodone == hammer2_io_track_iodone) {
-		track = bp->b_saveaddr;
-		KASSERT(track);
-	} else {
-		track = hmalloc(sizeof(*track), M_HAMMER2, M_WAITOK | M_ZERO);
-		track->iodone = bp->b_iodone;
-		track->saveaddr = bp->b_saveaddr;
-		track->docall = ((bp->b_flags & B_CALL) != 0);
-		bp->b_saveaddr = track;
-		bp->b_iodone = hammer2_io_track_iodone;
-		bp->b_flags |= B_CALL;
-	}
+	track = hammer2_io_track_buffer(dio);
 	wref->next = track->wrefs;
 	track->wrefs = wref;
 	hammer2_mtx_unlock(&dio->lock);

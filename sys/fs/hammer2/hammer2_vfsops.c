@@ -1198,6 +1198,31 @@ hammer2_pfs_schedule_sync(hammer2_pfs_t *pmp)
 		vn_syncer_add_to_worklist(syncvp, 1);
 }
 
+/* Never clear a failed backend transaction just because a later flush succeeds. */
+void
+hammer2_pfs_record_error(hammer2_pfs_t *pmp, int error)
+{
+	if (error)
+		(void)atomic_cas_uint(&pmp->write_error, 0, error);
+}
+
+int
+hammer2_pfs_error(hammer2_pfs_t *pmp)
+{
+	hammer2_dev_t *hmp;
+	int error, i;
+
+	error = atomic_cas_uint(&pmp->write_error, 0, 0);
+	for (i = 0; error == 0 && i < HAMMER2_MAXCLUSTER; ++i) {
+		hmp = pmp->pfs_hmps[i];
+		if (hmp)
+			error = hammer2_wsync_error(hmp->wsync);
+	}
+	if (error == 0 && pmp->spmp_hmp)
+		error = hammer2_wsync_error(pmp->spmp_hmp->wsync);
+	return (error);
+}
+
 int
 hammer2_pfs_memory_wait(hammer2_pfs_t *pmp)
 {
