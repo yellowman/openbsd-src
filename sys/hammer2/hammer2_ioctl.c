@@ -891,7 +891,8 @@ hammer2_ioctl_growfs(hammer2_inode_t *ip, void *data)
 	hammer2_dev_t *hmp;
 	hammer2_off_t size, delta;
 	hammer2_tid_t mtid;
-	struct disklabel dl;
+	struct partinfo pi;
+	u_int64_t sectors;
 	struct buf *bp;
 	int i, error;
 	daddr_t blkno;
@@ -909,13 +910,18 @@ hammer2_ioctl_growfs(hammer2_inode_t *ip, void *data)
 	}
 	KKASSERT(hmp->total_size == hmp->voldata.volu_size);
 
-	/* Get media size. */
-	error = VOP_IOCTL(hmp->devvp, DIOCGDINFO, &dl, FREAD, FSCRED, curproc);
+	/* Size the selected partition, not the entire underlying disk. */
+	error = VOP_IOCTL(hmp->devvp, DIOCGPART, &pi, FREAD, FSCRED, curproc);
 	if (error) {
-		hprintf("failed to get media size\n");
+		hprintf("failed to get partition size\n");
 		return (error);
 	}
-	size = (hammer2_off_t)dl.d_secperunit * dl.d_secsize;
+	if (pi.disklab == NULL || pi.part == NULL || pi.disklab->d_secsize == 0)
+		return (EINVAL);
+	sectors = DL_GETPSIZE(pi.part);
+	if (sectors > 0x7fffffffffffffffULL / pi.disklab->d_secsize)
+		return (EFBIG);
+	size = sectors * pi.disklab->d_secsize;
 	hprintf("growfs partition-auto to %016llx\n", (long long)size);
 
 	/* Expand to devvp size unless specified. */
@@ -933,7 +939,6 @@ hammer2_ioctl_growfs(hammer2_inode_t *ip, void *data)
 	 * reserved blocks at the base of each 2GB zone.
 	 */
 	grow->size &= ~HAMMER2_VOLUME_ALIGNMASK64;
-	delta = grow->size - hmp->voldata.volu_size;
 
 	/* Maximum allowed size is 2^63. */
 	if (grow->size > 0x7FFFFFFFFFFFFFFFLU) {
@@ -948,6 +953,7 @@ hammer2_ioctl_growfs(hammer2_inode_t *ip, void *data)
 		return (EINVAL);
 	}
 
+	delta = grow->size - hmp->voldata.volu_size;
 	if (delta == 0) {
 		hprintf("growfs - size did not change\n");
 		return (0);
