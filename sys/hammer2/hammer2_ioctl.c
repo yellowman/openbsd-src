@@ -897,12 +897,16 @@ hammer2_ioctl_growfs(hammer2_inode_t *ip, void *data)
 	int i, error;
 	daddr_t blkno;
 
+	grow->modified = 0;
 	hmp = ip->pmp->pfs_hmps[0];
 	if (hmp == NULL)
 		return (EINVAL);
 
 	if (hammer2_is_rdonly(ip->pmp->mp))
 		return (EROFS);
+	error = hammer2_pfs_error(ip->pmp);
+	if (error)
+		return (error);
 
 	if (hmp->nvolumes > 1) {
 		hprintf("growfs currently unsupported with multiple volumes\n");
@@ -925,7 +929,6 @@ hammer2_ioctl_growfs(hammer2_inode_t *ip, void *data)
 	hprintf("growfs partition-auto to %016llx\n", (long long)size);
 
 	/* Expand to devvp size unless specified. */
-	grow->modified = 0;
 	if (grow->size == 0) {
 		grow->size = size;
 	} else if (grow->size > size) {
@@ -972,15 +975,17 @@ hammer2_ioctl_growfs(hammer2_inode_t *ip, void *data)
 		blkno = i * HAMMER2_ZONE_BYTES64 / DEV_BSIZE;
 		error = bread(hmp->devvp, blkno, HAMMER2_VOLUME_BYTES, &bp);
 		if (error) {
-			brelse(bp);
+			if (bp)
+				brelse(bp);
 			hprintf("I/O error %d\n", error);
-			return (EINVAL);
+			return (error);
 		}
 		bzero(bp->b_data, HAMMER2_VOLUME_BYTES);
+		bp->b_flags |= B_NOCACHE;
 		error = bwrite(bp);
 		if (error) {
 			hprintf("I/O error %d\n", error);
-			return (EINVAL);
+			return (error);
 		}
 	}
 
@@ -1018,9 +1023,7 @@ hammer2_ioctl_growfs(hammer2_inode_t *ip, void *data)
 	 * filesystem syncer do it, but this was a sensitive operation
 	 * so don't take any chances.
 	 */
-	hammer2_sync(ip->pmp->mp, MNT_WAIT, 0, NULL, NULL);
-
-	return (0);
+	return (hammer2_sync(ip->pmp->mp, MNT_WAIT, 0, NULL, NULL));
 }
 
 /*
