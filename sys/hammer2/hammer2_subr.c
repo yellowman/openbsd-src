@@ -39,6 +39,7 @@
 
 #include <sys/dirent.h>
 #include <sys/signalvar.h>
+#include <sys/time.h>
 
 int
 hammer2_get_dtype(uint8_t type)
@@ -298,10 +299,12 @@ hammer2_calc_physical(hammer2_inode_t *ip, hammer2_key_t lbase)
 	return (pblksize);
 }
 
-void
 hammer2_update_time(uint64_t *timep)
 {
-	*timep = (uint64_t)gettime();
+	struct timespec ts;
+
+	getnanotime(&ts);
+	*timep = hammer2_timespec_to_time(&ts);
 }
 
 /*
