@@ -1247,14 +1247,16 @@ hammer2_pfs_error(hammer2_pfs_t *pmp)
 
 /*
  * Called before starting a modifying transaction.  Vnode locks may be held:
- * never sleep waiting for the syncer and never drop a caller's vnode lock.
- * Pageout and operations releasing space may bypass pressure, not I/O errors.
+ * request writeback, but do not wait for the syncer or drop the vnode lock.
+ * Dirty counters are not resource reservations and must not make ordinary
+ * filesystem operations fail with EAGAIN.  Retained backend errors still
+ * propagate to the caller.
  */
 int
-hammer2_pfs_memory_check(hammer2_pfs_t *pmp, int reclaim)
+hammer2_pfs_memory_check(hammer2_pfs_t *pmp, int reclaim __unused)
 {
 	unsigned long inodes;
-	int chains, error, high, busy;
+	int chains, error, high;
 
 	error = hammer2_pfs_error(pmp);
 	if (error)
@@ -1264,12 +1266,10 @@ hammer2_pfs_memory_check(hammer2_pfs_t *pmp, int reclaim)
 	inodes = atomic_load_long((volatile unsigned long *)&pmp->sideq_count);
 	high = chains > hammer2_limit_dirty_chains / 2 ||
 	    inodes > (unsigned long)hammer2_limit_dirty_inodes / 2;
-	busy = chains >= hammer2_limit_dirty_chains ||
-	    inodes >= (unsigned long)hammer2_limit_dirty_inodes;
 	hammer2_lk_unlock(&pmp->memory_lock);
 	if (high)
 		hammer2_pfs_schedule_sync(pmp);
-	return (busy && !reclaim ? EAGAIN : 0);
+	return (0);
 }
 
 
