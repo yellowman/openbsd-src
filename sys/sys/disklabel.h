@@ -275,6 +275,7 @@ static const char * const dktypenames[] = {
 #define FS_RAID		19		/* RAIDframe or softraid */
 #define FS_NTFS		20		/* Windows/NT file system */
 #define FS_UDF		21		/* UDF (DVD) filesystem */
+#define FS_HAMMER2	22		/* hammer2 filesystem */
 
 #ifdef DKTYPENAMES
 static const char * const fstypenames[] = {
@@ -300,6 +301,7 @@ static const char * const fstypenames[] = {
 	"RAID",
 	"NTFS",
 	"UDF",
+	"hammer2",
 	NULL
 };
 
@@ -327,6 +329,7 @@ static char *fstypesnames[] = {
 	"",		/* 19 */
 	"ntfs",		/* 20 */
 	"udf",		/* 21 */
+	"hammer2",	/* 22 */
 	NULL
 };
 
