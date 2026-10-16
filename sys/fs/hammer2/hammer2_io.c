@@ -331,7 +331,7 @@ hammer2_io_putblk(hammer2_io_t **diop)
 	struct buf *bp;
 	uint64_t orefs;
 	int dio_limit;
-	int do_write;
+	int do_write, btype, psize;
 
 	dio = *diop;
 	*diop = NULL;
@@ -361,6 +361,8 @@ hammer2_io_putblk(hammer2_io_t **diop)
 
 	/* Lastdrop (1->0 transition) case. */
 	hmp = dio->hmp;
+	btype = dio->btype;
+	psize = dio->psize;
 	bp = dio->bp;
 	dio->bp = NULL;
 	do_write = 0;
@@ -394,18 +396,15 @@ hammer2_io_putblk(hammer2_io_t **diop)
 		switch (do_write) {
 		case 3:
 			(void)bwrite(bp);
-			hammer2_inc_iostat(&hmp->iostat_write, dio->btype,
-			    dio->psize);
+			hammer2_inc_iostat(&hmp->iostat_write, btype, psize);
 			break;
 		case 2:
 			bawrite(bp);
-			hammer2_inc_iostat(&hmp->iostat_write, dio->btype,
-			    dio->psize);
+			hammer2_inc_iostat(&hmp->iostat_write, btype, psize);
 			break;
 		case 1:
 			bdwrite(bp);
-			hammer2_inc_iostat(&hmp->iostat_write, dio->btype,
-			    dio->psize);
+			hammer2_inc_iostat(&hmp->iostat_write, btype, psize);
 			break;
 		case -1:
 			bqrelse(bp);
