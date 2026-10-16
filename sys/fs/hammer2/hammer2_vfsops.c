@@ -1994,41 +1994,24 @@ restart:
 		 * dependencies may build up, so we definitely need to move
 		 * the whole SIDEQ back to SYNCQ when we restart.
 		 */
-		vp = ip->vp; /* NULL after vflush() */
-		if (vp) {
-			if (vget(vp, LK_EXCLUSIVE | LK_NOWAIT)) {
-				/*
-				 * Failed to get the vnode, requeue the inode
-				 * (PASS2 is already set so it will be found
-				 * again on the restart).  Then unlock.
-				 */
-				vp = NULL;
-				dorestart |= 1;
-				debug_hprintf("inum %016llx vn_lock failed\n",
-				    (long long)ip->meta.inum);
-				hammer2_mtx_ex(&ip->lock);
-				hammer2_inode_delayed_sideq(ip);
-				hammer2_mtx_unlock(&ip->lock);
-				hammer2_inode_drop(ip);
-
-				/*
-				 * If PASS2 was previously set we might
-				 * be looping too hard, ask for a delay
-				 * along with the restart.
-				 */
-				if (pass2 & HAMMER2_INODE_SYNCQ_PASS2)
-					dorestart |= 2;
-				hammer2_spin_ex(&pmp->list_spin);
-				continue;
-			}
+		hammer2_mtx_ex(&ip->lock);
+		if (hammer2_igetv_nowait(ip, &vp)) {
+			dorestart |= 1;
+			hammer2_inode_delayed_sideq(ip);
+			hammer2_mtx_unlock(&ip->lock);
+			hammer2_inode_drop(ip);
+			if (pass2 & HAMMER2_INODE_SYNCQ_PASS2)
+				dorestart |= 2;
+			hammer2_spin_ex(&pmp->list_spin);
+			continue;
 		}
 
-		/*
-		 * Relock the inode, and we inherit a ref from the above.
-		 * We will check for a race after we acquire the vnode.
-		 */
-		/* XXX2 DragonFly takes inode lock before vget */
-		hammer2_mtx_ex(&ip->lock);
+		if (vp) {
+			/* The strategy worker needs the inode/chain locks. */
+			hammer2_mtx_unlock(&ip->lock);
+			vflushbuf(vp, 1);
+			hammer2_mtx_ex(&ip->lock);
+		}
 
 		/*
 		 * If the inode wound up on a SIDEQ again it will already be
@@ -2051,12 +2034,6 @@ restart:
 		 * not NULL that will also be exclusively locked.  Do the
 		 * meat of the flush.
 		 */
-		if (vp) {
-			/* The strategy worker needs the inode/chain locks. */
-			hammer2_mtx_unlock(&ip->lock);
-			vflushbuf(vp, 1);
-			hammer2_mtx_ex(&ip->lock);
-		}
 
 		/*
 		 * If the inode has not yet been inserted into the tree
@@ -2108,19 +2085,14 @@ restart:
 			} else {
 				hammer2_inode_delayed_sideq(ip);
 			}
-			vput(vp);
-			/* OpenBSD mknod specific, not a must to begin with. */
-			/*
-			if (vp->v_type == VFIFO) {
-				vp->v_type = VNON;
-				vgone(vp);
-			}
-			*/
-			vp = NULL; /* safety */
+
 		}
 		atomic_clear_int(&ip->flags, HAMMER2_INODE_SYNCQ_PASS2);
 		hammer2_inode_unlock(ip); /* unlock+drop */
 		/* ip pointer invalid */
+		if (vp)
+			vput(vp);
+		vp = NULL;
 
 		/*
 		 * If the inode got dirted after we dropped our locks,

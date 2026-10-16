@@ -810,6 +810,35 @@ loop:
 	return (0);
 }
 
+/* Caller owns an inode reference and lock; never create a vnode for sync. */
+int
+hammer2_igetv_nowait(hammer2_inode_t *ip, struct vnode **vpp)
+{
+	struct vnode *vp;
+	u_long vid;
+	int error, ostate;
+
+	hammer2_mtx_assert_locked(&ip->lock);
+	*vpp = NULL;
+	if ((vp = ip->vp) == NULL)
+		return (0);
+	vid = vp->v_id;
+	ostate = hammer2_inode_lock_temp_release(ip);
+	error = vget(vp, LK_EXCLUSIVE | LK_NOWAIT);
+	hammer2_inode_lock_temp_restore(ip, ostate);
+	if (error)
+		return (error);
+	if (vp->v_id != vid || ip->vp != vp || vp->v_data != ip) {
+		ostate = hammer2_inode_lock_temp_release(ip);
+		vput(vp);
+		hammer2_inode_lock_temp_restore(ip, ostate);
+		return (EAGAIN);
+	}
+	*vpp = vp;
+	return (0);
+}
+
+
 /*
  * Returns the inode associated with the arguments, allocating a new
  * hammer2_inode structure if necessary, then synchronizing it to the passed
