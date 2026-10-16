@@ -102,7 +102,7 @@ cleanup_pfs_names(void)
 static void
 usage(void)
 {
-	fprintf(stderr, "fsck_hammer2 [-f] [-v] [-q] [-e] [-b] [-p] [-P] "
+	fprintf(stderr, "fsck_hammer2 [-f] [-n] [-y] [-v] [-q] [-e] [-b] [-p] [-P] "
 	    "[-l pfs_names] [-c cache_count] special\n");
 	exit(1);
 }
@@ -112,13 +112,17 @@ main(int ac, char **av)
 {
 	int i, ch;
 
-	while ((ch = getopt(ac, av, "dfvqebpPl:c:")) != -1) {
+	while ((ch = getopt(ac, av, "dfnyvqebpPl:c:")) != -1) {
 		switch(ch) {
 		case 'd':
 			DebugOpt++;
 			break;
 		case 'f':
 			ForceOpt = 1;
+			break;
+		case 'n':
+		case 'y':
+			/* Accepted for fsck(8); this checker never modifies disks. */
 			break;
 		case 'v':
 			if (QuietOpt)
