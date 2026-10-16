@@ -1243,7 +1243,12 @@ hammer2_truncate_buffers(hammer2_inode_t *ip, hammer2_key_t nsize)
 	}
 
 	uvm_vnp_setsize(vp, nsize);
-	uvm_vnp_uncache(vp);
+	/*
+	 * Truncating to zero already discards all VM pages.  Inactive may
+	 * have no vnode use reference for uvm_vnp_uncache() to duplicate.
+	 */
+	if (nsize != 0)
+		uvm_vnp_uncache(vp);
 
 	/*
 	 * Discard any fully truncated logical buffers, clean or dirty.
