@@ -1,7 +1,6 @@
-/*	$OpenBSD: nca.c,v 1.11 2026/07/09 12:02:23 job Exp $ */
+/*	$OpenBSD: nca.c,v 1.20 2026/10/15 08:45:38 job Exp $ */
 /*
  * Copyright (c) 2026 Job Snijders <job@bsd.nl>
- * Copyright (c) 2025 Theo Buehler <tb@openbsd.org>
  *
  * Permission to use, copy, modify, and distribute this software for any
  * purpose with or without fee is hereby granted, provided that the above
@@ -33,87 +32,83 @@
 
 extern int rrdpon;
 
-/*
- * Add a given CA cert into the non-functional CA tree.
- * Return 1 if a synchronization attempt is to be made, 0 otherwise.
- */
-static int
-nca_tree_insert_cert(struct nca_tree *tree, const struct cert *cert,
-    const struct nca_hist *nca_hist)
+static void
+ca_free(struct ca *ca)
 {
-	struct nonfunc_ca *nca;
+	if (ca == NULL)
+		return;
+
+	free(ca->aki);
+	free(ca->ski);
+	free(ca->location);
+	free(ca->carepo);
+	free(ca->mfturi);
+	free(ca->notify);
+	free(ca);
+}
+
+/*
+ * Add metadata for a given CA cert into the CA tree.
+ */
+struct ca *
+ca_tree_insert_cert(struct ca_tree *ca_tree, const struct cert *cert)
+{
+	struct ca *ca, *old_ca;
 	time_t now = get_current_time();
 
-	if ((nca = calloc(1, sizeof(*nca))) == NULL)
+	if ((ca = calloc(1, sizeof(*ca))) == NULL)
 		err(1, NULL);
-	if ((nca->aki = strdup(cert->aki)) == NULL)
-		err(1, NULL);
-	if ((nca->ski = strdup(cert->ski)) == NULL)
-		err(1, NULL);
-	if ((nca->location = strdup(cert->path)) == NULL)
-		err(1, NULL);
-	if ((nca->carepo = strdup(cert->repo)) == NULL)
-		err(1, NULL);
-	if ((nca->mfturi = strdup(cert->mft)) == NULL)
-		err(1, NULL);
-	if (cert->notify != NULL) {
-		if ((nca->notify = strdup(cert->notify)) == NULL)
+
+	if (cert->purpose != CERT_PURPOSE_TA) {
+		if ((ca->aki = strdup(cert->aki)) == NULL)
 			err(1, NULL);
 	}
-	nca->repoid = cert->repoid;
-	nca->certid = cert->certid;
-	nca->talid = cert->talid;
+
+	if ((ca->ski = strdup(cert->ski)) == NULL)
+		err(1, NULL);
+	if ((ca->location = strdup(cert->path)) == NULL)
+		err(1, NULL);
+	if ((ca->carepo = strdup(cert->repo)) == NULL)
+		err(1, NULL);
+	if ((ca->mfturi = strdup(cert->mft)) == NULL)
+		err(1, NULL);
+	if (cert->notify != NULL) {
+		if ((ca->notify = strdup(cert->notify)) == NULL)
+			err(1, NULL);
+	}
+	ca->repoid = cert->repoid;
+	ca->certid = cert->certid;
+	ca->talid = cert->talid;
+	ca->purpose = cert->purpose;
 
 	/* default initial state */
-	nca->since = now;
-	nca->last_attempt = now;
-	nca->attempts = 1;
-	nca->defer = 0;
+	ca->since = now;
+	ca->last_attempt = now;
+	ca->attempts = 1;
+	ca->defer = 0;
+	if (cert->purpose != CERT_PURPOSE_TA)
+		ca->nonfunc = 1;
 
-	if (nca_hist != NULL) {
-		nca->since = nca_hist->since;
-		nca->last_attempt = nca_hist->last_attempt;
-		nca->attempts = nca_hist->attempts;
-		nca->defer = nca_hist->defer;
-
-		if (retry_all_ncas || nca->defer == 0) {
-			if (verbose) {
-				warnx("%s: retrying, non-functional since %s",
-				    cert->path, time2str(nca->since));
-			}
-			nca->attempts++;
-			nca->last_attempt = now;
-		} else if (verbose > 1) {
-			warnx("%s: deferring sync, non-functional since"
-			    " %s", cert->path, time2str(nca->since));
-		}
+	if ((old_ca = RB_INSERT(ca_tree, ca_tree, ca)) != NULL) {
+		warnx("duplicate CA at %s", ca->location);
+		ca_free(ca);
+		return old_ca;
 	}
 
-	if (RB_INSERT(nca_tree, tree, nca) != NULL)
-		errx(1, "non-functional CA tree corrupted");
-
-	return nca->defer;
+	return ca;
 }
 
 void
-nca_tree_remove_cert(struct nca_tree *tree, int cid)
+nca_tree_clear_nonfunc(struct ca_tree *ca_tree, int cid)
 {
-	struct nonfunc_ca *found, needle = { .certid = cid };
+	struct ca *found, needle = { .certid = cid };
 
-	if ((found = RB_FIND(nca_tree, tree, &needle)) != NULL) {
-		RB_REMOVE(nca_tree, tree, found);
-		free(found->aki);
-		free(found->ski);
-		free(found->location);
-		free(found->carepo);
-		free(found->mfturi);
-		free(found->notify);
-		free(found);
-	}
+	if ((found = RB_FIND(ca_tree, ca_tree, &needle)) != NULL)
+		found->nonfunc = 0;
 }
 
 static inline int
-certidcmp(const struct nonfunc_ca *a, const struct nonfunc_ca *b)
+certidcmp(const struct ca *a, const struct ca *b)
 {
 	if (a->certid < b->certid)
 		return -1;
@@ -123,11 +118,12 @@ certidcmp(const struct nonfunc_ca *a, const struct nonfunc_ca *b)
 	return 0;
 }
 
-RB_GENERATE(nca_tree, nonfunc_ca, entry, certidcmp);
+RB_GENERATE(ca_tree, ca, entry, certidcmp);
 
 static struct strlist batchlist = LIST_HEAD_INITIALIZER(batchlist);
 
-static RB_HEAD(nca_hist_tree, nca_hist) ncas_hist = RB_INITIALIZER(&ncas_hist);
+static RB_HEAD(nca_hist_tree, nca_hist) nca_hist_tree = \
+    RB_INITIALIZER(&nca_hist_tree);
 
 static inline int
 nca_hist_cmp(const struct nca_hist *a, const struct nca_hist *b)
@@ -183,8 +179,8 @@ nca_hist_tree_free(void)
 {
 	struct nca_hist *nca_hist, *nca_hist_tmp;
 
-	RB_FOREACH_SAFE(nca_hist, nca_hist_tree, &ncas_hist, nca_hist_tmp) {
-		RB_REMOVE(nca_hist_tree, &ncas_hist, nca_hist);
+	RB_FOREACH_SAFE(nca_hist, nca_hist_tree, &nca_hist_tree, nca_hist_tmp) {
+		RB_REMOVE(nca_hist_tree, &nca_hist_tree, nca_hist);
 		nca_hist_free(nca_hist);
 	}
 }
@@ -234,7 +230,7 @@ ncas_plan_retries(void)
 	struct nca_hist *nca_hist;
 	struct strlistentry *sle, *sle_tmp;
 
-	RB_FOREACH(nca_hist, nca_hist_tree, &ncas_hist) {
+	RB_FOREACH(nca_hist, nca_hist_tree, &nca_hist_tree) {
 		if (nca_decide_retry(nca_hist) == 0) {
 			nca_hist->defer = 1;
 			continue;
@@ -246,7 +242,7 @@ ncas_plan_retries(void)
 			strlist_insert(&batchlist, nca_hist->notify);
 	}
 
-	RB_FOREACH(nca_hist, nca_hist_tree, &ncas_hist) {
+	RB_FOREACH(nca_hist, nca_hist_tree, &nca_hist_tree) {
 		if (strlist_find(&batchlist, nca_hist->baseuri,
 		    strlen(nca_hist->baseuri))) {
 			nca_hist->defer = 0;
@@ -378,8 +374,13 @@ nca_history_load(void)
 				err(1, NULL);
 		}
 
-		if (RB_INSERT(nca_hist_tree, &ncas_hist, nca_hist) != NULL)
-			err(1, "ncas_hist_tree corrupted");
+		if (RB_INSERT(nca_hist_tree, &nca_hist_tree,
+		    nca_hist) != NULL) {
+			warnx("duplicate entry for nca_hist_tree_tree at %s",
+			    nca_hist->location);
+			nca_hist_free(nca_hist);
+			nca_hist = NULL;
+		}
 	}
 
 	if (ferror(f))
@@ -409,28 +410,51 @@ nca_history_load(void)
  * Return 1 to skip the synchronization attempt, otherwise 0.
  */
 int
-nca_skip_sync(struct nca_tree *ncas, const struct cert *cert)
+nca_skip_sync(struct ca *ca)
 {
 	struct nca_hist *nca_hist, needle;
 
-	if (cert->purpose == CERT_PURPOSE_TA)
+	if (ca->purpose == CERT_PURPOSE_TA)
 		return 0;
 
-	needle.aki = cert->aki;
-	needle.ski = cert->ski;
-	needle.location = cert->path;
-	needle.mfturi = cert->mft;
-	nca_hist = RB_FIND(nca_hist_tree, &ncas_hist, &needle);
+	needle.aki = ca->aki;
+	needle.ski = ca->ski;
+	needle.location = ca->location;
+	needle.mfturi = ca->mfturi;
 
-	return nca_tree_insert_cert(ncas, cert, nca_hist);
+	nca_hist = RB_FIND(nca_hist_tree, &nca_hist_tree, &needle);
+	if (nca_hist == NULL)
+		return 0;
+
+	/* determined by ncas_plan_retries */
+	ca->defer = nca_hist->defer;
+
+	/* state from the previous run */
+	ca->since = nca_hist->since;
+	ca->last_attempt = nca_hist->last_attempt;
+	ca->attempts = nca_hist->attempts;
+
+	if (retry_all_ncas || ca->defer == 0) {
+		if (verbose) {
+			warnx("%s: retrying, non-functional since %s",
+			    ca->location, time2str(ca->since));
+		}
+		ca->attempts++;
+		ca->last_attempt = get_current_time();
+	} else if (verbose > 1) {
+		warnx("%s: deferring sync, non-functional since %s",
+		    ca->location, time2str(ca->since));
+	}
+
+	return ca->defer;
 }
 
 static int
 ncas_sorted_cmp(const void *a, const void *b)
 {
 	int cmp;
-	const struct nonfunc_ca *na = *(const struct nonfunc_ca **)a;
-	const struct nonfunc_ca *nb = *(const struct nonfunc_ca **)b;
+	const struct ca *na = *(const struct ca **)a;
+	const struct ca *nb = *(const struct ca **)b;
 
 	cmp = strcmp(na->aki, nb->aki);
 	if (cmp > 0)
@@ -460,16 +484,21 @@ ncas_sorted_cmp(const void *a, const void *b)
 }
 
 void
-nca_history_save(struct nca_tree *ncas, time_t buildtime)
+nca_history_save(struct ca_tree *ca_tree, time_t buildtime)
 {
 	char temp[] = NCA_HISTORY ".XXXXXXXX";
 	FILE *f = NULL;
 	int fd;
-	struct nonfunc_ca *nca, **ncas_sorted = NULL;
+	struct ca *ca, **ncas_sorted = NULL;
 	size_t ncas_num = 0, idx = 0;
 	struct timespec ts[2];
 
-	if (RB_EMPTY(ncas)) {
+	RB_FOREACH(ca, ca_tree, ca_tree) {
+		if (ca->nonfunc && ca->purpose == CERT_PURPOSE_CA)
+			ncas_num++;
+	}
+
+	if (ncas_num == 0) {
 		unlink(NCA_HISTORY);
 		return;
 	}
@@ -481,30 +510,29 @@ nca_history_save(struct nca_tree *ncas, time_t buildtime)
 	if ((f = fdopen(fd, "w")) == NULL)
 		err(1, "fopen");
 
-	RB_FOREACH(nca, nca_tree, ncas)
-		ncas_num++;
-
 	if ((ncas_sorted = calloc(ncas_num, sizeof(ncas_sorted[0]))) == NULL)
 		err(1, NULL);
 
-	RB_FOREACH(nca, nca_tree, ncas)
-		ncas_sorted[idx++] = nca;
+	RB_FOREACH(ca, ca_tree, ca_tree) {
+		if (ca->nonfunc && ca->purpose == CERT_PURPOSE_CA)
+			ncas_sorted[idx++] = ca;
+	}
 
 	qsort(ncas_sorted, ncas_num, sizeof(ncas_sorted[0]), ncas_sorted_cmp);
 
 	for (idx = 0; idx < ncas_num; idx++) {
-		nca = ncas_sorted[idx];
+		ca = ncas_sorted[idx];
 
-		if (fprintf(f, "%s %s %lld %lld %d %s %s", nca->aki, nca->ski,
-		    (long long)nca->since, (long long)nca->last_attempt,
-		    nca->attempts, nca->location, nca->mfturi) < 0)
+		if (fprintf(f, "%s %s %lld %lld %d %s %s", ca->aki, ca->ski,
+		    (long long)ca->since, (long long)ca->last_attempt,
+		    ca->attempts, ca->location, ca->mfturi) < 0)
 			goto err;
 
-		if (nca->notify == NULL) {
+		if (ca->notify == NULL) {
 			if (fprintf(f, " -\n") < 0)
 				goto err;
 		} else {
-			if (fprintf(f, " %s\n", nca->notify) < 0)
+			if (fprintf(f, " %s\n", ca->notify) < 0)
 				goto err;
 		}
 	}

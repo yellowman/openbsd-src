@@ -1,4 +1,4 @@
-/*	$OpenBSD: ypbind.c,v 1.81 2026/06/20 11:29:43 deraadt Exp $ */
+/*	$OpenBSD: ypbind.c,v 1.88 2026/10/15 04:24:40 deraadt Exp $ */
 
 /*
  * Copyright (c) 1992, 1993, 1996, 1997, 1998 Theo de Raadt <deraadt@openbsd.org>
@@ -45,19 +45,24 @@
 #include <ctype.h>
 #include <dirent.h>
 #include <err.h>
+#include <paths.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <ifaddrs.h>
 #include <limits.h>
+#include <pwd.h>
 #include <netdb.h>
 #include <poll.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <signal.h>
 #include <unistd.h>
 
 #define SERVERSDIR	"/etc/yp"
 #define BINDINGDIR	"/var/yp/binding"
+
+#define YPBIND_USER	"_ypbind"
 
 struct _dom_binding {
 	struct _dom_binding *dom_pnext;
@@ -89,6 +94,15 @@ char *domain;
 
 struct _dom_binding *ypbindlist;
 int check;
+int child;
+
+void
+terminate(int sig)
+{
+	if (child)
+		kill(child, sig);
+	child = 0;
+}
 
 #define YPSET_NO	0
 #define YPSET_LOCAL	1
@@ -331,19 +345,21 @@ usage(void)
 int
 main(int argc, char *argv[])
 {
-	char path[PATH_MAX];
-	struct sockaddr_in sin;
+	int width = 0, nready, lsock, parentp[2], nullfd, one = 1;
 	struct pollfd *pfd = NULL;
-	int width = 0, nready, lsock;
-	socklen_t len;
-	int evil = 0, one = 1;
-	DIR *dirp;
+	char path[PATH_MAX], c;
+	struct sockaddr_in sin;
 	struct dirent *dent;
+	struct passwd *pw;
+	socklen_t len;
+	uid_t uid;
+	gid_t gid;
+	DIR *dirp;
 
-	if (yp_get_default_domain(&domain) != 0 || domain[0] == '\0') {
-		fprintf(stderr, "domainname not set. Aborting.\n");
-		exit(1);
-	}
+	if (yp_get_default_domain(&domain) != 0 || domain[0] == '\0')
+		errx(1, "domainname not set. Aborting.");
+	if (strchr(domain, '/'))
+		errx(1, "bad domainname %s", domain);
 
 	while (--argc) {
 		++argv;
@@ -357,6 +373,14 @@ main(int argc, char *argv[])
 			usage();
 	}
 
+	if ((pw = getpwnam(YPBIND_USER)) != NULL) {
+		uid = pw->pw_uid;
+		gid = pw->pw_gid;
+	} else {
+		uid = getuid();
+		gid = getgid();
+	}
+
 	/* blow away everything in BINDINGDIR */
 	dirp = opendir(BINDINGDIR);
 	if (dirp) {
@@ -366,36 +390,67 @@ main(int argc, char *argv[])
 				continue;
 			(void)unlinkat(dirfd(dirp), dent->d_name, 0);
 		}
+		fchown(dirfd(dirp), uid, gid);
 		closedir(dirp);
 	} else {
 		(void)mkdir(BINDINGDIR, 0755);
+		chown(BINDINGDIR, uid, gid);
 	}
+
+	/* make parent wait until the child has bound */
+	if (pipe(parentp) == -1)
+		err(1, "pipe");
+	switch ((child = fork())) {
+	case -1:
+		err(1, "fork");
+	case 0:
+		close(parentp[0]);
+
+		if (setsid() == -1)
+			err(1, "setsid");
+		(void)chdir("/");
+		if ((nullfd = open(_PATH_DEVNULL, O_RDWR)) == -1)
+			err(1, "/dev/null");
+
+		/* child now tries to bind, then closes parent pipe */
+		break;
+	default:
+		if (setgroups(1, &gid) ||
+		    setresgid(gid, gid, gid) ||
+		    setresuid(uid, uid, uid))
+			err(1, "parent: unable to revoke privs");
+		signal(SIGTERM, terminate);
+		signal(SIGINT, terminate);
+		if (pledge("stdio proc", NULL) == -1)
+			err(1, "pledge");
+		close(parentp[1]);
+		/* wait until child establishes bind */
+		read(parentp[0], &c, 1);
+		_exit(0);
+	}
+
+	if (unveil(SERVERSDIR, "r") == -1)
+		err(1, "unveil");
+	if (unveil(BINDINGDIR, "crw") == -1)
+		err(1, "unveil");
+	if (unveil(NULL, NULL) == -1)
+		err(1, "unveil");
 
 	(void)pmap_unset(YPBINDPROG, YPBINDVERS);
 
 	udptransp = svcudp_create(RPC_ANYSOCK);
-	if (udptransp == NULL) {
-		fprintf(stderr, "cannot create udp service.\n");
-		exit(1);
-	}
+	if (udptransp == NULL)
+		errx(1, "cannot create udp service.");
 	if (!svc_register(udptransp, YPBINDPROG, YPBINDVERS, ypbindprog_2,
-	    IPPROTO_UDP)) {
-		fprintf(stderr,
-		    "unable to register (YPBINDPROG, YPBINDVERS, udp).\n");
-		exit(1);
-	}
+	    IPPROTO_UDP))
+		errx(1, "unable to register (YPBINDPROG, YPBINDVERS, udp).");
 
 	tcptransp = svctcp_create(RPC_ANYSOCK, 0, 0);
-	if (tcptransp == NULL) {
-		fprintf(stderr, "cannot create tcp service.\n");
-		exit(1);
-	}
+	if (tcptransp == NULL)
+		errx(1, "cannot create tcp service.");
 	if (!svc_register(tcptransp, YPBINDPROG, YPBINDVERS, ypbindprog_2,
-	    IPPROTO_TCP)) {
-		fprintf(stderr,
-		    "unable to register (YPBINDPROG, YPBINDVERS, tcp).\n");
-		exit(1);
-	}
+	    IPPROTO_TCP))
+		errx(1, "unable to register (YPBINDPROG, YPBINDVERS, tcp).");
 
 	if (ypsetmode == YPSET_LOCAL) {
 		/* build UDP local port */
@@ -417,10 +472,8 @@ main(int argc, char *argv[])
 			syslog(LOG_ERR, "cannot bind local udp: %m");
 			exit(1);
 		}
-		if ((ludptransp = svcudp_create(lsock)) == NULL) {
-			fprintf(stderr, "cannot create udp service.\n");
-			exit(1);
-		}
+		if ((ludptransp = svcudp_create(lsock)) == NULL)
+			errx(1, "cannot create udp service.");
 
 		/* build TCP local port */
 		if ((lsock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP)) == -1) {
@@ -441,14 +494,12 @@ main(int argc, char *argv[])
 			syslog(LOG_ERR, "cannot bind local tcp: %m");
 			exit(1);
 		}
-		if ((ltcptransp = svctcp_create(lsock, 0, 0)) == NULL) {
-			fprintf(stderr, "cannot create tcp service.\n");
-			exit(1);
-		}
+		if ((ltcptransp = svctcp_create(lsock, 0, 0)) == NULL)
+			errx(1, "cannot create tcp service.");
 	}
 
 	if ((rpcsock = socket(AF_INET, SOCK_DGRAM | SOCK_NONBLOCK, 0)) == -1) {
-		perror("socket");
+		warn("socket");
 		return -1;
 	}
 	memset(&sin, 0, sizeof sin);
@@ -458,7 +509,7 @@ main(int argc, char *argv[])
 	bindresvport(rpcsock, &sin);
 
 	if ((pingsock = socket(AF_INET, SOCK_DGRAM | SOCK_NONBLOCK, 0)) == -1) {
-		perror("socket");
+		warn("socket");
 		return -1;
 	}
 	memset(&sin, 0, sizeof sin);
@@ -478,8 +529,14 @@ main(int argc, char *argv[])
 	rmtcr.xdr_results = xdr_bool;
 	rmtcr.results_ptr = (caddr_t)&rmtcr_outval;
 
-	if (strchr(domain, '/'))
-		errx(1, "bad domainname %s", domain);
+	/* revoke privs */
+	if (setgroups(1, &gid) ||
+	    setresgid(gid, gid, gid) ||
+	    setresuid(uid, uid, uid))
+		err(1, "unable to revoke privs");
+
+	if (pledge("stdio rpath wpath cpath flock inet dns", NULL) == -1)
+		err(1, "pledge");
 
 	/* build initial domain binding, make it "unsuccessful" */
 	ypbindlist = malloc(sizeof *ypbindlist);
@@ -521,7 +578,7 @@ main(int argc, char *argv[])
 			break;
 		case -1:
 			if (errno != EINTR)
-				perror("poll");
+				warn("poll");
 			break;
 		default:
 			/* No need to check for POLLHUP on UDP sockets. */
@@ -539,12 +596,18 @@ main(int argc, char *argv[])
 			break;
 		}
 
-#ifdef DAEMON
-		if (!evil && ypbindlist->dom_alive) {
-			evil = 1;
-			daemon(0, 0);
+		if (ypbindlist->dom_alive && parentp[1] != -1) {
+			/* Release the parent, who will exit */
+			close(parentp[1]);
+			parentp[1] = -1;
+
+			/*.Complete daemonizing */
+			(void)dup2(nullfd, STDIN_FILENO);
+			(void)dup2(nullfd, STDOUT_FILENO);
+			(void)dup2(nullfd, STDERR_FILENO);
+			if (nullfd > 2)
+				(void)close(nullfd);
 		}
-#endif
 	}
 }
 
@@ -630,7 +693,7 @@ ping(struct _dom_binding *ypdb)
 	if (sendto(pingsock, buf, outlen, 0,
 	    (struct sockaddr *)&ypdb->dom_server_addr,
 	    (socklen_t)sizeof ypdb->dom_server_addr) == -1)
-		perror("sendto");
+		warn("sendto");
 	return 0;
 
 }
@@ -709,7 +772,7 @@ pings(struct _dom_binding *ypdb)
 		bindsin.sin_addr = ypdb->dom_server_addr.sin_addr;
 		if (sendto(rpcsock, buf, outlen, 0, (struct sockaddr *)&bindsin,
 		    (socklen_t)sizeof bindsin) == -1)
-			perror("sendto");
+			warn("sendto");
 	}
 	if (ypdb->dom_servlistfp)
 		return direct(ypdb, buf, outlen);
@@ -729,7 +792,7 @@ broadcast(struct _dom_binding *ypdb, char *buf, int outlen)
 	bindsin.sin_port = htons(PMAPPORT);
 
 	if (getifaddrs(&ifap) != 0) {
-		perror("getifaddrs");
+		warn("getifaddrs");
 		return -1;
 	}
 	for (ifa = ifap; ifa; ifa = ifa->ifa_next) {
@@ -757,7 +820,7 @@ broadcast(struct _dom_binding *ypdb, char *buf, int outlen)
 		bindsin.sin_addr = in;
 		if (sendto(rpcsock, buf, outlen, 0, (struct sockaddr *)&bindsin,
 		    (socklen_t)bindsin.sin_len) == -1)
-			perror("sendto");
+			warn("sendto");
 	}
 	freeifaddrs(ifap);
 	return 0;
@@ -814,7 +877,7 @@ direct(struct _dom_binding *ypdb, char *buf, int outlen)
 			if (sendto(rpcsock, buf, outlen, 0,
 			    (struct sockaddr *)&bindsin,
 			    (socklen_t)sizeof bindsin) == -1) {
-				perror("sendto");
+				warn("sendto");
 				continue;
 			}
 		}
@@ -1011,10 +1074,11 @@ rpc_received(char *dom, struct sockaddr_in *raddrp, int force)
 
 	snprintf(path, sizeof path, "%s/%s.%d", BINDINGDIR,
 	    ypdb->dom_domain, (int)ypdb->dom_vers);
-	if ((fd = open(path, O_CREAT|O_SHLOCK|O_RDWR|O_TRUNC, 0644)) == -1) {
+	if ((fd = open(path, O_CREAT|O_SHLOCK|O_RDWR|O_TRUNC|O_NOFOLLOW,
+	    0644)) == -1) {
 		(void)mkdir(BINDINGDIR, 0755);
-		if ((fd = open(path, O_CREAT|O_SHLOCK|O_RDWR|O_TRUNC,
-		    0644)) == -1)
+		if ((fd = open(path,
+		    O_CREAT|O_SHLOCK|O_RDWR|O_TRUNC|O_NOFOLLOW, 0644)) == -1)
 			return;
 	}
 
@@ -1042,7 +1106,7 @@ rpc_received(char *dom, struct sockaddr_in *raddrp, int force)
 
 	if (writev(ypdb->dom_lockfd, iov, sizeof(iov)/sizeof(iov[0])) !=
 	    iov[0].iov_len + iov[1].iov_len + iov[2].iov_len) {
-		perror("write");
+		warn("writev");
 		close(ypdb->dom_lockfd);
 		unlink(path);
 		ypdb->dom_lockfd = -1;

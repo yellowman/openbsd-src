@@ -1,4 +1,4 @@
-/* $OpenBSD: grid.c,v 1.158 2026/09/01 12:49:49 nicm Exp $ */
+/* $OpenBSD: grid.c,v 1.161 2026/10/12 15:40:17 nicm Exp $ */
 
 /*
  * Copyright (c) 2008 Nicholas Marriott <nicholas.marriott@gmail.com>
@@ -42,7 +42,7 @@ const struct grid_cell grid_default_cell = {
 
 /*
  * Padding grid cell data. Padding cells are the only zero width cell that
- * appears in the grid - because of this, they are always extended cells.
+ * appears in the grid.
  */
 static const struct grid_cell grid_padding_cell = {
 	{ { '!' }, 0, 0, 0 }, 0, GRID_FLAG_PADDING, 8, 8, 8, 0
@@ -591,7 +591,10 @@ grid_get_cell1(struct grid_line *gl, u_int px, struct grid_cell *gc)
 	if (gce->flags & GRID_FLAG_BG256)
 		gc->bg |= COLOUR_FLAG_256;
 	gc->us = 8;
-	utf8_set(&gc->data, gce->data.data);
+	if (gc->flags & GRID_FLAG_PADDING)
+		memcpy(&gc->data, &grid_padding_cell.data, sizeof gc->data);
+	else
+		utf8_set(&gc->data, gce->data.data);
 	gc->link = 0;
 }
 
@@ -1296,12 +1299,60 @@ grid_reflow_move(struct grid *gd, struct grid_line *from)
 	return (to);
 }
 
+/* Move the OSC 133 markers from one line to another. */
+static void
+grid_reflow_move_osc133(struct grid_line *to, struct grid_line *from,
+    u_int to_col, u_int count, int last)
+{
+	struct osc133_data	*src = &from->osc133_data;
+	struct osc133_data	*dst = &to->osc133_data;
+	u_short			*src_col[] = {
+		&src->prompt_col,
+		&src->cmd_col,
+		&src->out_start_col,
+		&src->out_end_col
+	};
+	u_short			*dst_col[] = {
+		&dst->prompt_col,
+		&dst->cmd_col,
+		&dst->out_start_col,
+		&dst->out_end_col
+	};
+	u_int			 flags[] = {
+		GRID_LINE_START_PROMPT|GRID_LINE_SECOND_PROMPT,
+		GRID_LINE_START_COMMAND,
+		GRID_LINE_START_OUTPUT,
+		GRID_LINE_END_OUTPUT
+	};
+	u_int			 i, flag;
+
+	if ((from->flags & GRID_LINE_OSC133_FLAGS) == 0)
+		return;
+	for (i = 0; i < nitems(flags); i++) {
+		flag = from->flags & flags[i];
+		if (flag == 0)
+			continue;
+		if (!last && *src_col[i] >= count) {
+			*src_col[i] -= count;
+			continue;
+		}
+		*dst_col[i] = to_col + *src_col[i];
+		to->flags |= flag;
+		from->flags &= ~flag;
+		*src_col[i] = 0;
+		if (flag == GRID_LINE_END_OUTPUT) {
+			dst->exit_status = src->exit_status;
+			src->exit_status = 0;
+		}
+	}
+}
+
 /* Join line below onto this one. */
 static void
 grid_reflow_join(struct grid *target, struct grid *gd, u_int sx, u_int yy,
     u_int width, int already)
 {
-	struct grid_line	*gl, *from = NULL;
+	struct grid_line	*gl, *from = NULL, *next;
 	struct grid_cell	 gc;
 	u_int			 lines, left, i, to, line, want = 0;
 	u_int			 at;
@@ -1332,13 +1383,20 @@ grid_reflow_join(struct grid *target, struct grid *gd, u_int sx, u_int yy,
 			break;
 		line = yy + 1 + lines;
 
-		/* If the next line is empty, skip it. */
+		/* Consume empty lines, including any markers. */
 		if (~gd->linedata[line].flags & GRID_LINE_WRAPPED)
 			wrapped = 0;
 		if (gd->linedata[line].cellused == 0) {
+			next = &gd->linedata[line];
+			if (!wrapped &&
+			    (next->flags & GRID_LINE_OSC133_FLAGS) == 0)
+				break;
+			from = next;
+			want = 0;
+			grid_reflow_move_osc133(gl, from, at, 0, 1);
+			lines++;
 			if (!wrapped)
 				break;
-			lines++;
 			continue;
 		}
 
@@ -1365,6 +1423,8 @@ grid_reflow_join(struct grid *target, struct grid *gd, u_int sx, u_int yy,
 			grid_set_cell(target, at, to, &gc);
 			at++;
 		}
+		grid_reflow_move_osc133(gl, from, at - want, want,
+		    want == from->cellused);
 		lines++;
 
 		/*
@@ -1392,8 +1452,7 @@ grid_reflow_join(struct grid *target, struct grid *gd, u_int sx, u_int yy,
 
 	/* Remove the lines that were completely consumed. */
 	for (i = yy + 1; i < yy + 1 + lines; i++) {
-		free(gd->linedata[i].celldata);
-		free(gd->linedata[i].extddata);
+		grid_free_line(gd, i);
 		grid_reflow_dead(&gd->linedata[i]);
 	}
 
@@ -1435,6 +1494,14 @@ grid_reflow_split(struct grid *target, struct grid *gd, u_int sx, u_int yy,
 	line = target->sy + 1;
 	first = grid_reflow_add(target, lines);
 
+	/* The first line keeps only the markers within its first at cells. */
+	memcpy(first, gl, sizeof *first);
+	first->cellsize = first->cellused = at;
+	first->flags &= ~GRID_LINE_OSC133_FLAGS;
+	first->flags |= GRID_LINE_WRAPPED;
+	memset(&first->osc133_data, 0, sizeof first->osc133_data);
+	grid_reflow_move_osc133(first, gl, 0, at, 0);
+
 	/* Copy sections from the original line. */
 	width = 0;
 	xx = 0;
@@ -1442,6 +1509,8 @@ grid_reflow_split(struct grid *target, struct grid *gd, u_int sx, u_int yy,
 		grid_get_cell1(gl, i, &gc);
 		if (width + gc.data.width > sx) {
 			target->linedata[line].flags |= GRID_LINE_WRAPPED;
+			grid_reflow_move_osc133(&target->linedata[line], gl, 0,
+			    xx, 0);
 
 			line++;
 			width = 0;
@@ -1453,11 +1522,7 @@ grid_reflow_split(struct grid *target, struct grid *gd, u_int sx, u_int yy,
 	}
 	if (flags & GRID_LINE_WRAPPED)
 		target->linedata[line].flags |= GRID_LINE_WRAPPED;
-
-	/* Move the remainder of the original line. */
-	gl->cellsize = gl->cellused = at;
-	gl->flags |= GRID_LINE_WRAPPED;
-	memcpy(first, gl, sizeof *first);
+	grid_reflow_move_osc133(&target->linedata[line], gl, 0, xx, 1);
 	grid_reflow_dead(gl);
 
 	/* Adjust the scroll position. */

@@ -1,4 +1,4 @@
-/*	$OpenBSD: main.c,v 1.313 2026/07/16 03:53:28 tb Exp $ */
+/*	$OpenBSD: main.c,v 1.329 2026/10/15 08:33:45 job Exp $ */
 /*
  * Copyright (c) 2021 Claudio Jeker <claudio@openbsd.org>
  * Copyright (c) 2019 Kristaps Dzonsons <kristaps@bsd.lv>
@@ -252,15 +252,40 @@ entity_write_repo(const struct repo *rp)
 void
 entityq_flush(struct entityq *q, struct repo *rp)
 {
-	struct entity	*p, *np;
+	struct entity *ent, *nent;
 
 	entity_write_repo(rp);
 
-	TAILQ_FOREACH_SAFE(p, q, entries, np) {
-		entity_write_req(p);
-		TAILQ_REMOVE(q, p, entries);
-		entity_free(p);
+	TAILQ_FOREACH_SAFE(ent, q, entries, nent) {
+		entity_write_req(ent);
+		TAILQ_REMOVE(q, ent, entries);
+		entity_free(ent);
 	}
+}
+
+static struct entity *
+entity_new(char *path, char *file, enum rtype type, enum location loc,
+    struct repo *rp, unsigned char *data, size_t datasz, int talid, int certid,
+    char *mftaki)
+{
+	struct entity *ent;
+
+	if ((ent = calloc(1, sizeof(*ent))) == NULL)
+		err(1, NULL);
+
+	ent->type = type;
+	ent->location = loc;
+	ent->talid = talid;
+	ent->certid = certid;
+	ent->mftaki = mftaki;
+	ent->path = path;
+	if (rp != NULL)
+		ent->repoid = repo_id(rp);
+	ent->file = file;
+	ent->data = data;
+	ent->datasz = (data != NULL) ? datasz : 0;
+
+	return ent;
 }
 
 /*
@@ -271,22 +296,10 @@ entityq_add(char *path, char *file, enum rtype type, enum location loc,
     struct repo *rp, unsigned char *data, size_t datasz, int talid, int certid,
     char *mftaki)
 {
-	struct entity	*p;
+	struct entity *ent;
 
-	if ((p = calloc(1, sizeof(struct entity))) == NULL)
-		err(1, NULL);
-
-	p->type = type;
-	p->location = loc;
-	p->talid = talid;
-	p->certid = certid;
-	p->mftaki = mftaki;
-	p->path = path;
-	if (rp != NULL)
-		p->repoid = repo_id(rp);
-	p->file = file;
-	p->data = data;
-	p->datasz = (data != NULL) ? datasz : 0;
+	ent = entity_new(path, file, type, loc, rp, data, datasz, talid, certid,
+	    mftaki);
 
 	entity_queue++;
 
@@ -295,9 +308,9 @@ entityq_add(char *path, char *file, enum rtype type, enum location loc,
 	 * been loaded else enqueue it for later.
 	 */
 
-	if (rp == NULL || !repo_queued(rp, p)) {
-		entity_write_req(p);
-		entity_free(p);
+	if (rp == NULL || !repo_queued(rp, ent)) {
+		entity_write_req(ent);
+		entity_free(ent);
 	}
 }
 
@@ -470,7 +483,7 @@ queue_add_from_mft(const struct mft *mft)
 			err(1, NULL);
 
 		entityq_add(npath, nfile, f->type, f->location, rp,
-		    data, datasz, mft->talid, mft->certid, mftaki);
+		    data, datasz, mft->talid, mft->issuerid, mftaki);
 	}
 }
 
@@ -536,8 +549,9 @@ queue_add_from_tal(struct tal *tal)
  * Add a manifest (MFT) found in an X509 certificate, RFC 6487.
  */
 static void
-queue_add_from_cert(const struct cert *cert, struct nca_tree *ncas)
+queue_add_from_cert(const struct cert *cert, struct ca_tree *ca_tree)
 {
+	struct ca		*ca;
 	struct repo		*repo;
 	char			*nfile, *npath, *host;
 	const char		*uri, *repouri, *file;
@@ -559,7 +573,8 @@ queue_add_from_cert(const struct cert *cert, struct nca_tree *ncas)
 		return;
 	}
 
-	if (nca_skip_sync(ncas, cert))
+	ca = ca_tree_insert_cert(ca_tree, cert);
+	if (nca_skip_sync(ca))
 		return;
 
 	repo = repo_lookup(cert->talid, cert->repo,
@@ -663,11 +678,11 @@ entity_process(struct ibuf *b, struct validation_data *vd, struct stats *st)
 		cert = cert_read(b);
 		switch (cert->purpose) {
 		case CERT_PURPOSE_TA:
-			queue_add_from_cert(cert, &vd->ncas);
+			queue_add_from_cert(cert, &vd->cas);
 			ccr_insert_tas(&vd->ccr.tas, cert);
 			break;
 		case CERT_PURPOSE_CA:
-			queue_add_from_cert(cert, &vd->ncas);
+			queue_add_from_cert(cert, &vd->cas);
 			ccr_insert_mft_sub(&vd->ccr.mfts, cert);
 			break;
 		case CERT_PURPOSE_BGPSEC_ROUTER:
@@ -690,7 +705,7 @@ entity_process(struct ibuf *b, struct validation_data *vd, struct stats *st)
 		if (mft->seqnum_gap)
 			repo_stat_inc(rp, talid, type, STYPE_SEQNUM_GAP);
 		queue_add_from_mft(mft);
-		nca_tree_remove_cert(&vd->ncas, mft->certid);
+		nca_tree_clear_nonfunc(&vd->cas, mft->issuerid);
 		ccr_insert_mft(&vd->ccr.mfts, mft);
 		mft_free(mft);
 		break;
@@ -995,6 +1010,7 @@ process_start(const char *title, int *fd)
 			err(1, "fchdir");
 		if (!filemode && timeout > 0)
 			alarm(timeout);
+		rtrx_close();
 		close(pair[1]);
 		*fd = pair[0];
 	} else {
@@ -1033,7 +1049,7 @@ main(int argc, char *argv[])
 	struct rusage	 ru;
 	struct timespec	 start_time, now_time;
 	struct validation_data vd = { 0 };
-	struct nonfunc_ca *nca;
+	struct ca	 *ca;
 
 	clock_gettime(CLOCK_MONOTONIC, &start_time);
 
@@ -1041,34 +1057,18 @@ main(int argc, char *argv[])
 	RB_INIT(&vd.brks);
 	RB_INIT(&vd.vaps);
 	RB_INIT(&vd.vsps);
-	RB_INIT(&vd.ncas);
+	RB_INIT(&vd.cas);
 	RB_INIT(&vd.ccr.mfts);
 	RB_INIT(&vd.ccr.vrps);
 	RB_INIT(&vd.ccr.tas);
 
-	/* If started as root, priv-drop to _rpki-client */
-	if (getuid() == 0) {
-		struct passwd *pw;
-
-		pw = getpwnam("_rpki-client");
-		if (!pw)
-			errx(1, "no _rpki-client user to revoke to");
-		if (setgroups(1, &pw->pw_gid) == -1 ||
-		    setresgid(pw->pw_gid, pw->pw_gid, pw->pw_gid) == -1 ||
-		    setresuid(pw->pw_uid, pw->pw_uid, pw->pw_uid) == -1)
-			err(1, "unable to revoke privs");
-	}
 	cachedir = RPKI_PATH_BASE_DIR;
 	outputdir = RPKI_PATH_OUT_DIR;
 	repo_timeout = timeout / 4;
 	skiplistfile = DEFAULT_SKIPLIST_FILE;
 
-	if (pledge("stdio rpath wpath cpath inet fattr dns sendfd recvfd "
-	    "proc exec unveil", NULL) == -1)
-		err(1, "pledge");
-
 	while ((c =
-	    getopt(argc, argv, "0Ab:Bcd:e:fH:jmNnop:P:Rs:S:t:vVx")) != -1)
+	    getopt(argc, argv, "0Ab:Bcd:e:fH:jmNnop:P:rRs:S:t:vVx")) != -1)
 		switch (c) {
 		case '0':
 			excludeas0 = 0;
@@ -1124,6 +1124,10 @@ main(int argc, char *argv[])
 			    X509_TIME_MAX, &errs);
 			if (errs)
 				errx(1, "-P: time in seconds %s", errs);
+			noop = 1;
+			break;
+		case 'r':
+			outformats |= FORMAT_RTRX;
 			break;
 		case 'R':
 			rrdpon = 0;
@@ -1160,6 +1164,28 @@ main(int argc, char *argv[])
 
 	argv += optind;
 	argc -= optind;
+
+	if (outformats & FORMAT_RTRX) {
+		/* Open RTRx socket before we drop priv */
+		rtrx_connect();
+	}
+
+	/* If started as root, priv-drop to _rpki-client */
+	if (getuid() == 0) {
+		struct passwd *pw;
+
+		pw = getpwnam("_rpki-client");
+		if (!pw)
+			errx(1, "no _rpki-client user to revoke to");
+		if (setgroups(1, &pw->pw_gid) == -1 ||
+		    setresgid(pw->pw_gid, pw->pw_gid, pw->pw_gid) == -1 ||
+		    setresuid(pw->pw_uid, pw->pw_uid, pw->pw_uid) == -1)
+			err(1, "unable to revoke privs");
+	}
+
+	if (pledge("stdio rpath wpath cpath inet fattr dns sendfd recvfd "
+	    "proc exec unveil", NULL) == -1)
+		err(1, "pledge");
 
 	if (!filemode) {
 		if (argc == 1)
@@ -1355,7 +1381,8 @@ main(int argc, char *argv[])
 	if (fchdir(cachefd) == -1)
 		err(1, "fchdir");
 
-	nca_history_load();
+	if (!noop)
+		nca_history_load();
 
 	while (entity_queue > 0 && !killme) {
 		int polltim;
@@ -1548,8 +1575,8 @@ main(int argc, char *argv[])
 	if (filemode)
 		return rc;
 
-	RB_FOREACH(nca, nca_tree, &vd.ncas)
-		repo_stat_add_nca(nca);
+	RB_FOREACH(ca, ca_tree, &vd.cas)
+		repo_stat_count_ca(ca);
 
 	logx("all files parsed: generating output");
 
@@ -1574,11 +1601,12 @@ main(int argc, char *argv[])
 	vd.buildtime = get_current_time();
 
 	if (!noop && rc == 0)
-		nca_history_save(&vd.ncas, vd.buildtime);
+		nca_history_save(&vd.cas, vd.buildtime);
 
 	/* change working directory to the output directory */
 	if (fchdir(outdirfd) == -1)
 		err(1, "fchdir output dir");
+	close(outdirfd);
 
 	for (i = 0; i < talsz; i++) {
 		repo_tal_stats_collect(sum_stats, i, &talstats[i]);
@@ -1649,7 +1677,7 @@ main(int argc, char *argv[])
 
 usage:
 	fprintf(stderr,
-	    "usage: rpki-client [-0ABcjmNnoRVvx] [-b sourceaddr] [-d cachedir]"
+	    "usage: rpki-client [-0ABcjmNnoRrVvx] [-b sourceaddr] [-d cachedir]"
 	    " [-e rsync_prog]\n"
 	    "                   [-H fqdn] [-P posix-seconds] [-p threads]"
 	    " [-S skiplist]\n"

@@ -1,4 +1,4 @@
-/* $OpenBSD: udp.c,v 1.95 2008/07/22 09:45:56 bluhm Exp $	 */
+/* $OpenBSD: udp.c,v 1.97 2026/10/04 13:44:51 deraadt Exp $	 */
 /* $EOM: udp.c,v 1.57 2001/01/26 10:09:57 niklas Exp $	 */
 
 /*
@@ -73,7 +73,6 @@ char		 *udp_decode_ids(struct transport *);
 void		  udp_remove(struct transport *);
 
 static struct transport *udp_create(char *);
-static void     udp_report(struct transport *);
 static void     udp_handle_message(struct transport *);
 static struct transport *udp_make(struct sockaddr *);
 static int      udp_send_message(struct message *, struct transport *);
@@ -83,7 +82,6 @@ static struct transport_vtbl udp_transport_vtbl = {
 	udp_create,
 	0,
 	udp_remove,
-	udp_report,
 	udp_fd_set,
 	udp_fd_isset,
 	udp_handle_message,
@@ -151,7 +149,7 @@ udp_make(struct sockaddr *laddr)
 	 * make sure it is entirely reuseable with SO_REUSEPORT.
 	 */
 	on = 1;
-	if (setsockopt(s, SOL_SOCKET,
+	if (monitor_setsockopt(s, SOL_SOCKET,
 	    wildcardaddress ? SO_REUSEPORT : SO_REUSEADDR,
 	    (void *)&on, sizeof on) == -1) {
 		log_error("udp_make: setsockopt (%d, %d, %d, %p, %lu)", s,
@@ -374,29 +372,6 @@ udp_remove(struct transport *t)
 	free(t);
 }
 
-/* Report transport-method specifics of the T transport. */
-void
-udp_report(struct transport *t)
-{
-	struct udp_transport *u = (struct udp_transport *)t;
-	char		*src = NULL, *dst = NULL;
-	in_port_t	 sport, dport;
-
-	if (sockaddr2text(u->src, &src, 0))
-		return;
-	sport = sockaddr_port(u->src);
-
-	if (!u->dst || sockaddr2text(u->dst, &dst, 0))
-		dst = 0;
-	dport = dst ? sockaddr_port(u->dst) : 0;
-
-	LOG_DBG((LOG_REPORT, 0, "udp_report: fd %d src %s:%u dst %s:%u", u->s,
-	    src, ntohs(sport), dst ? dst : "<none>", ntohs(dport)));
-
-	free(dst);
-	free(src);
-}
-
 /*
  * A message has arrived on transport T's socket.  If T is single-ended,
  * clone it into a double-ended transport which we will use from now on.
@@ -532,12 +507,12 @@ udp_decode_ids(struct transport *t)
 	if (getnameinfo(src, SA_LEN(src), idsrc, sizeof idsrc, NULL, 0,
 	    NI_NUMERICHOST) != 0) {
 		log_print("udp_decode_ids: getnameinfo () failed for 'src'");
-		strlcpy(idsrc, "<error>", 256);
+		strlcpy(idsrc, "<error>", sizeof idsrc);
 	}
 	if (getnameinfo(dst, SA_LEN(dst), iddst, sizeof iddst, NULL, 0,
 	    NI_NUMERICHOST) != 0) {
 		log_print("udp_decode_ids: getnameinfo () failed for 'dst'");
-		strlcpy(iddst, "<error>", 256);
+		strlcpy(iddst, "<error>", sizeof iddst);
 	}
 
 	snprintf(result, sizeof result, "src: %s dst: %s", idsrc, iddst);

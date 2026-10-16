@@ -1,4 +1,4 @@
-/*	$OpenBSD: hash.c,v 1.2 2026/09/18 04:55:39 deraadt Exp $ */
+/*	$OpenBSD: hash.c,v 1.4 2026/10/04 13:31:56 deraadt Exp $ */
 /*
  * Copyright (c) 2025-2026 Ralph Covelli <rcovelli@he.net>
  *
@@ -19,18 +19,9 @@
 #include <sys/tree.h>
 #include <sys/stat.h>
 #include <assert.h>
-#include <err.h>
-#include <errno.h>
-#include <fcntl.h>
-#include <limits.h>
 #include <netdb.h>
 #include <signal.h>
-#include <stdarg.h>
-#include <stdint.h>
-#include <stdio.h>
-#include <stdlib.h>
 #include <string.h>
-#include <time.h>
 #include <unistd.h>
 
 #include "rtrd.h"
@@ -57,6 +48,5 @@ fnv32_hash(void *buffer, size_t length, uint32_t hash)
 		hash *= FNV_32_PRIME;
 		hash ^= (uint32_t)p[i];
 	}
-
 	return hash;
 }

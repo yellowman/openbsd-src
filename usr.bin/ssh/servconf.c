@@ -1,4 +1,4 @@
-/* $OpenBSD: servconf.c,v 1.457 2026/09/16 00:35:09 djm Exp $ */
+/* $OpenBSD: servconf.c,v 1.459 2026/10/09 10:48:43 dtucker Exp $ */
 /*
  * Copyright (c) 1995 Tatu Ylonen <ylo@cs.hut.fi>, Espoo, Finland
  *                    All rights reserved
@@ -1085,6 +1085,7 @@ static const struct multistate multistate_keepalives[] = {
 	{ "no",				SSH_KEEPALIVES_OFF },
 	{ "transport",			SSH_KEEPALIVES_TRANSPORT },
 	{ "all",			SSH_KEEPALIVES_ALL },
+	{ NULL, -1 }
 };
 static const struct multistate multistate_warnweakcrypto[] = {
 	{ "true",			1 },
@@ -2469,7 +2470,8 @@ process_server_config_line_depth(ServerOptions *options, char *line,
 		if (arg == p || value < 0 || value > 0777)
 			fatal("%s line %d: Invalid %s.",
 			    filename, linenum, keyword);
-		if (*activep)
+		if (*activep &&
+		    options->fwd_opts.streamlocal_bind_mask == (mode_t)-1)
 			options->fwd_opts.streamlocal_bind_mask = (mode_t)value;
 		break;
 

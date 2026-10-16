@@ -1392,6 +1392,13 @@ int radeon_device_init(struct radeon_device *rdev,
 	}
 	rdev->need_swiotlb = drm_need_swiotlb(dma_bits);
 
+	/* disabling sparc64 iommu requires 64 bits */
+#ifdef __sparc64__
+	rdev->dma_limited = true;
+#else
+	rdev->dma_limited = dma_bits <= 32;
+#endif
+
 	/* Registers mapping */
 	/* TODO: block userspace mapping of io register */
 	mtx_init(&rdev->mmio_idx_lock, IPL_TTY);
@@ -1676,7 +1683,7 @@ int radeon_suspend_kms(struct drm_device *dev, bool suspend,
 	}
 
 	if (notify_clients)
-		drm_client_dev_suspend(dev, false);
+		drm_client_dev_suspend(dev);
 
 	return 0;
 }
@@ -1786,7 +1793,7 @@ int radeon_resume_kms(struct drm_device *dev, bool resume, bool notify_clients)
 		radeon_pm_compute_clocks(rdev);
 
 	if (notify_clients)
-		drm_client_dev_resume(dev, false);
+		drm_client_dev_resume(dev);
 
 	return 0;
 }

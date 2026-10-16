@@ -2648,6 +2648,14 @@ static int amdgpu_pmops_suspend_noirq(struct device *dev)
 	struct amdgpu_device *adev = drm_to_adev(drm_dev);
 	int r;
 
+	/*
+	 * A GPU parked by vga_switcheroo has no power and no PCIe link, so the
+	 * ASIC reset below would fail and abort the whole noirq suspend phase.
+	 * Bail out like amdgpu_device_prepare/suspend/resume() already do.
+	 */
+	if (drm_dev->switch_power_state == DRM_SWITCH_POWER_OFF)
+		return 0;
+
 	if (amdgpu_acpi_should_gpu_reset(adev)) {
 		amdgpu_device_lock_reset_domain(adev->reset_domain);
 		r = amdgpu_asic_reset(adev);
@@ -3775,7 +3783,8 @@ amdgpu_doswitch(void *v)
 	struct amdgpu_device *adev = ri->ri_hw;
 
 	rasops_show_screen(ri, adev->switchcookie, 0, NULL, NULL);
-	drm_fb_helper_restore_fbdev_mode_unlocked(adev_to_drm(adev)->fb_helper);
+	drm_fb_helper_restore_fbdev_mode_unlocked(adev_to_drm(adev)->fb_helper,
+	    false);
 
 	if (adev->switchcb)
 		(adev->switchcb)(adev->switchcbarg, 0, 0);
@@ -3793,7 +3802,7 @@ amdgpu_enter_ddb(void *v, void *cookie)
 
 	rasops_show_screen(ri, cookie, 0, NULL, NULL);
 	drm_fb_helper_debug_enter(fb_helper->info);
-	drm_fb_helper_restore_fbdev_mode_unlocked(fb_helper);
+	drm_fb_helper_restore_fbdev_mode_unlocked(fb_helper, true);
 }
 
 void

@@ -1,4 +1,4 @@
-/*	$OpenBSD: cache.c,v 1.4 2026/09/18 04:55:39 deraadt Exp $ */
+/*	$OpenBSD: cache.c,v 1.6 2026/10/04 13:31:56 deraadt Exp $ */
 /*
  * Copyright (c) 2025-2026 Ralph Covelli <rcovelli@he.net>
  *
@@ -20,11 +20,8 @@
 #include <netinet/in.h>
 #include <assert.h>
 #include <err.h>
-#include <errno.h>
 #include <signal.h>
-#include <stdio.h>
 #include <stdlib.h>
-#include <syslog.h>
 
 #include "rtr_config.h"
 #include "rtrd.h"
@@ -68,7 +65,6 @@ init_cache(struct cache *c, uint16_t session_id, uint16_t frame_count)
 	c->expire_interval = EXPIRE_INTERVAL;
 	c->session_id = session_id;
 	c->frame_count = frame_count;
-
 	return 0;
 }
 
@@ -89,7 +85,6 @@ init_cache_array(uint16_t frame_count)
 		if (init_cache(cache + version,
 		    (session_id + version) % 0x10000, frame_count) != 0)
 			return 1;
-
 	return 0;
 }
 
@@ -100,7 +95,6 @@ is_cache_empty(struct cache *c)
 
 	if (c->head == -1 && c->tail == -1)
 		return 1;
-
 	return 0;
 }
 
@@ -143,15 +137,13 @@ get_serial_cache_frame(uint8_t version, uint32_t serial_number)
 
 	for (i = cache[version].tail; i != cache[version].head;
 	    i = (i + 1) % cache[version].frame_count) {
-		if (cache[version].frames[i].serial_number == serial_number) {
+		if (cache[version].frames[i].serial_number == serial_number)
 			return cache[version].frames + i;
-		}
 	}
 
 	if (cache[version].frames[cache[version].head].serial_number
 	    == serial_number)
 		return cache[version].frames + cache[version].head;
-
 	return NULL;
 }
 
@@ -161,7 +153,6 @@ cache_frame_push(uint8_t version,
     struct cache_brk_tree *cache_brk, struct cache_vap_tree *cache_vap)
 {
 	struct cache_frame *cf;
-
 	int next;
 
 	assert(cache_vrp4);
@@ -179,14 +170,12 @@ cache_frame_push(uint8_t version,
 		cf->rtr_vrp6s = cache_vrp6;
 		cf->rtr_brks = (version >= RTR_VERSION_1) ? cache_brk : NULL;
 		cf->rtr_vaps = (version >= RTR_VERSION_2) ? cache_vap : NULL;
-
 		return cf;
 	}
 
 	next = (cache[version].head + 1) % cache[version].frame_count;
 
-	if (next == cache[version].tail)
-	{
+	if (next == cache[version].tail) {
 		/* full cache */
 		cf = cache[version].frames + cache[version].tail;
 		free_cache_frame(cf);
@@ -202,7 +191,6 @@ cache_frame_push(uint8_t version,
 	cf->rtr_vrp6s = cache_vrp6;
 	cf->rtr_brks = (version >= RTR_VERSION_1) ? cache_brk : NULL;
 	cf->rtr_vaps = (version >= RTR_VERSION_2) ? cache_vap : NULL;
-
 	return cf;
 }
 
@@ -215,10 +203,7 @@ update_cache(struct vrp4_tree *vrp4tree, struct vrp6_tree *vrp6tree,
 	struct cache_vrp6_tree *cache_vrp6;
 	struct cache_brk_tree *cache_brk;
 	struct cache_vap_tree *cache_vap;
-	int vrp4_diff;
-	int vrp6_diff;
-	int brk_diff;
-	int vap_diff;
+	int vrp4_diff, vrp6_diff, brk_diff, vap_diff;
 	struct pdu_serial_notify sn;
 
 	assert(vrp4tree);
@@ -229,7 +214,6 @@ update_cache(struct vrp4_tree *vrp4tree, struct vrp6_tree *vrp6tree,
 	/* VERSION 0 */
 
 	cf = get_latest_cache_frame(RTR_VERSION_0);
-
 	if (cf) {
 		vrp4_diff = vrp4_treecmp(&cf->rtr_vrp4s->vrp4s, vrp4tree);
 		vrp6_diff = vrp6_treecmp(&cf->rtr_vrp6s->vrp6s, vrp6tree);
@@ -259,7 +243,6 @@ update_cache(struct vrp4_tree *vrp4tree, struct vrp6_tree *vrp6tree,
 		/* no cache yet. load them in. */
 
 		cache_vrp4 = cache_vrp4_tree_new(vrp4tree);
-
 		cache_vrp6 = cache_vrp6_tree_new(vrp6tree);
 	}
 
@@ -276,8 +259,7 @@ update_cache(struct vrp4_tree *vrp4tree, struct vrp6_tree *vrp6tree,
 		sn.serial_number = cf->serial_number;
 		sendto_allregisteredclientsversion(&sn, sn.version);
 
-		logx(0, "Updated v0 cache to serial %u\n",
-		    cf->serial_number);
+		logx(0, "Updated v0 cache to serial %u\n", cf->serial_number);
 	}
 
 	/* VERSION 1 */
@@ -323,9 +305,7 @@ update_cache(struct vrp4_tree *vrp4tree, struct vrp6_tree *vrp6tree,
 		/* no cache yet. load them in. */
 
 		cache_vrp4 = cache_vrp4_tree_new(vrp4tree);
-
 		cache_vrp6 = cache_vrp6_tree_new(vrp6tree);
-
 		cache_brk = cache_brk_tree_new(brktree);
 	}
 
@@ -400,11 +380,8 @@ update_cache(struct vrp4_tree *vrp4tree, struct vrp6_tree *vrp6tree,
 		/* no cache yet. load them in. */
 
 		cache_vrp4 = cache_vrp4_tree_new(vrp4tree);
-
 		cache_vrp6 = cache_vrp6_tree_new(vrp6tree);
-
 		cache_brk = cache_brk_tree_new(brktree);
-
 		cache_vap = cache_vap_tree_new(vaptree);
 	}
 
@@ -422,6 +399,5 @@ update_cache(struct vrp4_tree *vrp4tree, struct vrp6_tree *vrp6tree,
 		sendto_allregisteredclientsversion(&sn, sn.version);
 
 		logx(0, "Updated v2 cache to serial %u\n", cf->serial_number);
-
 	}
 }

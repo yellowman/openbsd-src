@@ -1,7 +1,4 @@
-/* C++ compilation harness for the test suite.
-
-   This is used to ensure the Expat headers can be included from C++
-   and have everything work as expected.
+/* Tests related to the hash tables used inside Expat
                             __  __            _
                          ___\ \/ /_ __   __ _| |_
                         / _ \\  /| '_ \ / _` | __|
@@ -9,8 +6,7 @@
                         \___/_/\_\ .__/ \__,_|\__|
                                  |_| XML parser
 
-   Copyright (c) 2005 Fred L. Drake, Jr. <fdrake@users.sourceforge.net>
-   Copyright (c) 2017 Sebastian Pipping <sebastian@pipping.org>
+   Copyright (c) 2026 Sebastian Pipping <sebastian@pipping.org>
    Licensed under the MIT license:
 
    Permission is  hereby granted,  free of charge,  to any  person obtaining
@@ -31,6 +27,15 @@
    DAMAGES OR  OTHER LIABILITY, WHETHER  IN AN  ACTION OF CONTRACT,  TORT OR
    OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE
    USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+   SPDX-License-Identifier: MIT
 */
 
-#include "runtests.c"
+#ifndef XML_HASH_TESTS_H
+#define XML_HASH_TESTS_H
+
+#include "minicheck.h"
+
+extern void make_hash_test_case(Suite *s);
+
+#endif /* XML_HASH_TESTS_H */

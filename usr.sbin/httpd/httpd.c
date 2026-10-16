@@ -1,4 +1,4 @@
-/*	$OpenBSD: httpd.c,v 1.84 2026/09/17 17:55:06 rsadowski Exp $	*/
+/*	$OpenBSD: httpd.c,v 1.89 2026/10/15 10:59:00 rsadowski Exp $	*/
 
 /*
  * Copyright (c) 2014 Reyk Floeter <reyk@openbsd.org>
@@ -410,7 +410,7 @@ parent_dispatch_server(int fd, struct privsep_proc *p, struct imsg *imsg)
 	struct privsep		*ps = p->p_ps;
 	struct httpd		*env = ps->ps_env;
 
-	switch (imsg->hdr.type) {
+	switch (imsg_get_type(imsg)) {
 	case IMSG_CFG_DONE:
 		parent_configure_done(env);
 		break;
@@ -427,19 +427,12 @@ parent_dispatch_logger(int fd, struct privsep_proc *p, struct imsg *imsg)
 	struct privsep		*ps = p->p_ps;
 	struct httpd		*env = ps->ps_env;
 	unsigned int		 v;
-	char			*str = NULL;
 
-	switch (imsg->hdr.type) {
+	switch (imsg_get_type(imsg)) {
 	case IMSG_CTL_RESET:
 		IMSG_SIZE_CHECK(imsg, &v);
 		memcpy(&v, imsg->data, sizeof(v));
 		parent_reload(env, v, NULL);
-		break;
-	case IMSG_CTL_RELOAD:
-		if (IMSG_DATA_SIZE(imsg) > 0)
-			str = get_string(imsg->data, IMSG_DATA_SIZE(imsg));
-		parent_reload(env, CONFIG_RELOAD, str);
-		free(str);
 		break;
 	case IMSG_CTL_SHUTDOWN:
 		parent_shutdown(env);
@@ -1283,4 +1276,23 @@ header_dup(const struct custom_header *src)
 		fatal("out of memory");
 	h->flags = src->flags;
 	return (h);
+}
+
+struct header_rule *
+header_rule_dup(const struct header_rule *src)
+{
+	struct header_rule *r;
+
+	if ((r = calloc(1, sizeof(*r))) == NULL)
+		fatal("out of memory");
+	if ((r->name = strdup(src->name)) == NULL ||
+	    (r->value = strdup(src->value)) == NULL)
+		fatal("out of memory");
+
+	r->action = src->action;
+	r->return_code = src->return_code;
+	if ((r->return_uri = strdup(src->return_uri)) == NULL)
+		fatal("out of memory");
+
+	return (r);
 }
