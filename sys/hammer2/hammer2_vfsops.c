@@ -41,6 +41,7 @@
 #include <sys/sysctl.h>
 #include <sys/specdev.h>
 #include <sys/dkio.h>
+#include <sys/fcntl.h>
 
 static int hammer2_unmount(struct mount *, int, struct proc *);
 static int hammer2_recovery(hammer2_dev_t *);
