@@ -30,7 +30,7 @@
 .\" OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
 .\" SUCH DAMAGE.
 .\"
-.Dd December 11, 2023
+.Dd October 16, 2026
 .Dt NEWFS_HAMMER2 8
 .Os
 .Sh NAME
@@ -50,13 +50,19 @@ The
 utility prepares a
 .Nm HAMMER2
 volume on the specified block device.
+Each
+.Ar special
+argument may also be a disklabel UID (DUID) followed by a partition letter,
+as described in
+.Xr disklabel 8 .
 .Nm HAMMER2
 volumes can contain any number of named PFSs (Pseudo FileSystems).
 .Pp
 The
 .Nm
 program always creates a PFS called "LOCAL" which may be used for
-device-specific configuration.  This PFS should never be used for generic
+device-specific configuration.
+This PFS should never be used for generic
 data.
 .Pp
 If no
