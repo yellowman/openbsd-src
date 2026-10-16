@@ -1095,7 +1095,7 @@ static int
 hammer2_unmount(struct mount *mp, int mntflags, struct proc *p)
 {
 	hammer2_pfs_t *pmp = MPTOPMP(mp);
-	int flags = 0, error = 0;
+	int flags = 0, error = 0, sync_error, i;
 
 	/* Still NULL during mount before hammer2_mount_helper() called. */
 	if (pmp == NULL)
@@ -1117,14 +1117,26 @@ hammer2_unmount(struct mount *mp, int mntflags, struct proc *p)
 			hprintf("vflush failed %d\n", error);
 			goto failed;
 		}
-		hammer2_sync(mp, MNT_WAIT, 0, NULL, NULL);
-		hammer2_sync(mp, MNT_WAIT, 0, NULL, NULL);
-		hammer2_sync(mp, MNT_WAIT, 0, NULL, NULL);
+		for (i = 0; i < 3; ++i) {
+			sync_error = hammer2_sync(mp, MNT_WAIT, 0, NULL, NULL);
+			if (sync_error && error == 0)
+				error = sync_error;
+		}
+		if (error) {
+			if ((mntflags & MNT_FORCE) == 0)
+				goto failed;
+			hprintf("forced unmount after sync error %d; "
+			    "uncommitted data may be lost\n", error);
+		}
+		/* A retained sync error can bypass the normal logical-I/O drain. */
+		hammer2_bioq_sync(pmp);
 	} else {
 		debug_hprintf("no root inode"); /* failed before allocation */
 	}
 
 	hammer2_unmount_helper(mp, pmp, NULL);
+	/* Returning a sync error here would leave VFS with a detached mount. */
+	error = 0;
 failed:
 	hammer2_lk_unlock(&hammer2_mntlk);
 
