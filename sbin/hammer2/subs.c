@@ -316,36 +316,39 @@ check_volume(int fd)
 {
 	struct stat st;
 	struct disklabel dl;
-	hammer2_off_t size;
+	uint64_t sectors;
+	int part;
 
 	/*
 	 * Get basic information about the volume
 	 */
-	if (ioctl(fd, DIOCGDINFO, &dl) < 0) {
-		/*
-		 * Allow the formatting of regular files as HAMMER2 volumes
-		 */
-		if (fstat(fd, &st) < 0)
-			err(1, "Unable to stat fd %d", fd);
-		if (!S_ISREG(st.st_mode))
-			errx(1, "Unsupported file type for fd %d", fd);
-		size = st.st_size;
-	} else {
-		/*
-		 * When formatting a block device as a HAMMER2 volume the
-		 * sector size must be compatible.  HAMMER2 uses 64K
-		 * filesystem buffers but logical buffers for direct I/O
-		 * can be as small as HAMMER2_LOGSIZE (16KB).
-		 */
-		int media_blksize = dl.d_secsize;
-		size = (hammer2_off_t)dl.d_secperunit * media_blksize;
-		if (media_blksize > HAMMER2_PBUFSIZE ||
-		    HAMMER2_PBUFSIZE % media_blksize) {
-			errx(1, "A media sector size of %d is not supported",
-			     media_blksize);
-		}
-	}
-	return(size);
+	if (fstat(fd, &st) < 0)
+		err(1, "Unable to stat fd %d", fd);
+	if (S_ISREG(st.st_mode))
+		return (st.st_size);
+	if (!S_ISBLK(st.st_mode) && !S_ISCHR(st.st_mode))
+		errx(1, "Unsupported file type for fd %d", fd);
+	if (ioctl(fd, DIOCGDINFO, &dl) < 0)
+		err(1, "Unable to read disklabel for fd %d", fd);
+
+	/*
+	 * HAMMER2 uses 64K filesystem buffers, but logical buffers for
+	 * direct I/O can be as small as HAMMER2_LOGSIZE (16KB).
+	 */
+	if (dl.d_secsize == 0 || dl.d_secsize > HAMMER2_PBUFSIZE ||
+	    HAMMER2_PBUFSIZE % dl.d_secsize != 0)
+		errx(1, "A media sector size of %u is not supported",
+		    dl.d_secsize);
+
+	/* Device offsets are relative to the opened partition, not the disk. */
+	part = DISKPART(st.st_rdev);
+	if (part >= MAXPARTITIONS || part >= dl.d_npartitions)
+		errx(1, "Invalid partition %d for fd %d", part, fd);
+	sectors = DL_GETPSIZE(&dl.d_partitions[part]);
+	if (sectors == 0 || sectors > INT64_MAX / dl.d_secsize)
+		errx(1, "Invalid partition size for fd %d", fd);
+
+	return (sectors * dl.d_secsize);
 }
 
 /*
