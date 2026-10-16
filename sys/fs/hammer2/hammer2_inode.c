@@ -686,6 +686,7 @@ hammer2_igetv(hammer2_inode_t *ip, struct vnode **vpp)
 	hammer2_devvp_t *e;
 	struct mount *mp;
 	struct vnode *vp;
+	u_long vid;
 	int error, ostate;
 
 	KKASSERT(ip);
@@ -698,16 +699,23 @@ hammer2_igetv(hammer2_inode_t *ip, struct vnode **vpp)
 loop:
 	vp = ip->vp;
 	if (vp) {
+		vid = vp->v_id;
 		/* Unlock inode, otherwise deadlocks vs syscall processes. */
 		ostate = hammer2_inode_lock_temp_release(ip);
 		error = vget(vp, LK_EXCLUSIVE);
 		hammer2_inode_lock_temp_restore(ip, ostate);
 		if (error == 0) {
-			*vpp = vp;
-			return (0);
+			if (vp->v_id == vid && ip->vp == vp &&
+			    vp->v_data == ip) {
+				*vpp = vp;
+				return (0);
+			}
+
+			/* vput() may enter another inode's inactive path. */
+			ostate = hammer2_inode_lock_temp_release(ip);
+			vput(vp);
+			hammer2_inode_lock_temp_restore(ip, ostate);
 		}
-		hprintf("failed to vget inum %016llx\n",
-		    (long long)ip->meta.inum);
 		goto loop;
 	}
 
