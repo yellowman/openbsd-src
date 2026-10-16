@@ -1901,7 +1901,8 @@ hammer2_vfs_sync_pmp(hammer2_pfs_t *pmp, int waitfor __unused)
 	hammer2_depend_t *depend, *depend_next;
 	struct vnode *vp;
 	uint32_t pass2;
-	int error = 0, error2, dorestart, wakecount;
+	int xflags, chain_error = 0;
+	int error = 0, dorestart, wakecount;
 
 	/*
 	 * Move all inodes on sideq to syncq.  This will clear sideq.
@@ -1921,6 +1922,9 @@ hammer2_vfs_sync_pmp(hammer2_pfs_t *pmp, int waitfor __unused)
 	 * SIDEQ to SYNCQ.  PASS2 propagation by inode_lock4() and
 	 * inode_depend() are atomic with the spin-lock.
 	 */
+	error = hammer2_pfs_error(pmp);
+	if (error)
+		return (error);
 	if (pmp->mp && (pmp->mp->mnt_flag & MNT_RDONLY) == 0)
 		uvm_vnp_sync(pmp->mp);
 
@@ -2085,10 +2089,10 @@ restart:
 		 * meat of the flush.
 		 */
 		if (vp) {
+			/* The strategy worker needs the inode/chain locks. */
+			hammer2_mtx_unlock(&ip->lock);
 			vflushbuf(vp, 1);
-			error2 = hammer2_inode_wsync_wait(ip);
-			if (error2 && error == 0)
-				error = error2;
+			hammer2_mtx_ex(&ip->lock);
 		}
 
 		/*
@@ -2099,11 +2103,11 @@ restart:
 		if (ip->flags & HAMMER2_INODE_DELETING) {
 			debug_hprintf("inum %016llx destroy\n",
 			    (long long)ip->meta.inum);
-			hammer2_inode_chain_des(ip);
+			chain_error |= hammer2_inode_chain_des(ip);
 		} else if (ip->flags & HAMMER2_INODE_CREATING) {
 			debug_hprintf("inum %016llx insert\n",
 			    (long long)ip->meta.inum);
-			hammer2_inode_chain_ins(ip);
+			chain_error |= hammer2_inode_chain_ins(ip);
 		}
 
 		/*
@@ -2123,17 +2127,13 @@ restart:
 		 */
 		debug_hprintf("inum %016llx pinum %016llx chain-sync\n",
 		    (long long)ip->meta.inum, (long long)ip->meta.iparent);
-		error2 = hammer2_inode_chain_sync(ip);
-		if (error2 && error == 0)
-			error = error2;
+		chain_error |= hammer2_inode_chain_sync(ip);
 
 		if (ip == pmp->iroot)
-			error2 = hammer2_inode_chain_flush(ip, HAMMER2_XOP_INODE_STOP);
+			chain_error |= hammer2_inode_chain_flush(ip, HAMMER2_XOP_INODE_STOP);
 		else
-			error2 = hammer2_inode_chain_flush(ip,
+			chain_error |= hammer2_inode_chain_flush(ip,
 			    HAMMER2_XOP_INODE_STOP | HAMMER2_XOP_FSSYNC);
-		if (error2 && error == 0)
-			error = error2;
 		if (vp) {
 			if ((ip->flags & (HAMMER2_INODE_MODIFIED |
 			    HAMMER2_INODE_RESIZED |
@@ -2200,14 +2200,15 @@ restart:
 	if ((ip = pmp->iroot) != NULL) {
 		hammer2_inode_ref(ip);
 		hammer2_mtx_ex(&ip->lock);
-		error2 = hammer2_inode_chain_sync(ip);
-		if (error2 && error == 0)
-			error = error2;
-		error2 = hammer2_inode_chain_flush(ip,
-		    HAMMER2_XOP_INODE_STOP | HAMMER2_XOP_FSSYNC |
-		    HAMMER2_XOP_VOLHDR);
-		if (error2 && error == 0)
-			error = error2;
+		chain_error |= hammer2_inode_chain_sync(ip);
+		error = hammer2_error_to_errno(chain_error);
+		if (error == 0)
+			error = hammer2_pfs_error(pmp);
+		hammer2_pfs_record_error(pmp, error);
+		xflags = HAMMER2_XOP_INODE_STOP | HAMMER2_XOP_FSSYNC;
+		if (error == 0)
+			xflags |= HAMMER2_XOP_VOLHDR;
+		chain_error |= hammer2_inode_chain_flush(ip, xflags);
 		hammer2_inode_unlock(ip); /* unlock+drop */
 	}
 	debug_hprintf("FILESYSTEM SYNC STAGE 2 DONE\n");
@@ -2216,6 +2217,11 @@ restart:
 
 	hammer2_trans_done(pmp, HAMMER2_TRANS_ISFLUSH);
 
+	if (error == 0)
+		error = hammer2_error_to_errno(chain_error);
+	if (error == 0)
+		error = hammer2_pfs_error(pmp);
+	hammer2_pfs_record_error(pmp, error);
 	return (error);
 }
 
