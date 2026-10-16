@@ -299,6 +299,7 @@ hammer2_calc_physical(hammer2_inode_t *ip, hammer2_key_t lbase)
 	return (pblksize);
 }
 
+void
 hammer2_update_time(uint64_t *timep)
 {
 	struct timespec ts;
