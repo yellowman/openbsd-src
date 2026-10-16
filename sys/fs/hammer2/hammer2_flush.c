@@ -1090,6 +1090,102 @@ done:
  * chain->parent can be NULL, usually due to destroy races or detached inodes.
  * Primarily called from vfs_sync().
  */
+static int
+hammer2_fsync_devices(hammer2_dev_t *hmp)
+{
+	hammer2_devvp_t *e;
+	struct vnode *vp;
+	int error, first_error = 0;
+	uint64_t target = hammer2_wsync_target(hmp->wsync);
+
+	TAILQ_FOREACH(e, &hmp->devvp_list, entry) {
+		vp = e->devvp;
+		KKASSERT(vp);
+		error = vn_lock(vp, LK_EXCLUSIVE | LK_RETRY);
+		if (error == 0) {
+			error = VOP_FSYNC(vp, FSCRED, MNT_WAIT, curproc);
+			VOP_UNLOCK(vp);
+		}
+		if (error) {
+			hprintf("fsync error %d device \"%s\"\n",
+			    error, e->path);
+			if (first_error == 0)
+				first_error = error;
+		}
+	}
+	if (first_error == 0)
+		first_error = hammer2_wsync_waitfor(hmp->wsync, target);
+	return (first_error);
+}
+
+static int
+hammer2_barrier_devices(hammer2_dev_t *hmp)
+{
+	hammer2_devvp_t *e;
+	int error, first_error = 0, force;
+
+	TAILQ_FOREACH(e, &hmp->devvp_list, entry) {
+		force = 1;
+		error = vn_lock(e->devvp, LK_EXCLUSIVE | LK_RETRY);
+		if (error == 0) {
+			error = VOP_IOCTL(e->devvp, DIOCCACHESYNC, &force,
+			    FWRITE, FSCRED, curproc);
+			VOP_UNLOCK(e->devvp);
+		}
+		if (error) {
+			hprintf("cache sync error %d device \"%s\"\n",
+			    error, e->path);
+			if (first_error == 0)
+				first_error = error;
+		}
+	}
+	if (first_error == 0)
+		first_error = hammer2_wsync_error(hmp->wsync);
+	return (first_error);
+}
+
+static int
+hammer2_write_volhdr(hammer2_dev_t *hmp)
+{
+	struct buf *bp;
+	daddr_t blkno;
+	int error, force, j;
+
+	error = hammer2_barrier_devices(hmp);
+	if (error)
+		return (error);
+
+	j = hmp->volhdrno + 1;
+	if (j < 0 || j >= HAMMER2_NUM_VOLHDRS)
+		j = 0;
+	if (j * HAMMER2_ZONE_BYTES64 + HAMMER2_SEGSIZE >
+	    hmp->volsync.volu_size)
+		j = 0;
+
+	blkno = ((off_t)j * HAMMER2_ZONE_BYTES64) / DEV_BSIZE;
+	bp = getblk(hmp->devvp, blkno, HAMMER2_VOLUME_BYTES, 0, 0);
+	bcopy(&hmp->volsync, bp->b_data, HAMMER2_VOLUME_BYTES);
+	/* Do not let bwrite turn this into a delayed MNT_ASYNC write. */
+	bp->b_flags |= B_NOCACHE;
+	error = bwrite(bp);
+	if (error)
+		return (error);
+
+	force = 1;
+	error = vn_lock(hmp->devvp, LK_EXCLUSIVE | LK_RETRY);
+	if (error == 0) {
+		error = VOP_IOCTL(hmp->devvp, DIOCCACHESYNC, &force,
+		    FWRITE, FSCRED, curproc);
+		VOP_UNLOCK(hmp->devvp);
+	}
+	if (error)
+		return (error);
+
+	hmp->volhdrno = j;
+	atomic_clear_int(&hmp->vchain.flags, HAMMER2_CHAIN_VOLUMESYNC);
+	return (0);
+}
+
 void
 hammer2_xop_inode_flush(hammer2_xop_t *arg, void *scratch, int clindex)
 {
@@ -1098,12 +1194,8 @@ hammer2_xop_inode_flush(hammer2_xop_t *arg, void *scratch, int clindex)
 	hammer2_pfs_t *pmp;
 	hammer2_chain_t *chain;
 	hammer2_inode_t *ip;
-	hammer2_devvp_t *e;
-	struct vnode *devvp;
-	struct buf *bp;
-	int flush_error = 0, fsync_error = 0, total_error = 0, vol_error = 0;
-	int j, xflags, force, ispfsroot = 0;
-	daddr_t blkno;
+	int flush_error = 0, fsync_error = 0, total_error;
+	int j, xflags, ispfsroot = 0;
 
 	xflags = HAMMER2_FLUSH_TOP;
 	if (xop->head.flags & HAMMER2_XOP_INODE_STOP)
@@ -1239,75 +1331,15 @@ hammer2_xop_inode_flush(hammer2_xop_t *arg, void *scratch, int clindex)
 	 *
 	 * XXX this isn't being incremental
 	 */
-	TAILQ_FOREACH(e, &hmp->devvp_list, entry) {
-		devvp = e->devvp;
-		KKASSERT(devvp);
-		vn_lock(devvp, LK_EXCLUSIVE | LK_RETRY);
-		fsync_error = VOP_FSYNC(devvp, FSCRED, MNT_WAIT, curproc);
-		VOP_UNLOCK(devvp);
-		if (fsync_error || flush_error)
-			hprintf("fsync_error %d flush_error 0x%04x "
-			    "device \"%s\"\n",
-			    fsync_error, flush_error, e->path);
-	}
+	fsync_error = hammer2_fsync_devices(hmp);
+	if (fsync_error == 0)
+		fsync_error = hammer2_pfs_error(pmp);
+	if (flush_error == 0 && fsync_error == 0 &&
+	    (hmp->vchain.flags & HAMMER2_CHAIN_VOLUMESYNC))
+		fsync_error = hammer2_write_volhdr(hmp);
 
-	/*
-	 * The flush code sets CHAIN_VOLUMESYNC to indicate that the
-	 * volume header needs synchronization via hmp->volsync.
-	 *
-	 * XXX synchronize the flag & data with only this flush
-	 */
-	if (fsync_error == 0 && flush_error == 0 &&
-	    (hmp->vchain.flags & HAMMER2_CHAIN_VOLUMESYNC)) {
-		/*
-		 * Synchronize every component device before committing the
-		 * synchronized root volume header.  For a multi-volume mount,
-		 * the root volume header is only durable if all device caches
-		 * have been drained first.
-		 */
-		force = 1;
-		TAILQ_FOREACH(e, &hmp->devvp_list, entry) {
-			devvp = e->devvp;
-			KKASSERT(devvp);
-			vn_lock(devvp, LK_EXCLUSIVE | LK_RETRY);
-			vol_error = VOP_IOCTL(devvp, DIOCCACHESYNC, &force,
-			    FWRITE, FSCRED, curproc);
-			VOP_UNLOCK(devvp);
-			if (vol_error) {
-				hprintf("cachesync error %d device \"%s\"\n",
-				    vol_error, e->path);
-				if (fsync_error == 0)
-					fsync_error = vol_error;
-			}
-		}
-
-		/*
-		 * Then we can safely flush the version of the
-		 * volume header synchronized by the flush code.
-		 */
-		if (fsync_error == 0) {
-			j = hmp->volhdrno + 1;
-			if (j < 0)
-				j = 0;
-			if (j >= HAMMER2_NUM_VOLHDRS)
-				j = 0;
-			if (j * HAMMER2_ZONE_BYTES64 + HAMMER2_SEGSIZE >
-			    hmp->volsync.volu_size)
-				j = 0;
-			debug_hprintf("sync volhdr %d size %016llx\n",
-			    j, (long long)hmp->volsync.volu_size);
-
-			blkno = ((off_t)j * HAMMER2_ZONE_BYTES64) / DEV_BSIZE;
-			bp = getblk(hmp->devvp, blkno, HAMMER2_VOLUME_BYTES, 0, 0);
-			atomic_clear_int(&hmp->vchain.flags,
-			    HAMMER2_CHAIN_VOLUMESYNC);
-			bcopy(&hmp->volsync, bp->b_data, HAMMER2_VOLUME_BYTES);
-			vol_error = bwrite(bp);
-			hmp->volhdrno = j;
-			if (vol_error)
-				fsync_error = vol_error;
-		}
-	}
+	if (fsync_error == 0)
+		fsync_error = hammer2_pfs_error(pmp);
 
 	/* spmp trans */
 	hammer2_trans_done(hmp->spmp, HAMMER2_TRANS_ISFLUSH);

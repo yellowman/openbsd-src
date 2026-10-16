@@ -1321,15 +1321,18 @@ hammer2_pfs_fsync_devices(hammer2_pfs_t *pmp, struct ucred *cred, int waitfor,
 			devvp = e->devvp;
 			if (devvp == NULL)
 				continue;
-			vn_lock(devvp, LK_EXCLUSIVE | LK_RETRY);
+			fsync_error = vn_lock(devvp, LK_EXCLUSIVE | LK_RETRY);
+			if (fsync_error) {
+				if (error == 0)
+					error = fsync_error;
+				continue;
+			}
 			fsync_error = VOP_FSYNC(devvp, FSCRED, waitfor,
 			    p ? p : curproc);
 			if (waitfor == MNT_WAIT && fsync_error == 0) {
 				force = 1;
 				cache_error = VOP_IOCTL(devvp, DIOCCACHESYNC, &force,
 				    FWRITE, FSCRED, p ? p : curproc);
-				if (cache_error == ENOTTY || cache_error == EOPNOTSUPP)
-					cache_error = 0;
 				if (cache_error && error == 0)
 					error = cache_error;
 			}
@@ -1338,6 +1341,8 @@ hammer2_pfs_fsync_devices(hammer2_pfs_t *pmp, struct ucred *cred, int waitfor,
 				error = fsync_error;
 		}
 	}
+	if (error == 0)
+		error = hammer2_pfs_error(pmp);
 	return (error);
 }
 

@@ -593,21 +593,36 @@ hammer2_wref_complete(hammer2_wref_t *wref, int error)
 }
 
 /* The owner supplies a live reference for the entire wait. */
-int
-hammer2_wsync_wait(hammer2_wsync_t *wsync)
+uint64_t
+hammer2_wsync_target(hammer2_wsync_t *wsync)
 {
-	hammer2_wref_t *first;
 	uint64_t target;
-	int error;
 
 	mtx_enter(&wsync->lock);
 	target = wsync->issued;
+	mtx_leave(&wsync->lock);
+	return (target);
+}
+
+int
+hammer2_wsync_waitfor(hammer2_wsync_t *wsync, uint64_t target)
+{
+	hammer2_wref_t *first;
+	int error;
+
+	mtx_enter(&wsync->lock);
 	while ((first = TAILQ_FIRST(&wsync->pending)) != NULL &&
 	    first->sequence <= target)
 		msleep_nsec(wsync, &wsync->lock, PRIBIO, "h2wsync", INFSLP);
 	error = wsync->error;
 	mtx_leave(&wsync->lock);
 	return (error);
+}
+
+int
+hammer2_wsync_wait(hammer2_wsync_t *wsync)
+{
+	return (hammer2_wsync_waitfor(wsync, hammer2_wsync_target(wsync)));
 }
 
 int

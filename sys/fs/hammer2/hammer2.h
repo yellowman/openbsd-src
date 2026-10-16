@@ -1095,6 +1095,8 @@ void hammer2_wsync_drop(hammer2_wsync_t *);
 hammer2_wref_t *hammer2_wsync_getref(hammer2_wsync_t *);
 void hammer2_wref_complete(hammer2_wref_t *, int);
 int hammer2_wsync_wait(hammer2_wsync_t *);
+uint64_t hammer2_wsync_target(hammer2_wsync_t *);
+int hammer2_wsync_waitfor(hammer2_wsync_t *, uint64_t);
 int hammer2_wsync_error(hammer2_wsync_t *);
 void hammer2_wsync_record_error(hammer2_wsync_t *, int);
 int hammer2_inode_wsync_wait(hammer2_inode_t *);
