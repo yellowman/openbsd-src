@@ -889,7 +889,7 @@ hammer2_write_file(hammer2_inode_t *ip, struct uio *uio, int ioflag,
 	ssize_t overrun;
 	uint64_t mtime;
 	int lblksize, loff, trivial, endofblk;
-	int modified = 0, error = 0, error2;
+	int modified = 0, error = 0, error2, write_error;
 
 	KKASSERT(uio->uio_rw == UIO_WRITE);
 	KKASSERT(uio->uio_offset >= 0);
@@ -1034,13 +1034,17 @@ hammer2_write_file(hammer2_inode_t *ip, struct uio *uio, int ioflag,
 		 * needlessly scattered by the buffer daemon.
 		 */
 		if (ioflag & IO_SYNC) {
-			error = bwrite(bp);
-			if (error)
-				break;
+			/* IO_SYNC must not be downgraded by MNT_ASYNC. */
+			bp->b_flags |= B_NOCACHE;
+			write_error = bwrite(bp);
+			if (error == 0)
+				error = write_error;
 		} else if ((ioflag & IO_ASYNC) || endofblk)
 			bawrite(bp);
 		else
 			bdwrite(bp);
+		if (error)
+			break;
 	}
 
 	/*
